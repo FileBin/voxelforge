@@ -1,0 +1,11 @@
+[package]
+name = "voxelforge-refsim"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[[bin]]
+name = "vf-ref"
+path = "src/bin/vf_ref.rs"
