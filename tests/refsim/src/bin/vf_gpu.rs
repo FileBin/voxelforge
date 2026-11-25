@@ -22,6 +22,7 @@ struct Args {
     friction: Option<f32>,
     beta: Option<f32>,
     max_push: Option<f32>,
+    ang_damp: Option<f32>,
 }
 
 fn parse() -> Args {
@@ -30,7 +31,7 @@ fn parse() -> Args {
         frames: 420,
         dt: 1.0 / 60.0,
         substeps: 8,
-        iterations: 12,
+        iterations: 8,
         out: None,
         json: None,
         compare: false,
@@ -38,6 +39,7 @@ fn parse() -> Args {
         friction: None,
         beta: None,
         max_push: None,
+        ang_damp: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -55,6 +57,7 @@ fn parse() -> Args {
             "--friction" => a.friction = Some(v().parse().unwrap()),
             "--beta" => a.beta = Some(v().parse().unwrap()),
             "--max-push" => a.max_push = Some(v().parse().unwrap()),
+            "--ang-damp" => a.ang_damp = Some(v().parse().unwrap()),
             other => panic!("неизвестный аргумент {other}"),
         }
     }
@@ -134,6 +137,9 @@ fn main() {
     }
     if let Some(m) = args.max_push {
         params.max_push = m;
+    }
+    if let Some(d) = args.ang_damp {
+        params.ang_damp = d;
     }
 
     let bodies: Vec<GpuBody> = sim.bodies.iter().map(to_gpu).collect();

@@ -42,6 +42,8 @@ fn to_gpu(body: &Body) -> GpuBody {
 
 struct Outcome {
     top: f32,
+    /// Центр масс по горизонтали: ловит систематический снос к стенке.
+    center: [f32; 2],
     /// 99-й процентиль высоты: устойчив к паре шаров, заклинившихся в углу.
     p99: f32,
     vmax: f32,
@@ -83,6 +85,8 @@ fn run_gpu(n: usize, frames: u32, iters: u32, shaders: &Path) -> Outcome {
     hs.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let p99 = hs[(hs.len() * 99 / 100).min(hs.len() - 1)];
     let asleep = snap.iter().filter(|b| b.misc[1] > 0.5).count();
+    let cx = snap.iter().map(|b| b.pos_r[0]).sum::<f32>() / snap.len() as f32;
+    let cz = snap.iter().map(|b| b.pos_r[2]).sum::<f32>() / snap.len() as f32;
     let out_of_box = snap
         .iter()
         .filter(|b| {
@@ -104,6 +108,7 @@ fn run_gpu(n: usize, frames: u32, iters: u32, shaders: &Path) -> Outcome {
     }
     Outcome {
         top: top_end,
+        center: [cx, cz],
         p99,
         vmax,
         pen,
@@ -143,7 +148,7 @@ fn gpu_pile_matches_cpu_reference() {
 
     let n = 1000;
     let frames = 360;
-    let gpu = run_gpu(n, frames, 20, &shaders);
+    let gpu = run_gpu(n, frames, 12, &shaders);
 
     let mut cpu = pile_demo(n);
     for _ in 0..frames {
@@ -161,10 +166,21 @@ fn gpu_pile_matches_cpu_reference() {
     let cpu_pen = cpu.max_penetration();
 
     eprintln!(
-        "GPU: p99={:.3} pen={:.4} v={:.3} asleep={} | CPU: p99={:.3} pen={:.4} awake={}",
-        gpu.p99, gpu.pen, gpu.vmax, gpu.asleep, cpu_p99, cpu_pen, cpu_awake
+        "GPU: p99={:.3} pen={:.4} v={:.3} asleep={} центр=({:.2},{:.2}) | CPU: p99={:.3} pen={:.4} awake={}",
+        gpu.p99, gpu.pen, gpu.vmax, gpu.asleep, gpu.center[0], gpu.center[1], cpu_p99, cpu_pen, cpu_awake
     );
 
+    /* Проверка на «храповик»: раньше фиксированный порядок обхода контактов
+     * сносил всю кучу к одной стенке, и это было видно только глазами.
+     * Ящик 4.25 м, центр должен быть около 2.1 по обеим осям. */
+    for (axis, c) in [("x", gpu.center[0]), ("z", gpu.center[1])] {
+        assert!(
+            (c - 2.12).abs() < 0.45,
+            "куча снесена к стенке по {}: центр {:.2} при ожидании ~2.12",
+            axis,
+            c
+        );
+    }
     assert_eq!(gpu.out_of_box, 0, "GPU: {} тел вылетели из ящика", gpu.out_of_box);
     assert!(
         gpu.asleep * 100 / n >= 90,

@@ -15,6 +15,8 @@ layout(std430, set = 0, binding = 1) buffer Lists { C list[]; };
 layout(std430, set = 0, binding = 2) buffer ListCount { uint lc[]; };
 layout(std430, set = 0, binding = 3) buffer BodiesOut { Body bout[]; };
 
+const float RELAX = 0.5;
+
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= uint(pc.grid.w)) return;
@@ -31,6 +33,14 @@ void main() {
 
     uint n = lc[i];
     if (n > uint(CAP)) n = uint(CAP);
+
+    /* Импульсы считаются от СНИМКА (v, w) и копятся отдельно, а применяются
+     * один раз в конце. Это принципиально: если применять их по ходу обхода,
+     * тело решает контакты в фиксированном пространственном порядке, и обход
+     * превращается в храповик — кучу систематически сносит к одной стенке
+     * (проверено: разворот порядка обхода разворачивал снос). */
+    vec3 dv = vec3(0.0);
+    vec3 dw = vec3(0.0);
 
     for (uint k = 0u; k < n; k++) {
         C c = list[i * CAP + k];
@@ -54,10 +64,6 @@ void main() {
 
         vec3 rself = nrm * r;
         vec3 rother = -nrm * orad;
-        /* Соглашение: нормаль смотрит ОТ партнёра к телу. Для пары партнёр —
-         * второе тело, для статики — стенка. Отсюда два знака импульса:
-         * в паре тело стоит на стороне «a» (−P), у статики — на стороне «b» (+P).
-         * Если перепутать, пол и стены начинают втягивать тела внутрь. */
         bool is_static = (j < 0);
         vec3 vrel = is_static
             ? (v + cross(w, rself))
@@ -65,13 +71,13 @@ void main() {
         float vn = dot(vrel, nrm);
         float wn = im + oim;
         if (wn <= 0.0) continue;
+        float sgn = is_static ? 1.0 : -1.0;
 
         float push = min(max(pen - pc.prm1.z, 0.0) * pc.prm1.x / dt, pc.prm1.y);
         float dl = (push - vn) / wn;
         vec3 P = nrm * dl;
-        float sgn = is_static ? 1.0 : -1.0;
-        v += P * (im * sgn);
-        w += cross(rself, P) * (ii * sgn);
+        dv += P * (im * sgn);
+        dw += cross(rself, P) * (ii * sgn);
 
         vec3 vt_vec = vrel - nrm * vn;
         float vt = length(vt_vec);
@@ -84,11 +90,16 @@ void main() {
                 float cap = mu * max(dl, 0.0);
                 float dlt = clamp(-vt / wt, -cap, cap);
                 vec3 Pt = t * dlt;
-                v += Pt * (im * sgn);
-                w += cross(rself, Pt) * (ii * sgn);
+                dv += Pt * (im * sgn);
+                dw += cross(rself, Pt) * (ii * sgn);
             }
         }
     }
+
+    /* Релаксация: контакты считаются независимо и в сумме перебирают
+     * коррекцию (у тела их до 24). Без множителя штабель звенит. */
+    v += dv * RELAX;
+    w += dw * RELAX;
 
     me.vel_m = vec4(v, im);
     me.ang_i = vec4(w, ii);
