@@ -19,6 +19,9 @@ struct Args {
     json: Option<PathBuf>,
     compare: bool,
     shaders: Option<PathBuf>,
+    friction: Option<f32>,
+    beta: Option<f32>,
+    max_push: Option<f32>,
 }
 
 fn parse() -> Args {
@@ -32,6 +35,9 @@ fn parse() -> Args {
         json: None,
         compare: false,
         shaders: None,
+        friction: None,
+        beta: None,
+        max_push: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -46,6 +52,9 @@ fn parse() -> Args {
             "--json" => a.json = Some(v().into()),
             "--shaders" => a.shaders = Some(v().into()),
             "--compare" => a.compare = true,
+            "--friction" => a.friction = Some(v().parse().unwrap()),
+            "--beta" => a.beta = Some(v().parse().unwrap()),
+            "--max-push" => a.max_push = Some(v().parse().unwrap()),
             other => panic!("неизвестный аргумент {other}"),
         }
     }
@@ -111,12 +120,21 @@ fn main() {
         .iter()
         .map(|b| b.pos[1] as f32 + b.radius)
         .fold(0.0f32, f32::max);
-    let params = Params {
+    let mut params = Params {
         lo: [-0.05, 0.0, -0.05],
         hi: [4.2, top + 0.5, 4.2],
         cell: 0.16,
         ..Params::default()
     };
+    if let Some(f) = args.friction {
+        params.friction = f;
+    }
+    if let Some(b) = args.beta {
+        params.beta = b;
+    }
+    if let Some(m) = args.max_push {
+        params.max_push = m;
+    }
 
     let bodies: Vec<GpuBody> = sim.bodies.iter().map(to_gpu).collect();
     let shaders = find_shaders(args.shaders.as_deref())
@@ -230,32 +248,19 @@ fn main() {
     );
 
     if let Some(p) = &args.out {
-        // Тот же VFR2-формат, что у CPU-эталона: вьюер не различает источник.
-        let n = gpu.n;
-        let nf = frames_out.len();
-        let mut blob: Vec<u8> = Vec::new();
-        blob.extend_from_slice(b"VFR2");
-        blob.extend_from_slice(&(n as u32).to_le_bytes());
-        blob.extend_from_slice(&(nf as u32).to_le_bytes());
-        for b in &sim.bodies {
-            blob.extend_from_slice(&(b.mass as f32).to_le_bytes());
-            blob.extend_from_slice(&b.radius.to_le_bytes());
-            blob.push(0u8); // sphere
-            blob.extend_from_slice(&[0u8; 7]);
-            blob.extend_from_slice(&[0u8; 12]);
-        }
-        for frame in &frames_out {
-            for p in frame {
-                blob.extend_from_slice(&p[0].to_le_bytes());
-                blob.extend_from_slice(&p[1].to_le_bytes());
-                blob.extend_from_slice(&p[2].to_le_bytes());
-            }
-        }
+        // Тот же кодировщик, что у CPU-эталона: раскладка записи тела
+        // (f64 масса, f32 радиус, u8 форма, 3×f32 half = 25 байт) не должна
+        // разъезжаться между двумя раннерами, иначе вьюер покажет мусор.
+        let frames3: Vec<Vec<[f32; 3]>> = frames_out
+            .iter()
+            .map(|f| f.iter().map(|q| [q[0], q[1], q[2]]).collect())
+            .collect();
+        let blob = voxelforge_refsim::vfr::encode(&sim.bodies, &frames3);
         if let Some(dir) = p.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
         std::fs::write(p, &blob).unwrap();
-        println!("записано: {} ({} кадров)", p.display(), nf);
+        println!("записано: {} ({} кадров)", p.display(), frames_out.len());
 
         // Боковая проекция «до/после» — картинка для глаз, пока вьюер не открыт.
         let svg = p.with_extension("svg");
@@ -285,7 +290,7 @@ fn main() {
         let doc = format!(
             r##"<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="410" viewBox="0 0 1080 410"><rect width="1080" height="410" fill="#0d1117"/>{}{}</svg>"##,
             panel(first, 10.0, "t = 0"),
-            panel(last, 550.0, &format!("t = {:.1} с (GPU)", nf as f32 * args.dt))
+            panel(last, 550.0, &format!("t = {:.1} с (GPU)", frames_out.len() as f32 * args.dt))
         );
         std::fs::write(&svg, doc).unwrap();
         println!("картинка: {}", svg.display());
