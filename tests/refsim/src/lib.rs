@@ -34,12 +34,27 @@ pub struct Body {
     /// Половина размеров AABB: для сферы — `[r, r, r]`.
     pub half: [f64; 3],
     pub shape: Shape,
+    /// Ориентация как кватернион `[w, x, y, z]`. У сферы визуально не видна,
+    /// но без неё нет угловой динамики.
+    pub rot: [f64; 4],
+    /// Угловая скорость, рад/с.
+    pub ang: [f64; 3],
+    /// Обратный момент инерции, изотропный скаляр. `0` — вращение выключено
+    /// (блоки: их опрокидывание требует контактных манифолдов, отдельный шаг).
+    pub inv_inertia: f64,
     /// Статическое тело (бесконечная масса) — пол, планета.
     pub anchored: bool,
 }
 
 impl Body {
     pub fn new(pos: [f64; 3], vel: [f64; 3], mass: f64, radius: f32) -> Self {
+        let r = radius as f64;
+        // Момент инерции однородной сферы 2/5·m·r².
+        let inv_inertia = if mass > 0.0 && r > 0.0 {
+            1.0 / (0.4 * mass * r * r)
+        } else {
+            0.0
+        };
         Self {
             pos,
             vel,
@@ -47,6 +62,9 @@ impl Body {
             radius,
             half: [radius as f64; 3],
             shape: Shape::Sphere,
+            rot: [1.0, 0.0, 0.0, 0.0],
+            ang: [0.0; 3],
+            inv_inertia,
             anchored: false,
         }
     }
@@ -62,6 +80,11 @@ impl Body {
             radius,
             half,
             shape: Shape::Block,
+            rot: [1.0, 0.0, 0.0, 0.0],
+            ang: [0.0; 3],
+            // Вращения блоков пока нет: оно требует контактных манифолдов
+            // (несколько точек на грань), а не одной точки.
+            inv_inertia: 0.0,
             anchored: false,
         }
     }

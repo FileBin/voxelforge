@@ -37,6 +37,45 @@ fn heavy_body_does_not_swallow_light_one() {
     assert!(pebble_y < 2.5, "горошину выбросило: y = {pebble_y:.3}");
 }
 
+/// Вращение: шар, брошенный по полу скольжением, обязан перейти в качение.
+///
+/// Точное предсказание: без проскальзывания момент импульса сохраняется, и
+/// конечная скорость равна `5/7·v₀` — это классический результат для
+/// однородной сферы (I = 2/5·m·r²). Проверяем и его, и условие качения
+/// `v = ω·r`.
+#[test]
+fn sliding_sphere_transitions_to_rolling() {
+    let r = 0.1;
+    let v0 = 2.0;
+    let mut sim = PileSim::new(vec![Body::new([0.0, r, 0.0], [v0, 0.0, 0.0], 1.0, r as f32)]);
+    sim.friction = 0.8;
+    sim.angular_damping = 0.0; // проверяем идеальное качение без сопротивления
+    sim.sleep_linear = 0.0001; // сон не должен вмешаться в замер
+    sim.sleep_time = 100.0;
+    let dt = 1.0 / 240.0;
+    for _ in 0..240 {
+        sim.step(dt);
+    }
+    let b = &sim.bodies[0];
+    let v = b.vel[0];
+    let w = b.ang[2]; // качение по +x означает вращение вокруг −z
+    let slip = v + w * r; // скорость точки контакта вдоль x: v + ω×r
+
+    assert!(
+        slip.abs() < 0.05,
+        "проскальзывание {slip:.4} м/с: качение не установилось (v={v:.3}, ω·r={:.3})",
+        w * r
+    );
+    let expected = 5.0 / 7.0 * v0;
+    assert!(
+        (v - expected).abs() < 0.05,
+        "v={v:.4}, ожидалось 5/7·v₀ = {expected:.4}"
+    );
+    // ориентация должна быть валидным кватернионом
+    let n = (b.rot[0] * b.rot[0] + b.rot[1] * b.rot[1] + b.rot[2] * b.rot[2] + b.rot[3] * b.rot[3]).sqrt();
+    assert!((n - 1.0).abs() < 1e-9, "кватернион не единичный: |q| = {n}");
+}
+
 #[test]
 fn pile_is_deterministic() {
     let run = || {
