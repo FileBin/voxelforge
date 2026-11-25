@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # CI идёт через тот же flake.lock, что и локально: версии rustc, glslc
+      # и mesa не могут разъехаться между машиной и раннером.
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - name: unit tests
+        run: nix develop --command cargo test --locked
+
+      - name: "demo gate: D0 орбиты"
+        run: |
+          mkdir -p demos/out
+          nix develop --command cargo run --release --locked \
+            -p voxelforge-refsim --bin vf-ref -- \
+            --scenario orbit --frames 1500 --periods 2 --substeps 4 \
+            --json demos/out/orbit.json --out demos/out/orbit.vfr
+
+      - name: "demo gate: D0 коллапс"
+        run: |
+          nix develop --command cargo run --release --locked \
+            -p voxelforge-refsim --bin vf-ref -- \
+            --scenario collapse --bodies 400 --frames 900 --seed 7 --dt 0.01 \
+            --json demos/out/collapse.json
