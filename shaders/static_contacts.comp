@@ -1,0 +1,37 @@
+#version 450
+#include "common.glsl"
+
+/* Контакты со статикой: пол и четыре стенки ящика. Партнёр — GROUND. */
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) buffer Bodies { Body b[]; };
+layout(std430, set = 0, binding = 1) buffer Lists { C list[]; };
+layout(std430, set = 0, binding = 2) buffer ListCount { uint lc[]; };
+
+void push(uint self, vec3 n, float pen) {
+    uint slot = atomicAdd(lc[self], 1u);
+    if (int(slot) >= CAP) return;
+    C c;
+    c.meta = ivec4(GROUND, 0, 0, 0);
+    c.n_pen = vec4(n, pen);
+    list[self * CAP + slot] = c;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.grid.w)) return;
+    Body x = b[i];
+    float r = x.pos_r.w;
+    float m = pc.prm1.z;
+
+    float pen = -(x.pos_r.y - r);
+    if (pen > -m) push(i, vec3(0.0, 1.0, 0.0), pen);
+
+    float left = pc.lo.x - (x.pos_r.x - r);
+    if (left > -m) push(i, vec3(1.0, 0.0, 0.0), left);
+    float right = (x.pos_r.x + r) - pc.hi.x;
+    if (right > -m) push(i, vec3(-1.0, 0.0, 0.0), right);
+    float back = pc.lo.z - (x.pos_r.z - r);
+    if (back > -m) push(i, vec3(0.0, 0.0, 1.0), back);
+    float front = (x.pos_r.z + r) - pc.hi.z;
+    if (front > -m) push(i, vec3(0.0, 0.0, -1.0), front);
+}

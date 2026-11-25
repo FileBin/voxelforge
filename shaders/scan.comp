@@ -1,0 +1,21 @@
+#version 450
+#include "common.glsl"
+
+/* Последовательный префикс-сум по ячейкам. Один поток, 13k ячеек —
+ * микросекунды, зато без хитрой иерархии и без лишних проходов.
+ * Заодно копирует счётчики в курсоры для прохода заполнения. */
+layout(local_size_x = 1) in;
+layout(std430, set = 0, binding = 0) buffer Cells { uint cellcnt[]; };
+layout(std430, set = 0, binding = 1) buffer Starts { uint start[]; };
+layout(std430, set = 0, binding = 2) buffer Cursors { uint cursor[]; };
+
+void main() {
+    uint nc = uint(pc.grid.x * pc.grid.y * pc.grid.z);
+    uint sum = 0u;
+    for (uint i = 0u; i < nc; i++) {
+        start[i] = sum;
+        cursor[i] = 0u;   /* курсор заполнения — счётчик с нуля, не копия счёта */
+        sum += cellcnt[i];
+    }
+    start[nc] = sum;
+}

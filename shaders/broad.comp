@@ -1,0 +1,77 @@
+#version 450
+#include "common.glsl"
+
+/* Пары тел по равномерной сетке. Каждая пара попадает в списки обоих тел:
+ * нормаль в списке тела смотрит на партнёра. */
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) buffer Bodies { Body b[]; };
+layout(std430, set = 0, binding = 1) buffer Starts { uint start[]; };
+layout(std430, set = 0, binding = 2) buffer CellBodies { int ids[]; };
+layout(std430, set = 0, binding = 3) buffer Lists { C list[]; };
+layout(std430, set = 0, binding = 4) buffer ListCount { uint lc[]; };
+
+void push(int self, int other, vec3 n, float pen) {
+    uint slot = atomicAdd(lc[self], 1u);
+    if (int(slot) >= CAP) return;
+    C c;
+    c.meta = ivec4(other, 0, 0, 0);
+    c.n_pen = vec4(n, pen);
+    list[self * CAP + slot] = c;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.grid.w)) return;
+    Body a = b[i];
+    ivec3 dim = pc.grid.xyz;
+    ivec3 c = cell_of(a.pos_r.xyz, pc.lo.xyz, pc.prm1.w, dim);
+
+    for (int dz = -1; dz <= 1; dz++)
+    for (int dy = -1; dy <= 1; dy++)
+    for (int dx = -1; dx <= 1; dx++) {
+        ivec3 cc = c + ivec3(dx, dy, dz);
+        if (any(lessThan(cc, ivec3(0))) || any(greaterThanEqual(cc, dim))) continue;
+        int ci = cell_index(cc, dim);
+        uint s = start[ci];
+        uint e = start[ci + 1];
+        for (uint k = s; k < e; k++) {
+            int j = ids[k];
+            if (j <= int(i)) continue;
+            Body o = b[j];
+            bool a_sleep = a.misc.y > 0.5;
+            bool o_sleep = o.misc.y > 0.5;
+            if (a_sleep && o_sleep) continue;
+            vec3 d = o.pos_r.xyz - a.pos_r.xyz;
+            float rr0 = a.pos_r.w + o.pos_r.w;
+            if (dot(d, d) >= rr0 * rr0) continue;
+            /* Пробуждение: покоящееся тело трогает сосед, который реально
+             * едет. Порог в 4 раза выше порога сна — иначе дрожание
+             * разбудит весь штабель. */
+            float thr = 0.2;
+            if (a_sleep && dot(o.vel_m.xyz, o.vel_m.xyz) > thr * thr) {
+                Body w = b[i];
+                w.misc.y = 0.0;
+                w.misc.x = 0.0;
+                w.vel_m.w = w.misc.z;
+                w.ang_i.w = w.misc.w;
+                b[i] = w;
+                a = b[i];
+            } else if (o_sleep && dot(a.vel_m.xyz, a.vel_m.xyz) > thr * thr) {
+                Body w = b[j];
+                w.misc.y = 0.0;
+                w.misc.x = 0.0;
+                w.vel_m.w = w.misc.z;
+                w.ang_i.w = w.misc.w;
+                b[j] = w;
+                o = b[j];
+            }
+            float dist2 = dot(d, d);
+            float rr = a.pos_r.w + o.pos_r.w;
+            if (dist2 >= rr * rr || dist2 <= 1e-12) continue;
+            float dist = sqrt(dist2);
+            vec3 n = d / dist;
+            push(int(i), j, n, rr - dist);
+            push(j, int(i), -n, rr - dist);
+        }
+    }
+}

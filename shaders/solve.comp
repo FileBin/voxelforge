@@ -1,0 +1,96 @@
+#version 450
+#include "common.glsl"
+
+/* Скоростное решение контактов, Jacobi по телам.
+ *
+ * Каждое тело решает СВОЮ сторону контакта, читая партнёра из снимка
+ * (bin). Оба тела пары считают один и тот же импульс, потому что входные
+ * данные одинаковые, — значит в сумме пара получает ровно полный импульс,
+ * как в обычном последовательном солвере, но без гонок и без атомиков.
+ * Плата — сходимость медленнее Gauss-Seidel, поэтому итераций больше.
+ */
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) buffer BodiesIn { Body bin[]; };
+layout(std430, set = 0, binding = 1) buffer Lists { C list[]; };
+layout(std430, set = 0, binding = 2) buffer ListCount { uint lc[]; };
+layout(std430, set = 0, binding = 3) buffer BodiesOut { Body bout[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.grid.w)) return;
+
+    Body me = bin[i];
+    if (me.misc.y > 0.5) { bout[i] = me; return; }
+    vec3 v = me.vel_m.xyz;
+    vec3 w = me.ang_i.xyz;
+    float im = me.vel_m.w;
+    float ii = me.ang_i.w;
+    float r = me.pos_r.w;
+    float dt = pc.prm0.x;
+    float mu = pc.prm0.w;
+
+    uint n = lc[i];
+    if (n > uint(CAP)) n = uint(CAP);
+
+    for (uint k = 0u; k < n; k++) {
+        C c = list[i * CAP + k];
+        int j = c.meta.x;
+        vec3 nrm = c.n_pen.xyz;
+        float pen = c.n_pen.w;
+
+        vec3 ov = vec3(0.0);
+        vec3 ow = vec3(0.0);
+        float oim = 0.0;
+        float orad = 0.0;
+        float oii = 0.0;
+        if (j >= 0) {
+            Body o = bin[j];
+            ov = o.vel_m.xyz;
+            ow = o.ang_i.xyz;
+            oim = o.vel_m.w;
+            orad = o.pos_r.w;
+            oii = o.ang_i.w;
+        }
+
+        vec3 rself = nrm * r;
+        vec3 rother = -nrm * orad;
+        /* Соглашение: нормаль смотрит ОТ партнёра к телу. Для пары партнёр —
+         * второе тело, для статики — стенка. Отсюда два знака импульса:
+         * в паре тело стоит на стороне «a» (−P), у статики — на стороне «b» (+P).
+         * Если перепутать, пол и стены начинают втягивать тела внутрь. */
+        bool is_static = (j < 0);
+        vec3 vrel = is_static
+            ? (v + cross(w, rself))
+            : (ov + cross(ow, rother)) - (v + cross(w, rself));
+        float vn = dot(vrel, nrm);
+        float wn = im + oim;
+        if (wn <= 0.0) continue;
+
+        float push = min(max(pen - pc.prm1.z, 0.0) * pc.prm1.x / dt, pc.prm1.y);
+        float dl = (push - vn) / wn;
+        vec3 P = nrm * dl;
+        float sgn = is_static ? 1.0 : -1.0;
+        v += P * (im * sgn);
+        w += cross(rself, P) * (ii * sgn);
+
+        vec3 vt_vec = vrel - nrm * vn;
+        float vt = length(vt_vec);
+        if (mu > 0.0 && vt > 1e-7) {
+            vec3 t = vt_vec / vt;
+            vec3 ra_xt = cross(rself, t);
+            vec3 rb_xt = cross(rother, t);
+            float wt = im + oim + dot(ra_xt, ra_xt) * ii + dot(rb_xt, rb_xt) * oii;
+            if (wt > 0.0) {
+                float cap = mu * max(dl, 0.0);
+                float dlt = clamp(-vt / wt, -cap, cap);
+                vec3 Pt = t * dlt;
+                v += Pt * (im * sgn);
+                w += cross(rself, Pt) * (ii * sgn);
+            }
+        }
+    }
+
+    me.vel_m = vec4(v, im);
+    me.ang_i = vec4(w, ii);
+    bout[i] = me;
+}

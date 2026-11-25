@@ -12,6 +12,7 @@
 //! не синхронизируется; в GPU-солвере они, наоборот, запрещены гейтами.
 
 pub mod contact;
+pub mod gpu;
 pub mod pile;
 
 pub use contact::ContactSim;

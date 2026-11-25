@@ -105,6 +105,26 @@
             program = "${demo "pile" "pile" "--bodies 2000 --frames 420 --substeps 8 --iterations 8"}/bin/voxelforge-pile";
           };
           vf-ref = { type = "app"; program = "${vfref}/bin/vf-ref"; };
+          gpu = {
+            type = "app";
+            program = "${pkgs.writeShellApplication {
+              name = "voxelforge-gpu";
+              runtimeInputs = [ pkgs.mesa pkgs.vulkan-loader ];
+              text = ''
+                out="''${OUT_DIR:-demos/out}"
+                mkdir -p "$out"
+                if [ -z "''${VK_ICD_FILENAMES:-}" ]; then
+                  lvp="$(ls ${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.*.json 2>/dev/null | head -n1)"
+                  [ -n "$lvp" ] && export VK_ICD_FILENAMES="$lvp"
+                fi
+                ${vfref}/bin/vf_gpu --shaders ${self.packages.${system}.spirv} \
+                  --out "$out/pile-gpu.vfr" --json "$out/pile-gpu.json" "$@"
+                echo ""
+                echo "готово: $out/pile-gpu.vfr"
+                echo "смотреть: открыть viewer/index.html и перетащить туда файл"
+              '';
+            }}/bin/voxelforge-gpu";
+          };
         });
 
       devShells = forAll (system: pkgs: {
@@ -130,6 +150,18 @@
       });
 
       packages = forAll (system: pkgs: {
+        # SPIR-V из GLSL: собирается один раз, используется приложением, гейтом
+        # и тестами. Шейдеры грузятся в рантайме, поэтому путь передаётся явно.
+        spirv = pkgs.runCommand "voxelforge-spv" {
+          nativeBuildInputs = [ pkgs.shaderc ];
+        } ''
+          mkdir -p "$out"
+          cd ${./shaders}
+          for f in *.comp; do
+            glslc -I. "$f" -o "$out/''${f%.comp}.spv"
+          done
+        '';
+
         default = pkgs.rustPlatform.buildRustPackage {
           pname = "vf-ref";
           version = "0.0.0";
@@ -141,6 +173,7 @@
           };
           cargoLock.lockFile = ./Cargo.lock;
           nativeBuildInputs = [ pkgs.gcc ];
+          buildInputs = [ pkgs.vulkan-loader ];
           meta.mainProgram = "vf-ref";
         };
       });
@@ -166,6 +199,21 @@
           ${self.packages.${system}.default}/bin/vf-ref \
             --scenario stack --bodies 10 --frames 600 --substeps 8 --iterations 8 \
             --json "$out/stack.json" --out "$out/stack.vfr" | tee "$out/log.txt"
+        '';
+
+        # GPU-путь целиком: C-ядро, шейдеры, сетка пар, солвер, сон.
+        # Гоняется на lavapipe — видеокарта не нужна и не может подвиснуть.
+        demo-gpu = pkgs.runCommand "demo-gpu" { } ''
+          mkdir -p "$out"
+          export VK_ICD_FILENAMES="$(ls ${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.*.json | head -n1)"
+          ${self.packages.${system}.default}/bin/vf_gpu \
+            --shaders ${self.packages.${system}.spirv} \
+            --bodies 1000 --frames 300 --iterations 16 \
+            --json "$out/pile.json" --out "$out/pile.vfr" | tee "$out/log.txt"
+          grep -q "summary:" "$out/log.txt"
+          pen=$(sed -n 's/.*pen=\([0-9.]*\).*/\1/p' "$out/log.txt" | head -n1)
+          echo "проникновение: $pen м"
+          awk -v p="$pen" 'BEGIN { if (p + 0 > 0.01) { print "FAIL: проникновение > 1 см"; exit 1 } }'
         '';
 
         # D3: куча должна уснуть и не провалиться. Файл трека не пишем —

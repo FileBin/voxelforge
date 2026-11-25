@@ -1,0 +1,18 @@
+#version 450
+#include "common.glsl"
+
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) buffer Bodies { Body b[]; };
+layout(std430, set = 0, binding = 1) buffer Cursors { uint cursor[]; };
+layout(std430, set = 0, binding = 2) buffer Starts { uint start[]; };
+layout(std430, set = 0, binding = 3) buffer CellBodies { int ids[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.grid.w)) return;
+    ivec3 dim = pc.grid.xyz;
+    ivec3 c = cell_of(b[i].pos_r.xyz, pc.lo.xyz, pc.prm1.w, dim);
+    int ci = cell_index(c, dim);
+    uint slot = atomicAdd(cursor[ci], 1u);
+    ids[start[ci] + slot] = int(i);
+}
