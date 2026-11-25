@@ -160,6 +160,12 @@ fn main() {
                     .map(|b| b.pos_r[1] + b.pos_r[3])
                     .fold(0.0f32, f32::max);
                 let pen = max_penetration(&snap);
+                // Максимальная высота — метрика обманчивая: пара шаров,
+                // заклинившихся в углу, делает «кучу» вдвое выше. Берём
+                // 99-й процентиль: он описывает саму кучу, а не выбросы.
+                let mut hs: Vec<f32> = snap.iter().map(|b| b.pos_r[1] + b.pos_r[3]).collect();
+                hs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let p99 = hs[(hs.len() * 99 / 100).min(hs.len() - 1)];
                 let (mut xmin, mut xmax, mut zmin, mut zmax) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
                 for b in &snap {
                     xmin = xmin.min(b.pos_r[0]);
@@ -175,8 +181,8 @@ fn main() {
                 let avg = counts.iter().map(|&c| c as f64).sum::<f64>() / counts.len() as f64;
                 println!("контактов на тело: среднее {avg:.1}, упёрлись в CAP: {filled}");
                 println!(
-                    "summary: scenario=pile bodies={} frames={} slept_at={:.2}s pen={:.4} top={:.2}->{:.2} vmax={:.3}",
-                    gpu.n, args.frames, slept_at, pen, top_start, top_end, vmax
+                    "summary: scenario=pile bodies={} frames={} slept_at={:.2}s pen={:.4} top={:.2}->{:.2} p99={:.2} vmax={:.3}",
+                    gpu.n, args.frames, slept_at, pen, top_start, top_end, p99, vmax
                 );
                 if args.compare {
                     let mut cpu = pile_demo(args.bodies);

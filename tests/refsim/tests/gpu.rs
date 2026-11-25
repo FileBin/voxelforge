@@ -42,6 +42,8 @@ fn to_gpu(body: &Body) -> GpuBody {
 
 struct Outcome {
     top: f32,
+    /// 99-й процентиль высоты: устойчив к паре шаров, заклинившихся в углу.
+    p99: f32,
     vmax: f32,
     pen: f64,
     asleep: usize,
@@ -77,6 +79,9 @@ fn run_gpu(n: usize, frames: u32, iters: u32, shaders: &Path) -> Outcome {
             (b.vel_m[0] * b.vel_m[0] + b.vel_m[1] * b.vel_m[1] + b.vel_m[2] * b.vel_m[2]).sqrt()
         })
         .fold(0.0f32, f32::max);
+    let mut hs: Vec<f32> = snap.iter().map(|b| b.pos_r[1] + b.pos_r[3]).collect();
+    hs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p99 = hs[(hs.len() * 99 / 100).min(hs.len() - 1)];
     let asleep = snap.iter().filter(|b| b.misc[1] > 0.5).count();
     let out_of_box = snap
         .iter()
@@ -99,6 +104,7 @@ fn run_gpu(n: usize, frames: u32, iters: u32, shaders: &Path) -> Outcome {
     }
     Outcome {
         top: top_end,
+        p99,
         vmax,
         pen,
         asleep,
@@ -148,12 +154,15 @@ fn gpu_pile_matches_cpu_reference() {
         .iter()
         .map(|b| b.pos[1] + b.radius as f64)
         .fold(0.0f64, f64::max);
+    let mut cpu_hs: Vec<f64> = cpu.bodies.iter().map(|b| b.pos[1] + b.radius as f64).collect();
+    cpu_hs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let cpu_p99 = cpu_hs[(cpu_hs.len() * 99 / 100).min(cpu_hs.len() - 1)];
     let cpu_awake = cpu.awake;
     let cpu_pen = cpu.max_penetration();
 
     eprintln!(
-        "GPU: top={:.3} pen={:.4} v={:.3} asleep={} | CPU: top={:.3} pen={:.4} awake={}",
-        gpu.top, gpu.pen, gpu.vmax, gpu.asleep, cpu_top, cpu_pen, cpu_awake
+        "GPU: p99={:.3} pen={:.4} v={:.3} asleep={} | CPU: p99={:.3} pen={:.4} awake={}",
+        gpu.p99, gpu.pen, gpu.vmax, gpu.asleep, cpu_p99, cpu_pen, cpu_awake
     );
 
     assert_eq!(gpu.out_of_box, 0, "GPU: {} тел вылетели из ящика", gpu.out_of_box);
@@ -178,7 +187,13 @@ fn gpu_pile_matches_cpu_reference() {
      * Проверяем, что обе кучи в физически осмысленном диапазоне: не
      * «пыль» на полу и не столб. */
     assert!(
-        gpu.top > 0.35 && gpu.top < 2.2,
+        (gpu.p99 as f64 - cpu_p99).abs() / cpu_p99 < 0.5,
+        "толщина кучи разошлась с эталоном: GPU p99 {:.3} против CPU p99 {:.3}",
+        gpu.p99,
+        cpu_p99
+    );
+    assert!(
+        gpu.top > 0.35 && gpu.top < 2.4,
         "высота кучи на GPU неправдоподобна: {:.3} м (CPU {:.3})",
         gpu.top,
         cpu_top
