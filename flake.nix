@@ -70,6 +70,7 @@
               echo "  nix run .#collapse    гравитационный коллапс облака (400 тел)"
               echo "  nix run .#drop        D1: блок падает на пол и остаётся лежать"
               echo "  nix run .#stack       D2: стопка из 10 блоков стоит 10 секунд"
+              echo "  nix run .#pile        D3: куча из 2000 сфер ложится и засыпает"
               echo "  nix run .#vf-ref -- --scenario stack --bodies 20   прямой доступ к CLI"
               echo "  nix run .#help        эта справка"
               echo ""
@@ -98,6 +99,10 @@
           stack = {
             type = "app";
             program = "${demo "stack" "stack" "--bodies 10 --frames 600 --dt 0.0166 --substeps 8 --iterations 8"}/bin/voxelforge-stack";
+          };
+          pile = {
+            type = "app";
+            program = "${demo "pile" "pile" "--bodies 2000 --frames 420 --substeps 4 --iterations 8"}/bin/voxelforge-pile";
           };
           vf-ref = { type = "app"; program = "${vfref}/bin/vf-ref"; };
         });
@@ -161,6 +166,15 @@
           ${self.packages.${system}.default}/bin/vf-ref \
             --scenario stack --bodies 10 --frames 600 --substeps 8 --iterations 8 \
             --json "$out/stack.json" --out "$out/stack.vfr" | tee "$out/log.txt"
+        '';
+
+        # D3: куча должна уснуть и не провалиться. Файл трека не пишем —
+        # он весит десятки мегабайт, а гейту нужны только метрики.
+        demo-pile = pkgs.runCommand "demo-pile" { } ''
+          mkdir -p "$out"
+          ${self.packages.${system}.default}/bin/vf-ref \
+            --scenario pile --bodies 1200 --frames 300 --substeps 4 --iterations 8 \
+            --json "$out/pile.json" | tee "$out/log.txt"
         '';
       });
     };

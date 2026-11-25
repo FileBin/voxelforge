@@ -15,7 +15,7 @@
 
 use std::process::ExitCode;
 
-use voxelforge_refsim::{svg, vfr, Body, ContactSim, Rng, Sim};
+use voxelforge_refsim::{svg, vfr, Body, ContactSim, PileSim, Rng, Sim};
 
 struct Args {
     scenario: String,
@@ -133,6 +133,21 @@ fn stack_scenario(count: usize, substeps: usize, iterations: usize) -> ContactSi
     }
     let mut sim = ContactSim::new(bodies);
     sim.gravity = 9.81;
+    sim.substeps = substeps;
+    sim.iterations = iterations;
+    sim
+}
+
+/// D3: куча из сфер, брошенных решёткой над полом.
+fn pile_scenario(count: usize, substeps: usize, iterations: usize) -> PileSim {
+    let mut bodies = Vec::new();
+    for i in 0..count.max(1) {
+        let x = (i % 17) as f64 * 0.24;
+        let z = ((i / 17) % 17) as f64 * 0.24;
+        let y = 1.0 + (i / 289) as f64 * 0.24;
+        bodies.push(Body::new([x, y, z], [0.0; 3], 1.0, 0.08));
+    }
+    let mut sim = PileSim::new(bodies);
     sim.substeps = substeps;
     sim.iterations = iterations;
     sim
@@ -349,11 +364,89 @@ fn run_contact(args: &Args) -> ExitCode {
     }
 }
 
+fn run_pile(args: &Args) -> ExitCode {
+    let mut sim = pile_scenario(args.bodies, args.substeps, args.iterations);
+    let top0 = sim.top();
+    let dt = if args.dt > 0.0 { args.dt } else { 1.0 / 60.0 };
+
+    let mut frames: Vec<Vec<[f32; 3]>> = Vec::with_capacity(args.frames);
+    let mut slept_at: Option<f64> = None;
+    for f in 0..args.frames {
+        sim.step(dt);
+        if slept_at.is_none() && sim.awake == 0 {
+            slept_at = Some((f + 1) as f64 * dt);
+        }
+        frames.push(
+            sim.bodies
+                .iter()
+                .map(|b| [b.pos[0] as f32, b.pos[1] as f32, b.pos[2] as f32])
+                .collect(),
+        );
+    }
+
+    let top1 = sim.top();
+    let pen = sim.max_penetration();
+    let speed = sim.max_speed();
+    let awake = sim.awake;
+
+    if let Err(e) = write_outputs(args, &sim.bodies, &frames) {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
+
+    let slept = slept_at.unwrap_or(-1.0);
+    let json = format!(
+        concat!(
+            "{{",
+            "\"scenario\":\"pile\",\"bodies\":{},\"frames\":{},\"substeps\":{},\"iterations\":{},\"dt\":{:.9},",
+            "\"top_start\":{:.6},\"top_end\":{:.6},\"slept_at\":{:.4},",
+            "\"awake\":{},\"max_penetration\":{:.6e},\"max_speed\":{:.6e}",
+            "}}"
+        ),
+        sim.bodies.len(),
+        args.frames,
+        args.substeps,
+        args.iterations,
+        dt,
+        top0,
+        top1,
+        slept,
+        awake,
+        pen,
+        speed
+    );
+    if let Err(e) = write_json(args, &json) {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
+    println!("{json}");
+    println!(
+        "summary: scenario=pile bodies={} frames={} slept_at={:.2}s awake={} pen={:.4} max_speed={:.3}",
+        sim.bodies.len(),
+        args.frames,
+        slept,
+        awake,
+        pen,
+        speed
+    );
+
+    if awake > 0 {
+        eprintln!("FAIL: не все тела уснули за {} кадров (бодрствуют {})", args.frames, awake);
+        return ExitCode::FAILURE;
+    }
+    if pen > 0.02 {
+        eprintln!("FAIL: проникновение {:.4} м > 2 см", pen);
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
     let args = Args::parse();
     match args.scenario.as_str() {
         "orbit" | "collapse" => run_gravity(&args),
         "drop" | "stack" => run_contact(&args),
+        "pile" => run_pile(&args),
         other => {
             eprintln!("unknown scenario: {other} (orbit|collapse|drop|stack)");
             ExitCode::from(2)
