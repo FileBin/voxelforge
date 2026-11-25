@@ -29,7 +29,12 @@
   <b>voxelforge</b>
   <input id="file" type="file" accept=".vfr" style="max-width:180px">
   <button id="play">⏸ пауза</button>
+  <button id="prev10" title="−10 кадров (Shift+←)">«10</button>
+  <button id="prev" title="предыдущий кадр (←)">◀</button>
+  <button id="next" title="следующий кадр (→)">▶</button>
+  <button id="next10" title="+10 кадров (Shift+→)">10»</button>
   <input id="frame" type="range" min="0" max="0" value="0">
+  <span id="pos" class="hint">—</span>
   <select id="speed">
     <option value="15">0.25×</option>
     <option value="30">0.5×</option>
@@ -159,7 +164,11 @@ function cubeMesh() {
   ];
   const v = [];
   for (const [n, u, w] of faces) {
-    const c = [n[0] + u[0] + w[0], n[1] + u[1] + w[1], n[2] + u[2] + w[2]];
+    // Центр грани — это ровно n (нормаль единичной длины). Раньше здесь было
+    // n + u + w, и все шесть квадов съезжали в угол: грани не смыкались,
+    // четыре из них смотрели внутрь и отсекались как изнанка — коробка
+    // выглядела «раскрытой».
+    const c = n;
     const p = (s1, s2) => [c[0] + s1 * u[0] + s2 * w[0], c[1] + s1 * u[1] + s2 * w[1], c[2] + s1 * u[2] + s2 * w[2]];
     const a = p(-1, -1), b = p(1, -1), d = p(1, 1), e = p(-1, 1);
     for (const tri of [[a, b, d], [a, d, e]]) for (const q of tri) v.push(q[0], q[1], q[2], n[0], n[1], n[2]);
@@ -403,6 +412,7 @@ function loop(now) {
       acc -= steps;
       frame = (frame + steps) % sim.nf;
       $("frame").value = String(frame);
+      $("pos").textContent = `${frame + 1} / ${sim.nf}`;
     }
   }
   render();
@@ -437,12 +447,38 @@ cv.addEventListener("wheel", (e) => {
   cam.dist = Math.max(0.02, Math.min(50000, cam.dist * Math.exp(e.deltaY * 0.0012)));
 }, { passive: false });
 window.addEventListener("keydown", (e) => {
-  if (e.code === "Space") { e.preventDefault(); play = !play; syncPlay(); }
+  const tag = (e.target && e.target.tagName) || "";
+  if (tag === "INPUT" && e.code !== "Space") return;   // не мешаем полю выбора файла
+  switch (e.code) {
+    case "Space": e.preventDefault(); play = !play; syncPlay(); break;
+    case "ArrowLeft": e.preventDefault(); stepFrame(e.shiftKey ? -10 : -1); break;
+    case "ArrowRight": e.preventDefault(); stepFrame(e.shiftKey ? 10 : 1); break;
+    case "ArrowUp": e.preventDefault(); stepFrame(10); break;
+    case "ArrowDown": e.preventDefault(); stepFrame(-10); break;
+    case "Home": if (sim) { e.preventDefault(); setFrame(0, true); } break;
+    case "End": if (sim) { e.preventDefault(); setFrame(sim.nf - 1, true); } break;
+  }
 });
 $("file").addEventListener("change", (e) => { if (e.target.files[0]) loadFile(e.target.files[0]); });
 $("play").addEventListener("click", () => { play = !play; syncPlay(); });
 $("speed").addEventListener("change", (e) => { speed = +e.target.value; });
-$("frame").addEventListener("input", (e) => { frame = +e.target.value; });
+$("frame").addEventListener("input", (e) => { setFrame(+e.target.value); });
+
+// Ручной шаг всегда ставит на паузу: если вы смотрите кадр, листать дальше
+// автоматически — мешает.
+function setFrame(f, pause = false) {
+  if (!sim) return;
+  if (pause && play) { play = false; syncPlay(); }
+  frame = Math.max(0, Math.min(sim.nf - 1, Math.round(f)));
+  $("frame").value = String(frame);
+  $("pos").textContent = `${frame + 1} / ${sim.nf}`;
+}
+function stepFrame(d) { if (sim) setFrame(frame + d, true); }
+
+$("prev").addEventListener("click", () => stepFrame(-1));
+$("next").addEventListener("click", () => stepFrame(1));
+$("prev10").addEventListener("click", () => stepFrame(-10));
+$("next10").addEventListener("click", () => stepFrame(10));
 ["dragenter", "dragover"].forEach((ev) => window.addEventListener(ev, (e) => e.preventDefault()));
 window.addEventListener("drop", (e) => {
   e.preventDefault();
