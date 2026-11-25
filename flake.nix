@@ -40,6 +40,58 @@
       ];
     in
     {
+      apps = forAll (system: pkgs:
+        let
+          vfref = self.packages.${system}.default;
+
+          # Обёртка демки: пишет результаты в $OUT_DIR (по умолчанию ./out),
+          # лишние аргументы после `--` уходят прямо в vf-ref и перекрывают
+          # дефолты (парсер берёт последнее значение).
+          demo = name: scenario: defaults: pkgs.writeShellApplication {
+            name = "voxelforge-${name}";
+            text = ''
+              out="''${OUT_DIR:-demos/out}"
+              mkdir -p "$out"
+              ${vfref}/bin/vf-ref --scenario ${scenario} ${defaults} \
+                --out "$out/${name}.vfr" --svg "$out/${name}.svg" --json "$out/${name}.json" \
+                "$@"
+              echo ""
+              echo "готово: $out/${name}.vfr"
+              echo "смотреть: открыть viewer/index.html и перетащить туда файл"
+            '';
+          };
+
+          help = pkgs.writeShellApplication {
+            name = "voxelforge";
+            text = ''
+              echo "voxelforge — демки физики на CPU-эталоне"
+              echo ""
+              echo "  nix run .#orbit       орбиты: звезда + 3 планеты, 2 периода"
+              echo "  nix run .#collapse    гравитационный коллапс облака (400 тел)"
+              echo "  nix run .#vf-ref -- --scenario orbit --frames 900   прямой доступ к CLI"
+              echo "  nix run .#help        эта справка"
+              echo ""
+              echo "  результаты → ./out  (другой каталог: OUT_DIR=dir nix run .#orbit)"
+              echo "  просмотр   → viewer/index.html, перетащить .vfr в окно"
+              echo ""
+              echo "  все флаги: --frames --dt --periods --substeps --bodies --seed --svg --size"
+            '';
+          };
+        in
+        {
+          default = { type = "app"; program = "${help}/bin/voxelforge"; };
+          help = { type = "app"; program = "${help}/bin/voxelforge"; };
+          orbit = {
+            type = "app";
+            program = "${demo "orbit" "orbit" "--frames 1500 --periods 2 --substeps 4"}/bin/voxelforge-orbit";
+          };
+          collapse = {
+            type = "app";
+            program = "${demo "collapse" "collapse" "--bodies 400 --frames 900 --seed 7 --dt 0.01"}/bin/voxelforge-collapse";
+          };
+          vf-ref = { type = "app"; program = "${vfref}/bin/vf-ref"; };
+        });
+
       devShells = forAll (system: pkgs: {
         default = pkgs.mkShell {
           name = "voxelforge";
