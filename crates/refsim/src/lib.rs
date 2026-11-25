@@ -1,4 +1,4 @@
-//! CPU-эталон физики: гравитация, интегратор, запись траекторий.
+//! CPU-эталон физики: гравитация, интегратор, контакты, запись траекторий.
 //!
 //! Это **оракул**, а не продакшн-путь. Он существует, чтобы:
 //! 1. давать числа для приёмочных тестов, пока GPU-версии нет;
@@ -6,25 +6,62 @@
 //! 3. позволять смотреть симуляцию без GPU и без окна — через записанный трек.
 //!
 //! Всё в `f64`, суммирование в фиксированном порядке индексов: два прогона с
-//! одинаковым входом обязаны дать побайтово одинаковую запись (это тест
-//! `deterministic_recording`). Трансцендентные функции (`sqrt`) здесь
-//! допустимы — эталон живёт на одной машине и ни с кем не синхронизируется;
-//! в GPU-солвере они, наоборот, запрещены гейтами детерминизма.
+//! одинаковым входом обязаны дать побайтово одинаковую запись (тесты
+//! `deterministic_recording` и `contact_sim_deterministic`). Трансцендентные
+//! функции (`sqrt`) здесь допустимы — эталон живёт на одной машине и ни с кем
+//! не синхронизируется; в GPU-солвере они, наоборот, запрещены гейтами.
 
-/// Тело: точечная масса со сферой визуального радиуса.
+pub mod contact;
+
+pub use contact::ContactSim;
+
+/// Форма тела: сфера (гравитационные демки) или блок (контактные демки).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shape {
+    Sphere,
+    Block,
+}
+
+/// Тело: масса, положение, форма. Вращения пока нет (см. модуль `contact`).
 #[derive(Clone, Copy, Debug)]
 pub struct Body {
     pub pos: [f64; 3],
     pub vel: [f64; 3],
     pub mass: f64,
     pub radius: f32,
-    /// Статическое тело (бесконечная масса) — для будущих планет.
+    /// Половина размеров AABB: для сферы — `[r, r, r]`.
+    pub half: [f64; 3],
+    pub shape: Shape,
+    /// Статическое тело (бесконечная масса) — пол, планета.
     pub anchored: bool,
 }
 
 impl Body {
     pub fn new(pos: [f64; 3], vel: [f64; 3], mass: f64, radius: f32) -> Self {
-        Self { pos, vel, mass, radius, anchored: false }
+        Self {
+            pos,
+            vel,
+            mass,
+            radius,
+            half: [radius as f64; 3],
+            shape: Shape::Sphere,
+            anchored: false,
+        }
+    }
+
+    /// Коробка по половине размеров; масса — из плотности 1.
+    pub fn block(pos: [f64; 3], half: [f64; 3]) -> Self {
+        let volume = 8.0 * half[0] * half[1] * half[2];
+        let radius = half[0].max(half[1]).max(half[2]) as f32;
+        Self {
+            pos,
+            vel: [0.0; 3],
+            mass: volume,
+            radius,
+            half,
+            shape: Shape::Block,
+            anchored: false,
+        }
     }
 }
 
@@ -160,20 +197,28 @@ impl Rng {
     }
 }
 
-/// Формат записи траектории `.vfr`:
-/// magic "VFR1" | u32 bodies | u32 frames | f64 mass[n] | f32 radius[n] | f32 pos[3n] × frames
+/// Формат записи траектории `.vfr`, версия 2 (с формой тела):
+///
+/// `"VFR2" | u32 bodies | u32 frames | [f64 mass, f32 radius, u8 shape, f32 half×3]×n | f32 pos×3 × frames`
 pub mod vfr {
-    pub const MAGIC: &[u8; 4] = b"VFR1";
+    pub const MAGIC: &[u8; 4] = b"VFR2";
 
     pub fn encode(bodies: &[crate::Body], frames: &[Vec<[f32; 3]>]) -> Vec<u8> {
         let n = bodies.len();
-        let mut out = Vec::with_capacity(12 + n * 12 + frames.len() * n * 12);
+        let mut out = Vec::with_capacity(12 + n * 21 + frames.len() * n * 12);
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&(n as u32).to_le_bytes());
         out.extend_from_slice(&(frames.len() as u32).to_le_bytes());
         for b in bodies {
             out.extend_from_slice(&b.mass.to_le_bytes());
             out.extend_from_slice(&b.radius.to_le_bytes());
+            out.push(match b.shape {
+                crate::Shape::Sphere => 0u8,
+                crate::Shape::Block => 1u8,
+            });
+            for k in 0..3 {
+                out.extend_from_slice(&(b.half[k] as f32).to_le_bytes());
+            }
         }
         for f in frames {
             for p in f {
@@ -186,7 +231,7 @@ pub mod vfr {
     }
 }
 
-/// Простенький SVG-снимок: траектории и текущие положения (вид сверху).
+/// Простенький SVG-снимок: траектории и текущие положения (вид сбоку, x–y).
 pub fn svg(bodies: &[Body], frames: &[Vec<[f32; 3]>], size: u32) -> String {
     let mut lo = [f32::INFINITY; 3];
     let mut hi = [f32::NEG_INFINITY; 3];
@@ -198,9 +243,14 @@ pub fn svg(bodies: &[Body], frames: &[Vec<[f32; 3]>], size: u32) -> String {
             }
         }
     }
+    // Учитываем размеры тел, иначе крайние блоки обрезаются рамкой.
+    let pad = bodies
+        .iter()
+        .map(|b| (b.half[0] as f32).max(b.half[1] as f32))
+        .fold(0.0f32, f32::max);
     let cx = 0.5 * (lo[0] + hi[0]);
     let cy = 0.5 * (lo[1] + hi[1]);
-    let span = (hi[0] - lo[0]).max(hi[1] - lo[1]).max(1.0) * 0.55;
+    let span = ((hi[0] - lo[0]).max(hi[1] - lo[1]) + 2.0 * pad).max(1.0) * 0.55;
     let s = (size as f32 * 0.5) / span;
     let px = |x: f32| size as f32 * 0.5 + (x - cx) * s;
     let py = |y: f32| size as f32 * 0.5 - (y - cy) * s;
@@ -210,6 +260,13 @@ pub fn svg(bodies: &[Body], frames: &[Vec<[f32; 3]>], size: u32) -> String {
         r##"<svg xmlns="http://www.w3.org/2000/svg" width="{0}" height="{0}" viewBox="0 0 {0} {0}"><rect width="{0}" height="{0}" fill="#0b0f14"/>"##,
         size
     ));
+    let ground_y = py(0.0);
+    if ground_y >= 0.0 && ground_y <= size as f32 {
+        out.push_str(&format!(
+            r##"<line x1="0" y1="{:.1}" x2="{}" y2="{:.1}" stroke="#1e2b38" stroke-width="1"/>"##,
+            ground_y, size, ground_y
+        ));
+    }
     let palette = ["#59a5ff", "#ffb347", "#7ee08a", "#ff6b8a", "#c48aff", "#4fd6d6"];
     // Траектории рисуем только для малого числа тел: иначе SVG раздувается.
     if bodies.len() <= 64 {
@@ -233,14 +290,31 @@ pub fn svg(bodies: &[Body], frames: &[Vec<[f32; 3]>], size: u32) -> String {
     if let Some(last) = frames.last() {
         for (i, b) in bodies.iter().enumerate() {
             let p = last[i];
-            let r = (b.radius * s).clamp(1.5, 14.0);
-            out.push_str(&format!(
-                r#"<circle cx="{:.1}" cy="{:.1}" r="{:.1}" fill="{}"/>"#,
-                px(p[0]),
-                py(p[1]),
-                r,
-                palette[i % palette.len()]
-            ));
+            let color = palette[i % palette.len()];
+            match b.shape {
+                Shape::Block => {
+                    let hw = (b.half[0] as f32 * s).max(1.0);
+                    let hh = (b.half[1] as f32 * s).max(1.0);
+                    out.push_str(&format!(
+                        r#"<rect x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}" fill="{}"/>"#,
+                        px(p[0]) - hw,
+                        py(p[1]) - hh,
+                        2.0 * hw,
+                        2.0 * hh,
+                        color
+                    ));
+                }
+                Shape::Sphere => {
+                    let r = (b.radius * s).clamp(1.5, 14.0);
+                    out.push_str(&format!(
+                        r#"<circle cx="{:.1}" cy="{:.1}" r="{:.1}" fill="{}"/>"#,
+                        px(p[0]),
+                        py(p[1]),
+                        r,
+                        color
+                    ));
+                }
+            }
         }
     }
     out.push_str("</svg>");

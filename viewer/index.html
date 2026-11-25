@@ -60,13 +60,22 @@ let acc = 0, last = 0;
 function parseVFR(buf) {
   const dv = new DataView(buf);
   const magic = String.fromCharCode(dv.getUint8(0), dv.getUint8(1), dv.getUint8(2), dv.getUint8(3));
-  if (magic !== "VFR1") throw new Error("не VFR1: " + magic);
+  if (magic !== "VFR1" && magic !== "VFR2") throw new Error("не VFR1/VFR2: " + magic);
   const n = dv.getUint32(4, true), nf = dv.getUint32(8, true);
   let off = 12;
-  const radii = [];
+  const radii = [], halfs = [], shapes = [];
   for (let i = 0; i < n; i++) {
-    off += 8;                                  // mass (f64), не нужна для картинки
-    radii.push(dv.getFloat32(off, true)); off += 4;
+    off += 8;                                  // mass (f64), для картинки не нужна
+    const r = dv.getFloat32(off, true); off += 4;
+    radii.push(r);
+    if (magic === "VFR2") {
+      shapes.push(dv.getUint8(off)); off += 1;
+      halfs.push([dv.getFloat32(off, true), dv.getFloat32(off + 4, true), dv.getFloat32(off + 8, true)]);
+      off += 12;
+    } else {
+      shapes.push(0);
+      halfs.push([r, r, r]);
+    }
   }
   const frames = [];
   const lo = [Infinity, Infinity], hi = [-Infinity, -Infinity];
@@ -80,7 +89,7 @@ function parseVFR(buf) {
       if (y < lo[1]) lo[1] = y; if (y > hi[1]) hi[1] = y;
     }
   }
-  return { n, nf, radii, frames, lo, hi };
+  return { n, nf, radii, halfs, shapes, frames, lo, hi };
 }
 
 function loadArrayBuffer(buf, name) {
@@ -169,11 +178,20 @@ function draw() {
   const cur = sim.frames[frame];
   for (let i = 0; i < sim.n; i++) {
     const x = X(cur[3 * i]), y = Y(cur[3 * i + 1]);
-    const r = Math.max(1.5, Math.min(sim.radii[i] * s, 16));
-    ctx.beginPath();
-    ctx.arc(x, y, r, 0, Math.PI * 2);
-    ctx.fillStyle = PALETTE[i % PALETTE.length];
-    ctx.fill();
+    const color = PALETTE[i % PALETTE.length];
+    if (sim.shapes[i] === 1) {
+      // блок: прямоугольник по половине размеров (вид сбоку, x–y)
+      const hw = Math.max(1.5, sim.halfs[i][0] * s);
+      const hh = Math.max(1.5, sim.halfs[i][1] * s);
+      ctx.fillStyle = color;
+      ctx.fillRect(x - hw, y - hh, 2 * hw, 2 * hh);
+    } else {
+      const r = Math.max(1.5, Math.min(sim.radii[i] * s, 16));
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+    }
   }
 
   ctx.fillStyle = "#5d7286";

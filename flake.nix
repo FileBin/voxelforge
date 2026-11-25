@@ -68,13 +68,15 @@
               echo ""
               echo "  nix run .#orbit       орбиты: звезда + 3 планеты, 2 периода"
               echo "  nix run .#collapse    гравитационный коллапс облака (400 тел)"
-              echo "  nix run .#vf-ref -- --scenario orbit --frames 900   прямой доступ к CLI"
+              echo "  nix run .#drop        D1: блок падает на пол и остаётся лежать"
+              echo "  nix run .#stack       D2: стопка из 10 блоков стоит 10 секунд"
+              echo "  nix run .#vf-ref -- --scenario stack --bodies 20   прямой доступ к CLI"
               echo "  nix run .#help        эта справка"
               echo ""
-              echo "  результаты → ./out  (другой каталог: OUT_DIR=dir nix run .#orbit)"
+              echo "  результаты → demos/out  (другой каталог: OUT_DIR=dir nix run .#stack)"
               echo "  просмотр   → viewer/index.html, перетащить .vfr в окно"
               echo ""
-              echo "  все флаги: --frames --dt --periods --substeps --bodies --seed --svg --size"
+              echo "  все флаги: --frames --dt --periods --substeps --iterations --bodies --seed --svg --size"
             '';
           };
         in
@@ -88,6 +90,14 @@
           collapse = {
             type = "app";
             program = "${demo "collapse" "collapse" "--bodies 400 --frames 900 --seed 7 --dt 0.01"}/bin/voxelforge-collapse";
+          };
+          drop = {
+            type = "app";
+            program = "${demo "drop" "drop" "--frames 300 --dt 0.0166 --substeps 8 --iterations 6"}/bin/voxelforge-drop";
+          };
+          stack = {
+            type = "app";
+            program = "${demo "stack" "stack" "--bodies 10 --frames 600 --dt 0.0166 --substeps 8 --iterations 8"}/bin/voxelforge-stack";
           };
           vf-ref = { type = "app"; program = "${vfref}/bin/vf-ref"; };
         });
@@ -142,6 +152,15 @@
           ${self.packages.${system}.default}/bin/vf-ref \
             --scenario orbit --frames 600 --periods 2 --substeps 4 \
             --json "$out/orbit.json" --out "$out/orbit.vfr" | tee "$out/log.txt"
+        '';
+
+        # D1 и D2: контакты. Падают, если проникновение > 2 см,
+        # остаточная скорость > 2 см/с или стопка просела больше 5%.
+        demo-stack = pkgs.runCommand "demo-stack" { } ''
+          mkdir -p "$out"
+          ${self.packages.${system}.default}/bin/vf-ref \
+            --scenario stack --bodies 10 --frames 600 --substeps 8 --iterations 8 \
+            --json "$out/stack.json" --out "$out/stack.vfr" | tee "$out/log.txt"
         '';
       });
     };
