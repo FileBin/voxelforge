@@ -3,137 +3,400 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>voxelforge · просмотр траекторий</title>
+<title>voxelforge · 3D (WebGPU)</title>
 <style>
   :root { color-scheme: dark; }
   html, body { margin: 0; height: 100%; background: #0b0f14; color: #cfd8e3;
-               font: 13px/1.4 ui-sans-serif, system-ui, sans-serif; }
-  #bar { display: flex; gap: 12px; align-items: center; padding: 10px 14px;
-         border-bottom: 1px solid #1b2733; flex-wrap: wrap; }
-  #bar b { color: #e8f0f8; font-weight: 600; letter-spacing: .3px; }
+               font: 13px/1.4 ui-sans-serif, system-ui, sans-serif; overflow: hidden; }
+  #bar { position: fixed; inset: 0 0 auto 0; display: flex; gap: 10px; align-items: center;
+         padding: 9px 12px; background: #0b0f14cc; backdrop-filter: blur(6px);
+         border-bottom: 1px solid #1b2733; flex-wrap: wrap; z-index: 10; }
+  #bar b { color: #e8f0f8; letter-spacing: .3px; }
   #bar .hint { color: #5d7286; }
   button, select, input[type=range] { background: #131c25; color: #cfd8e3;
          border: 1px solid #253545; border-radius: 6px; padding: 4px 10px; font: inherit; }
   button:hover { border-color: #3b5875; }
-  input[type=range] { padding: 0; width: 260px; }
+  input[type=range] { padding: 0; width: 200px; }
   #meta { margin-left: auto; color: #6b8299; font-variant-numeric: tabular-nums; }
-  #wrap { position: absolute; inset: 47px 0 0 0; }
-  canvas { display: block; width: 100%; height: 100%; }
-  #drop { position: absolute; inset: 0; display: grid; place-content: center;
-          text-align: center; color: #5d7286; gap: 8px; pointer-events: none; }
-  #drop b { color: #8fa8bf; }
+  canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
+  #msg { position: fixed; inset: 0; display: grid; place-content: center; text-align: center;
+         gap: 10px; color: #5d7286; padding: 24px; pointer-events: none; }
+  #msg b { color: #8fa8bf; font-size: 15px; }
 </style>
 </head>
 <body>
 <div id="bar">
   <b>voxelforge</b>
-  <input id="file" type="file" accept=".vfr" style="max-width:220px">
+  <input id="file" type="file" accept=".vfr" style="max-width:180px">
   <button id="play">⏸ пауза</button>
   <input id="frame" type="range" min="0" max="0" value="0">
   <select id="speed">
     <option value="15">0.25×</option>
     <option value="30">0.5×</option>
-    <option value="60" selected>1× (60 fps)</option>
+    <option value="60" selected>1×</option>
     <option value="120">2×</option>
     <option value="240">4×</option>
   </select>
-  <span class="hint">пробел — пауза, перетащите .vfr в окно</span>
+  <span class="hint">ЛКМ — орбита · колесо — зум · ПКМ/Shift+ЛКМ — пан · пробел — пауза</span>
   <span id="meta">нет данных</span>
 </div>
-<div id="wrap">
-  <canvas id="cv"></canvas>
-  <div id="drop"><b>перетащите .vfr</b><span>или выберите файл — файл читается локально, никуда не уходит</span></div>
-</div>
-<script>
+<canvas id="cv"></canvas>
+<div id="msg"><b>перетащите .vfr в окно</b><span>или выберите файл · читается локально, никуда не уходит</span></div>
+
+<script type="module">
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const cv = $("cv"), ctx = cv.getContext("2d");
-const PALETTE = ["#59a5ff", "#ffb347", "#7ee08a", "#ff6b8a", "#c48aff", "#4fd6d6"];
+const cv = $("cv");
 
-let sim = null;        // {n, nf, radii, frames, lo, hi}
-let frame = 0;
-let playing = true;
-let speed = 60;        // кадров в секунду
-let acc = 0, last = 0;
+let sim = null, play = true, frame = 0, speed = 60, acc = 0, last = 0;
 
+let device = null, gpuCtx = null, canvasFormat = "bgra8unorm";
+let pipeSphere = null, pipeBlock = null, bgl = null;
+let ubo = null, bufPos = null, bufScale = null, bufIdxS = null, bufIdxB = null;
+let vgS = null, vgB = null, vtxS = 0, vtxB = 0, cntS = 0, cntB = 0;
+let bgS = null, bgB = null, depthTex = null;
+
+/* ---------------- .vfr ---------------- */
 function parseVFR(buf) {
   const dv = new DataView(buf);
   const magic = String.fromCharCode(dv.getUint8(0), dv.getUint8(1), dv.getUint8(2), dv.getUint8(3));
   if (magic !== "VFR1" && magic !== "VFR2") throw new Error("не VFR1/VFR2: " + magic);
   const n = dv.getUint32(4, true), nf = dv.getUint32(8, true);
   let off = 12;
-  const radii = [], halfs = [], shapes = [];
+  const scale = [], shapes = [];
   for (let i = 0; i < n; i++) {
-    off += 8;                                  // mass (f64), для картинки не нужна
+    off += 8;                                   // mass (f64)
     const r = dv.getFloat32(off, true); off += 4;
-    radii.push(r);
     if (magic === "VFR2") {
-      shapes.push(dv.getUint8(off)); off += 1;
-      halfs.push([dv.getFloat32(off, true), dv.getFloat32(off + 4, true), dv.getFloat32(off + 8, true)]);
+      const shape = dv.getUint8(off); off += 1;
+      const hx = dv.getFloat32(off, true), hy = dv.getFloat32(off + 4, true), hz = dv.getFloat32(off + 8, true);
       off += 12;
+      scale.push([r, hx, hy, hz]); shapes.push(shape);
     } else {
-      shapes.push(0);
-      halfs.push([r, r, r]);
+      scale.push([r, r, r, r]); shapes.push(0);
     }
   }
-  const frames = [];
-  const lo = [Infinity, Infinity], hi = [-Infinity, -Infinity];
-  for (let f = 0; f < nf; f++) {
-    const arr = new Float32Array(n * 3);
-    for (let k = 0; k < n * 3; k++) { arr[k] = dv.getFloat32(off, true); off += 4; }
-    frames.push(arr);
-    for (let i = 0; i < n; i++) {
-      const x = arr[3 * i], y = arr[3 * i + 1];
-      if (x < lo[0]) lo[0] = x; if (x > hi[0]) hi[0] = x;
-      if (y < lo[1]) lo[1] = y; if (y > hi[1]) hi[1] = y;
-    }
+  const pos = new Float32Array(n * nf * 3);
+  for (let i = 0; i < n * nf * 3; i++) { pos[i] = dv.getFloat32(off, true); off += 4; }
+  const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+  for (let f = 0; f < nf; f++) for (let i = 0; i < n; i++) for (let k = 0; k < 3; k++) {
+    const v = pos[(f * n + i) * 3 + k];
+    if (v < lo[k]) lo[k] = v;
+    if (v > hi[k]) hi[k] = v;
   }
-  return { n, nf, radii, halfs, shapes, frames, lo, hi };
+  return { n, nf, pos, scale, shapes, lo, hi };
 }
 
-function loadArrayBuffer(buf, name) {
-  try {
+function loadFile(file) {
+  file.arrayBuffer().then((buf) => {
     sim = parseVFR(buf);
-  } catch (e) {
-    $("meta").textContent = "ошибка: " + e.message;
-    return;
+    frame = 0; acc = 0;
+    $("frame").max = String(sim.nf - 1); $("frame").value = "0";
+    $("msg").style.display = "none";
+    $("meta").textContent = `${file.name} · тел ${sim.n} · кадров ${sim.nf}`;
+    fitCamera();
+    upload();
+  }).catch((e) => {
+    $("msg").style.display = "grid";
+    $("msg").innerHTML = `<b>ошибка чтения</b><span>${e.message}</span>`;
+  });
+}
+
+/* ---------------- камера ---------------- */
+const cam = { yaw: 0.6, pitch: 0.35, dist: 8, target: [0, 1, 0] };
+function fitCamera() {
+  const { lo, hi } = sim;
+  cam.target = [(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2];
+  const ext = Math.max(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2], 0.5);
+  cam.dist = ext * 1.5;
+  cam.pitch = 0.35; cam.yaw = 0.6;
+}
+function eyePos() {
+  const cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
+  return [
+    cam.target[0] + cam.dist * cp * Math.sin(cam.yaw),
+    cam.target[1] + cam.dist * sp,
+    cam.target[2] + cam.dist * cp * Math.cos(cam.yaw),
+  ];
+}
+
+/* ---------------- матрицы (column-major) ---------------- */
+const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const norm = (a) => { const l = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0] / l, a[1] / l, a[2] / l]; };
+function persp(fovy, aspect, near, far) {
+  const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+  return new Float32Array([f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, (far + near) * nf, -1, 0, 0, 2 * far * near * nf, 0]);
+}
+function lookAt(eye, at, up) {
+  const z = norm(sub(eye, at)), x = norm(cross(up, z)), y = cross(z, x);
+  return new Float32Array([
+    x[0], y[0], z[0], 0,
+    x[1], y[1], z[1], 0,
+    x[2], y[2], z[2], 0,
+    -(x[0] * eye[0] + x[1] * eye[1] + x[2] * eye[2]),
+    -(y[0] * eye[0] + y[1] * eye[1] + y[2] * eye[2]),
+    -(z[0] * eye[0] + z[1] * eye[1] + z[2] * eye[2]), 1,
+  ]);
+}
+function mul(a, b) {                            // a * b, column-major
+  const o = new Float32Array(16);
+  for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++) {
+    let s = 0;
+    for (let k = 0; k < 4; k++) s += a[k * 4 + j] * b[i * 4 + k];
+    o[i * 4 + j] = s;
   }
-  frame = 0;
-  $("frame").max = String(sim.nf - 1);
-  $("frame").value = "0";
-  $("drop").style.display = "none";
-  $("meta").textContent = `${name} · тел: ${sim.n}, кадров: ${sim.nf}`;
-  last = performance.now();
-  requestAnimationFrame(tick);
+  return o;
 }
 
-async function openFile(file) {
-  const buf = await file.arrayBuffer();
-  loadArrayBuffer(buf, file.name);
+/* ---------------- меши ---------------- */
+function cubeMesh() {
+  const faces = [
+    [[0, 0, 1], [1, 0, 0], [0, 1, 0]], [[0, 0, -1], [-1, 0, 0], [0, 1, 0]],
+    [[1, 0, 0], [0, 0, -1], [0, 1, 0]], [[-1, 0, 0], [0, 0, 1], [0, 1, 0]],
+    [[0, 1, 0], [1, 0, 0], [0, 0, -1]], [[0, -1, 0], [1, 0, 0], [0, 0, 1]],
+  ];
+  const v = [];
+  for (const [n, u, w] of faces) {
+    const c = [n[0] + u[0] + w[0], n[1] + u[1] + w[1], n[2] + u[2] + w[2]];
+    const p = (s1, s2) => [c[0] + s1 * u[0] + s2 * w[0], c[1] + s1 * u[1] + s2 * w[1], c[2] + s1 * u[2] + s2 * w[2]];
+    const a = p(-1, -1), b = p(1, -1), d = p(1, 1), e = p(-1, 1);
+    for (const tri of [[a, b, d], [a, d, e]]) for (const q of tri) v.push(q[0], q[1], q[2], n[0], n[1], n[2]);
+  }
+  return new Float32Array(v);
+}
+function sphereMesh(subdiv) {
+  const t = (1 + Math.sqrt(5)) / 2;
+  let verts = [[-1, t, 0], [1, t, 0], [-1, -t, 0], [1, -t, 0], [0, -1, t], [0, 1, t],
+               [0, -1, -t], [0, 1, -t], [t, 0, -1], [t, 0, 1], [-t, 0, -1], [-t, 0, 1]].map(norm);
+  let faces = [[0, 11, 5], [0, 5, 1], [0, 1, 7], [0, 7, 10], [0, 10, 11], [1, 5, 9], [5, 11, 4],
+               [11, 10, 2], [10, 7, 6], [7, 1, 8], [3, 9, 4], [3, 4, 2], [3, 2, 6], [3, 6, 8],
+               [3, 8, 9], [4, 9, 5], [2, 4, 11], [6, 2, 10], [8, 6, 7], [9, 8, 1]];
+  for (let s = 0; s < subdiv; s++) {
+    const mid = new Map(), nf = [];
+    const m = (a, b) => {
+      const k = a < b ? a + ":" + b : b + ":" + a;
+      if (mid.has(k)) return mid.get(k);
+      const p = norm([(verts[a][0] + verts[b][0]) / 2, (verts[a][1] + verts[b][1]) / 2, (verts[a][2] + verts[b][2]) / 2]);
+      verts.push(p); mid.set(k, verts.length - 1); return verts.length - 1;
+    };
+    for (const [a, b, c] of faces) {
+      const ab = m(a, b), bc = m(b, c), ca = m(c, a);
+      nf.push([a, ab, ca], [b, bc, ab], [c, ca, bc], [ab, bc, ca]);
+    }
+    faces = nf;
+  }
+  const v = [];
+  for (const [a, b, c] of faces) for (const i of [a, b, c]) {
+    const p = verts[i];
+    v.push(p[0], p[1], p[2], p[0], p[1], p[2]);
+  }
+  return new Float32Array(v);
 }
 
-$("file").addEventListener("change", (e) => { if (e.target.files[0]) openFile(e.target.files[0]); });
-$("play").addEventListener("click", () => { playing = !playing; syncPlayLabel(); });
-$("speed").addEventListener("change", (e) => { speed = +e.target.value; });
-$("frame").addEventListener("input", (e) => { frame = +e.target.value; draw(); });
-window.addEventListener("keydown", (e) => {
-  if (e.code === "Space") { e.preventDefault(); playing = !playing; syncPlayLabel(); }
-});
-["dragenter", "dragover"].forEach((ev) =>
-  window.addEventListener(ev, (e) => { e.preventDefault(); }));
-window.addEventListener("drop", (e) => {
-  e.preventDefault();
-  const f = e.dataTransfer.files[0];
-  if (f) openFile(f);
-});
+/* ---------------- WGSL ---------------- */
+const WGSL = `
+struct U { vp: mat4x4f, frame: u32, n: u32, pad0: u32, pad1: u32 };
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var<storage, read> pos: array<f32>;
+@group(0) @binding(2) var<storage, read> sc: array<vec4f>;
+@group(0) @binding(3) var<storage, read> idx: array<u32>;
 
-function syncPlayLabel() { $("play").textContent = playing ? "⏸ пауза" : "▶ играть"; }
+struct VSOut {
+  @builtin(position) clip: vec4f,
+  @location(0) nrm: vec3f,
+  @location(1) col: vec3f,
+};
 
-function tick(now) {
-  const dt = Math.min(0.1, (now - last) / 1000);
+fn body_pos(b: u32) -> vec3f {
+  let base = (u.frame * u.n + b) * 3u;
+  return vec3f(pos[base], pos[base + 1u], pos[base + 2u]);
+}
+
+fn body_col(b: u32) -> vec3f {
+  var pal = array<vec3f, 6>(
+    vec3f(0.35, 0.65, 1.00), vec3f(1.00, 0.70, 0.28), vec3f(0.49, 0.88, 0.54),
+    vec3f(1.00, 0.42, 0.54), vec3f(0.77, 0.54, 1.00), vec3f(0.31, 0.84, 0.84));
+  return pal[b % 6u];
+}
+
+@vertex fn vs_sphere(@location(0) p: vec3f, @location(1) n: vec3f,
+                     @builtin(instance_index) ii: u32) -> VSOut {
+  let b = idx[ii];
+  let wp = body_pos(b) + p * sc[b].x;
+  var o: VSOut;
+  o.clip = u.vp * vec4f(wp, 1.0);
+  o.nrm = n;
+  o.col = body_col(b);
+  return o;
+}
+
+@vertex fn vs_block(@location(0) p: vec3f, @location(1) n: vec3f,
+                    @builtin(instance_index) ii: u32) -> VSOut {
+  let b = idx[ii];
+  let h = sc[b].yzw;
+  let wp = body_pos(b) + p * h;
+  var o: VSOut;
+  o.clip = u.vp * vec4f(wp, 1.0);
+  o.nrm = normalize(n / h);
+  o.col = body_col(b);
+  return o;
+}
+
+@fragment fn fs(v: VSOut) -> @location(0) vec4f {
+  let n = normalize(v.nrm);
+  let l1 = normalize(vec3f(0.45, 0.90, 0.35));
+  let l2 = normalize(vec3f(-0.70, 0.25, -0.45));
+  let d = max(dot(n, l1), 0.0) * 0.85 + max(dot(n, l2), 0.0) * 0.22;
+  let base = v.col * (0.30 + d);
+  return vec4f(pow(base, vec3f(0.4545)), 1.0);
+}
+`;
+
+/* ---------------- WebGPU ---------------- */
+async function initGPU() {
+  if (!navigator.gpu) throw new Error("браузер не поддерживает WebGPU");
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+  if (!adapter) throw new Error("нет адаптера WebGPU");
+  device = await adapter.requestDevice();
+  gpuCtx = cv.getContext("webgpu");
+  canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+  gpuCtx.configure({ device, format: canvasFormat, alphaMode: "opaque" });
+
+  const module = device.createShaderModule({ code: WGSL });
+  bgl = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } },
+      { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+      { binding: 2, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+      { binding: 3, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+    ],
+  });
+  const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl] });
+  const mk = (vs) => device.createRenderPipeline({
+    layout,
+    vertex: {
+      module, entryPoint: vs,
+      buffers: [{ arrayStride: 24, attributes: [
+        { shaderLocation: 0, offset: 0, format: "float32x3" },
+        { shaderLocation: 1, offset: 12, format: "float32x3" },
+      ] }],
+    },
+    fragment: { module, entryPoint: "fs", targets: [{ format: canvasFormat }] },
+    primitive: { topology: "triangle-list", cullMode: "back" },
+    depthStencil: { format: "depth24plus", depthWriteEnabled: true, depthCompare: "less" },
+  });
+  pipeSphere = mk("vs_sphere");
+  pipeBlock = mk("vs_block");
+
+  const sv = sphereMesh(2), bv = cubeMesh();
+  vtxS = sv.length / 6; vtxB = bv.length / 6;
+  vgS = device.createBuffer({ size: sv.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(vgS, 0, sv);
+  vgB = device.createBuffer({ size: bv.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(vgB, 0, bv);
+
+  // 80 байт: mat4 (64) + frame(4) + n(4) + 8 выравнивания
+  ubo = device.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+
+  const name = adapter.info?.description || adapter.info?.vendor || "adapter";
+  $("meta").textContent = "WebGPU · " + name;
+  requestAnimationFrame(loop);
+}
+
+function upload() {
+  if (!device || !sim) return;
+  const n = sim.n;
+
+  bufPos = device.createBuffer({ size: sim.pos.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(bufPos, 0, sim.pos);
+
+  const sc = new Float32Array(n * 4);
+  for (let i = 0; i < n; i++) sc.set(sim.scale[i], i * 4);
+  bufScale = device.createBuffer({ size: sc.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(bufScale, 0, sc);
+
+  const sIdx = [], bIdx = [];
+  for (let i = 0; i < n; i++) (sim.shapes[i] === 1 ? bIdx : sIdx).push(i);
+  cntS = sIdx.length; cntB = bIdx.length;
+
+  const mkIdx = (arr) => {
+    const size = Math.max(4, arr.length * 4);
+    const b = device.createBuffer({ size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    if (arr.length) device.queue.writeBuffer(b, 0, new Uint32Array(arr));
+    return b;
+  };
+  bufIdxS = mkIdx(sIdx);
+  bufIdxB = mkIdx(bIdx);
+
+  const bind = (idxBuf) => device.createBindGroup({
+    layout: bgl,
+    entries: [
+      { binding: 0, resource: { buffer: ubo } },
+      { binding: 1, resource: { buffer: bufPos } },
+      { binding: 2, resource: { buffer: bufScale } },
+      { binding: 3, resource: { buffer: idxBuf } },
+    ],
+  });
+  bgS = bind(bufIdxS);
+  bgB = bind(bufIdxB);
+}
+
+/* ---------------- рендер ---------------- */
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.max(1, Math.floor(cv.clientWidth * dpr));
+  const h = Math.max(1, Math.floor(cv.clientHeight * dpr));
+  if (cv.width === w && cv.height === h && depthTex) return;
+  cv.width = w; cv.height = h;
+  depthTex = device.createTexture({
+    size: [w, h], format: "depth24plus", usage: GPUTextureUsage.RENDER_ATTACHMENT,
+  });
+}
+
+function render() {
+  if (!device || !sim) return;
+  resize();
+  const w = cv.width, h = cv.height;
+
+  const vp = mul(persp(0.9, w / h, 0.02, 20000), lookAt(eyePos(), cam.target, [0, 1, 0]));
+  const ab = new ArrayBuffer(80), f32 = new Float32Array(ab), u32 = new Uint32Array(ab);
+  f32.set(vp, 0); u32[16] = frame; u32[17] = sim.n;
+  device.queue.writeBuffer(ubo, 0, ab);
+
+  const enc = device.createCommandEncoder();
+  const pass = enc.beginRenderPass({
+    colorAttachments: [{
+      view: gpuCtx.getCurrentTexture().createView(),
+      clearValue: { r: 0.043, g: 0.059, b: 0.078, a: 1 },
+      loadOp: "clear", storeOp: "store",
+    }],
+    depthStencilAttachment: {
+      view: depthTex.createView(), depthClearValue: 1,
+      depthLoadOp: "clear", depthStoreOp: "store",
+    },
+  });
+  if (cntB > 0) {
+    pass.setPipeline(pipeBlock);
+    pass.setBindGroup(0, bgB);
+    pass.setVertexBuffer(0, vgB);
+    pass.draw(vtxB, cntB);
+  }
+  if (cntS > 0) {
+    pass.setPipeline(pipeSphere);
+    pass.setBindGroup(0, bgS);
+    pass.setVertexBuffer(0, vgS);
+    pass.draw(vtxS, cntS);
+  }
+  pass.end();
+  device.queue.submit([enc.finish()]);
+}
+
+function loop(now) {
+  const dt = Math.min(0.1, (now - last) / 1000 || 0);
   last = now;
-  if (sim && playing) {
+  if (sim && play) {
     acc += dt * speed;
     const steps = Math.floor(acc);
     if (steps > 0) {
@@ -142,68 +405,63 @@ function tick(now) {
       $("frame").value = String(frame);
     }
   }
-  draw();
-  requestAnimationFrame(tick);
+  render();
+  requestAnimationFrame(loop);
 }
 
-function draw() {
-  const w = cv.clientWidth, h = cv.clientHeight;
-  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
-  ctx.fillStyle = "#0b0f14";
-  ctx.fillRect(0, 0, w, h);
-  if (!sim) return;
-
-  const cx = (sim.lo[0] + sim.hi[0]) / 2, cy = (sim.lo[1] + sim.hi[1]) / 2;
-  const span = Math.max(sim.hi[0] - sim.lo[0], sim.hi[1] - sim.lo[1], 1e-6) * 0.55;
-  const s = Math.min(w, h) * 0.5 / span;
-  const X = (x) => w * 0.5 + (x - cx) * s;
-  const Y = (y) => h * 0.5 - (y - cy) * s;
-
-  // следы — только когда тел немного
-  if (sim.n <= 64) {
-    const tail = 90;
-    for (let i = 0; i < sim.n; i++) {
-      ctx.beginPath();
-      const f0 = Math.max(0, frame - tail);
-      for (let f = f0; f <= frame; f++) {
-        const a = sim.frames[f], x = X(a[3 * i]), y = Y(a[3 * i + 1]);
-        f === f0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
-      }
-      ctx.strokeStyle = PALETTE[i % PALETTE.length] + "88";
-      ctx.lineWidth = 1;
-      ctx.stroke();
-    }
+/* ---------------- ввод ---------------- */
+let drag = null;
+cv.addEventListener("contextmenu", (e) => e.preventDefault());
+cv.addEventListener("pointerdown", (e) => {
+  drag = { x: e.clientX, y: e.clientY, pan: e.button === 2 || e.shiftKey };
+  cv.setPointerCapture(e.pointerId);
+});
+cv.addEventListener("pointerup", () => { drag = null; });
+cv.addEventListener("pointermove", (e) => {
+  if (!drag) return;
+  const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+  drag.x = e.clientX; drag.y = e.clientY;
+  if (drag.pan) {
+    const k = cam.dist * 0.0016;
+    const right = [Math.cos(cam.yaw), 0, -Math.sin(cam.yaw)];
+    cam.target[0] += (-right[0] * dx) * k;
+    cam.target[2] += (-right[2] * dx) * k;
+    cam.target[1] += dy * k;
+  } else {
+    cam.yaw -= dx * 0.006;
+    cam.pitch = Math.max(-1.45, Math.min(1.45, cam.pitch + dy * 0.006));
   }
+});
+cv.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  cam.dist = Math.max(0.02, Math.min(50000, cam.dist * Math.exp(e.deltaY * 0.0012)));
+}, { passive: false });
+window.addEventListener("keydown", (e) => {
+  if (e.code === "Space") { e.preventDefault(); play = !play; syncPlay(); }
+});
+$("file").addEventListener("change", (e) => { if (e.target.files[0]) loadFile(e.target.files[0]); });
+$("play").addEventListener("click", () => { play = !play; syncPlay(); });
+$("speed").addEventListener("change", (e) => { speed = +e.target.value; });
+$("frame").addEventListener("input", (e) => { frame = +e.target.value; });
+["dragenter", "dragover"].forEach((ev) => window.addEventListener(ev, (e) => e.preventDefault()));
+window.addEventListener("drop", (e) => {
+  e.preventDefault();
+  const f = e.dataTransfer.files[0];
+  if (f) loadFile(f);
+});
+function syncPlay() { $("play").textContent = play ? "⏸ пауза" : "▶ играть"; }
 
-  const cur = sim.frames[frame];
-  for (let i = 0; i < sim.n; i++) {
-    const x = X(cur[3 * i]), y = Y(cur[3 * i + 1]);
-    const color = PALETTE[i % PALETTE.length];
-    if (sim.shapes[i] === 1) {
-      // блок: прямоугольник по половине размеров (вид сбоку, x–y)
-      const hw = Math.max(1.5, sim.halfs[i][0] * s);
-      const hh = Math.max(1.5, sim.halfs[i][1] * s);
-      ctx.fillStyle = color;
-      ctx.fillRect(x - hw, y - hh, 2 * hw, 2 * hh);
-    } else {
-      const r = Math.max(1.5, Math.min(sim.radii[i] * s, 16));
-      ctx.beginPath();
-      ctx.arc(x, y, r, 0, Math.PI * 2);
-      ctx.fillStyle = color;
-      ctx.fill();
-    }
-  }
-
-  ctx.fillStyle = "#5d7286";
-  ctx.font = "12px ui-monospace, monospace";
-  ctx.fillText(`кадр ${frame + 1} / ${sim.nf}`, 14, h - 14);
-}
-
-// Если страница открыта по http (python -m http.server), подхватываем ?file=
 const q = new URLSearchParams(location.search).get("file");
-if (q) fetch(q).then((r) => r.arrayBuffer()).then((b) => loadArrayBuffer(b, q)).catch(() => {});
-syncPlayLabel();
-requestAnimationFrame(tick);
+if (q) fetch(q).then((r) => r.arrayBuffer()).then((b) => {
+  loadFile(new File([b], q.split("/").pop()));
+}).catch(() => {});
+
+syncPlay();
+initGPU().catch((e) => {
+  $("msg").style.display = "grid";
+  $("msg").innerHTML = `<b>WebGPU недоступен</b><span>${e.message}</span>` +
+    `<span>нужен Chrome/Chromium 113+ или Firefox с включённым WebGPU</span>`;
+});
 </script>
 </body>
 </html>

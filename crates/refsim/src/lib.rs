@@ -12,8 +12,10 @@
 //! не синхронизируется; в GPU-солвере они, наоборот, запрещены гейтами.
 
 pub mod contact;
+pub mod pile;
 
 pub use contact::ContactSim;
+pub use pile::PileSim;
 
 /// Форма тела: сфера (гравитационные демки) или блок (контактные демки).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
