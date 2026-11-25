@@ -174,7 +174,6 @@ pub struct GpuSim {
     cursor: *mut c_void,
     cbody: *mut c_void,
     pipes: Vec<*mut c_void>,
-    bindings: [u32; 10],
 }
 
 impl GpuSim {
@@ -242,8 +241,7 @@ impl GpuSim {
             ("integrate_pos", 1),
         ];
         let mut pipes = Vec::new();
-        let mut bindings = [0u32; 10];
-        for (i, (nm, nb)) in names.iter().enumerate() {
+        for (nm, nb) in names.iter() {
             let path = shader_dir.join(format!("{nm}.spv"));
             let bytes = std::fs::read(&path)
                 .unwrap_or_else(|e| panic!("нет {path:?}: {e} (соберите: glslc)"));
@@ -265,7 +263,6 @@ impl GpuSim {
                 )
             };
             pipes.push(p);
-            bindings[i] = *nb;
         }
 
         Self {
@@ -283,7 +280,6 @@ impl GpuSim {
             cursor,
             cbody,
             pipes,
-            bindings,
         }
     }
 

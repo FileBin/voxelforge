@@ -135,7 +135,8 @@ fn main() {
 
     for f in 0..args.frames {
         gpu.frame(args.dt, args.substeps, args.iterations);
-        if f % 10 == 0 || f + 1 == args.frames {
+        // С треком читаем каждый кадр: иначе во вьюере будет дёрганое видео.
+        if f % 10 == 0 || f + 1 == args.frames || args.out.is_some() {
             let snap = gpu.read_bodies();
             if f == 0 {
                 top_start = snap
@@ -249,5 +250,38 @@ fn main() {
         }
         std::fs::write(p, &blob).unwrap();
         println!("записано: {} ({} кадров)", p.display(), nf);
+
+        // Боковая проекция «до/после» — картинка для глаз, пока вьюер не открыт.
+        let svg = p.with_extension("svg");
+        let panel = |frame: &Vec<[f32; 4]>, ox: f32, title: &str| {
+            let (w, h) = (520.0f32, 360.0f32);
+            let mut out = format!(
+                r##"<g transform="translate({ox},24)"><text x="0" y="-6" fill="#9aa" font-family="sans-serif" font-size="13">{title}</text><rect x="0" y="0" width="{w}" height="{h}" fill="#0d1117" stroke="#2a3340"/>"##
+            );
+            let mut order: Vec<&[f32; 4]> = frame.iter().collect();
+            order.sort_by(|a, b| a[2].partial_cmp(&b[2]).unwrap());
+            for q in order {
+                let sx = q[0] / 4.25 * w;
+                let sy = h - q[1] / 2.6 * h;
+                let r = (q[3] / 4.25 * w).max(1.2);
+                let depth = (q[2] / 4.25).clamp(0.0, 1.0);
+                let c = (90.0 + 140.0 * depth) as u8;
+                out.push_str(&format!(
+                    r##"<circle cx="{sx:.1}" cy="{sy:.1}" r="{r:.1}" fill="rgb({},{c},200)" opacity="0.75"/>"##,
+                    255 - c / 2
+                ));
+            }
+            out.push_str("</g>");
+            out
+        };
+        let first = &frames_out[0];
+        let last = &frames_out[frames_out.len() - 1];
+        let doc = format!(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="410" viewBox="0 0 1080 410"><rect width="1080" height="410" fill="#0d1117"/>{}{}</svg>"##,
+            panel(first, 10.0, "t = 0"),
+            panel(last, 550.0, &format!("t = {:.1} с (GPU)", nf as f32 * args.dt))
+        );
+        std::fs::write(&svg, doc).unwrap();
+        println!("картинка: {}", svg.display());
     }
 }

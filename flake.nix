@@ -173,7 +173,9 @@
           };
           cargoLock.lockFile = ./Cargo.lock;
           nativeBuildInputs = [ pkgs.gcc ];
-          buildInputs = [ pkgs.vulkan-loader ];
+          # headers нужны на этапе сборки C-ядра (build.rs зовёт gcc),
+          # loader — на линковке и в рантайме
+          buildInputs = [ pkgs.vulkan-headers pkgs.vulkan-loader ];
           meta.mainProgram = "vf-ref";
         };
       });

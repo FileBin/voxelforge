@@ -137,7 +137,7 @@ fn gpu_pile_matches_cpu_reference() {
 
     let n = 1000;
     let frames = 360;
-    let gpu = run_gpu(n, frames, 12, &shaders);
+    let gpu = run_gpu(n, frames, 20, &shaders);
 
     let mut cpu = pile_demo(n);
     for _ in 0..frames {
