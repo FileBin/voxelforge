@@ -15,7 +15,7 @@ pub mod contact;
 pub mod pile;
 
 pub use contact::ContactSim;
-pub use pile::PileSim;
+pub use pile::{pile_demo, PileSim};
 
 /// Форма тела: сфера (гравитационные демки) или блок (контактные демки).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

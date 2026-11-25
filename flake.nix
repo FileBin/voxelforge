@@ -102,7 +102,7 @@
           };
           pile = {
             type = "app";
-            program = "${demo "pile" "pile" "--bodies 2000 --frames 420 --substeps 4 --iterations 8"}/bin/voxelforge-pile";
+            program = "${demo "pile" "pile" "--bodies 2000 --frames 420 --substeps 8 --iterations 8"}/bin/voxelforge-pile";
           };
           vf-ref = { type = "app"; program = "${vfref}/bin/vf-ref"; };
         });

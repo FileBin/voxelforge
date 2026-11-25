@@ -46,6 +46,14 @@ pub struct PileSim {
     pub margin: f64,
     /// Доля проникновения, выталкиваемая за подшаг (0..1).
     pub beta: f64,
+    /// Потолок скорости выталкивания, м/с.
+    ///
+    /// Bias считается как `pen·β/h`, и при малом `h` (много подшагов) или
+    /// глубоком проникновении он раздувается: на 4 подшагах куча из 5000 тел
+    /// разгонялась до 10 м/с и не засыпала. Потолок — стандартная мера
+    /// (max correction velocity), он же делает солвер нечувствительным к
+    /// числу подшагов.
+    pub max_push: f64,
     /// Коэффициент трения Кулона.
     pub friction: f64,
     /// Пары с отношением масс выше этого решаются односторонне.
@@ -73,10 +81,11 @@ impl PileSim {
             bodies,
             gravity: 9.81,
             ground_y: 0.0,
-            substeps: 4,
+            substeps: 8,
             iterations: 8,
             margin: 5e-4,
             beta: 0.2,
+            max_push: 3.0,
             friction: 0.7,
             mass_ratio_limit: 1000.0,
             sleep_linear: 0.05,
@@ -250,7 +259,7 @@ impl PileSim {
 
         // --- нормаль -------------------------------------------------------
         let vn = rel[0] * c.n[0] + rel[1] * c.n[1] + rel[2] * c.n[2];
-        let push = ((c.pen - self.margin).max(0.0) * self.beta) / h;
+        let push = (((c.pen - self.margin).max(0.0) * self.beta) / h).min(self.max_push);
         let d_lambda = (push - vn) / w;
         let new_n = (c.lambda_n + d_lambda).max(0.0);
         let d = new_n - c.lambda_n;
@@ -391,4 +400,36 @@ impl PileSim {
             .map(|b| b.pos[1] + b.radius as f64)
             .fold(f64::NEG_INFINITY, f64::max)
     }
+}
+
+/// Демо-сцена D3: сферы радиусом 8 см, поставленные решёткой над полом.
+///
+/// Дрожание в позициях обязательно, и вот почему: при идеально ровной решётке
+/// каждая колонна стоит вечно. Нормаль контакта строго вертикальна, касательной
+/// силы нет, трения нет — падать нечему. Без вращения тел это «правильный»
+/// результат для бесконечно точной расстановки, но визуально это частокол
+/// столбов, а не куча. Дрожание ломает выравнивание, нормали наклоняются, и
+/// колонны складываются в пирамиду.
+///
+/// Дрожание детерминированное: без него тест перестал бы быть воспроизводимым.
+pub fn pile_demo(count: usize) -> PileSim {
+    let mut bodies = Vec::with_capacity(count);
+    let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut rnd = || {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((s >> 33) as f64 / u32::MAX as f64) - 0.5
+    };
+    for i in 0..count.max(1) {
+        let x = (i % 17) as f64 * 0.24 + rnd() * 0.07;
+        let z = ((i / 17) % 17) as f64 * 0.24 + rnd() * 0.07;
+        let y = 1.0 + (i / 289) as f64 * 0.24 + rnd() * 0.02;
+        let vx = rnd() * 0.06;
+        let vz = rnd() * 0.06;
+        bodies.push(Body::new([x, y, z], [vx, 0.0, vz], 1.0, 0.08));
+    }
+    let mut sim = PileSim::new(bodies);
+    sim.gravity = 9.81;
+    sim
 }

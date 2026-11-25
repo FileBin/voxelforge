@@ -1,21 +1,11 @@
-//! Интеграционные тесты плотной кучи: правило больших масс (D4) и
-//! детерминизм. Сцена D3 (5000 тел) пока не сходится — см. `#[ignore]`.
+//! Интеграционные тесты плотной кучи: правило больших масс (D4),
+//! детерминизм и сцена D3 (5000 тел ложатся и засыпают).
 
-use voxelforge_refsim::{Body, PileSim};
+use voxelforge_refsim::{pile_demo, Body, PileSim};
 
+/// Сцена D3 — та же, что в демке: решётка с детерминированным дрожанием.
 fn lattice_scene(count: usize) -> PileSim {
-    // Решётка без начальных пересечений: шаг 0.24 при диаметре 0.16.
-    // Куча образуется падением, а не «взрывом» из перекрытия — иначе тест
-    // проверяет разбор начального мусора, а не укладку.
-    let mut bodies = Vec::with_capacity(count);
-    for i in 0..count {
-        let x = (i % 17) as f64 * 0.24;
-        let z = ((i / 17) % 17) as f64 * 0.24;
-        let y = 1.0 + (i / 289) as f64 * 0.24;
-        bodies.push(Body::new([x, y, z], [0.0; 3], 1.0, 0.08));
-    }
-    let mut sim = PileSim::new(bodies);
-    sim.gravity = 9.81;
+    let mut sim = pile_demo(count);
     sim.friction = 0.7;
     sim
 }

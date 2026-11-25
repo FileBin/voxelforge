@@ -15,7 +15,7 @@
 
 use std::process::ExitCode;
 
-use voxelforge_refsim::{svg, vfr, Body, ContactSim, PileSim, Rng, Sim};
+use voxelforge_refsim::{pile_demo, svg, vfr, Body, ContactSim, PileSim, Rng, Sim};
 
 struct Args {
     scenario: String,
@@ -138,16 +138,10 @@ fn stack_scenario(count: usize, substeps: usize, iterations: usize) -> ContactSi
     sim
 }
 
-/// D3: куча из сфер, брошенных решёткой над полом.
+/// D3: куча из сфер, брошенных решёткой над полом (с дрожанием, чтобы
+/// колонны рассыпались — см. `pile_demo`).
 fn pile_scenario(count: usize, substeps: usize, iterations: usize) -> PileSim {
-    let mut bodies = Vec::new();
-    for i in 0..count.max(1) {
-        let x = (i % 17) as f64 * 0.24;
-        let z = ((i / 17) % 17) as f64 * 0.24;
-        let y = 1.0 + (i / 289) as f64 * 0.24;
-        bodies.push(Body::new([x, y, z], [0.0; 3], 1.0, 0.08));
-    }
-    let mut sim = PileSim::new(bodies);
+    let mut sim = pile_demo(count);
     sim.substeps = substeps;
     sim.iterations = iterations;
     sim
