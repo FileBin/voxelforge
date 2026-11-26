@@ -505,9 +505,26 @@ impl Live {
         }
 
         let mass_total: f64 = frags.iter().map(|f| DENSITY * f.volume()).sum();
-        let v_rms = (2.0 * 0.45 * energy as f64 / mass_total.max(1e-6))
+        let v_rms = (2.0 * 0.20 * energy as f64 / mass_total.max(1e-6))
             .sqrt()
             .min(20.0);
+
+        // Разлёт должен быть импульсно-нейтральным: куски разлетаются от
+        // точки удара, но НЕ уносят всю кучу вперёд. Иначе плита «улетала»
+        // вместе со снарядом: замер — осколки по 2–10 кг разгонялись до
+        // 20 м/с, хотя импульс снаряда (90 кг × 26 м/с) на 590 кг плиты
+        // даёт всего ~4 м/с.
+        let mut net = [0.0f64; 3];
+        for fr in frags.iter() {
+            let c = fr.world_centroid();
+            let d = [c[0] - point[0], c[1] - point[1], c[2] - point[2]];
+            let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-3);
+            let m = DENSITY * fr.volume();
+            for k in 0..3 {
+                net[k] += m * (d[k] / l) as f64;
+            }
+        }
+        let drift = [net[0] / mass_total, net[1] / mass_total, net[2] / mass_total];
 
         let mut rng = crate::tet::Lcg::new(0xB17E_5EED ^ (self.cracks as u64));
         let mut created = 0usize;
@@ -577,7 +594,10 @@ impl Live {
             pos: from,
             quat: [1.0, 0.0, 0.0, 0.0],
             vel: [dir[0] * speed, dir[1] * speed, dir[2] * speed],
-            mass: 90.0,
+            // Снаряд-камень, а не ядро: 90 кг на 26 м/с давали 30 кДж и
+            // прошивали плиту, разгоняя осколки до 20 м/с. 8 кг — попадание,
+            // от которого плита колется, но не улетает.
+            mass: 8.0,
             radius: 0.14,
             tets: ball.tets.clone(),
             origin: ball.origin,
