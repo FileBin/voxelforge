@@ -149,6 +149,8 @@ const P_BROAD: usize = 6;
 const P_SOLVE: usize = 7;
 const P_SLEEP: usize = 8;
 const P_POS: usize = 9;
+/// Потолок тетраэдров в пуле: 64 тела по 768.
+pub const MAX_POOL_TETS: usize = 64 * 768;
 const P_SOLVE_CONTACTS: usize = 10;
 const P_SOLVE_APPLY: usize = 11;
 
@@ -228,6 +230,12 @@ pub struct GpuSim {
     bodies: [*mut c_void; 2],
     list: *mut c_void,
     imp: *mut c_void,
+    /// Геометрия тел НА УСТРОЙСТВЕ: локальные тетраэдры в пуле, поза берётся
+    /// из текущего тела. Заливается один раз при спавне/расколе, а не каждый
+    /// кадр — иначе коллизия на GPU не избавит от копий.
+    tets: *mut c_void,
+    /// На тело: смещение в пуле и число тетраэдров.
+    span: *mut c_void,
     lcount: *mut c_void,
     cellcnt: *mut c_void,
     starts: *mut c_void,
@@ -276,6 +284,9 @@ impl GpuSim {
         let list = mk(n * CAP * 48, true);
         // Две vec4 на точку контакта: приращение скорости и угловое.
         let imp = mk(n * CAP * 32, false);
+        // Пул геометрии: 4 vec4 на тетраэдр (a, b, c, d).
+        let tets = mk(MAX_POOL_TETS * 64, true);
+        let span = mk(n * 8, true);
         let lcount = mk(n * 4, true);
         let cellcnt = mk(ncells as usize * 4, false);
         let starts = mk((ncells as usize + 1) * 4, false);
@@ -346,6 +357,8 @@ impl GpuSim {
             bodies: [bodies_a, bodies_b],
             list,
             imp,
+            tets,
+            span,
             lcount,
             cellcnt,
             starts,
@@ -549,6 +562,86 @@ impl GpuSim {
     /// Записать тела обратно на устройство: нужно, когда мир меняется по ходу
     /// прогона (импульс раскола при ударе). Пишем в `bodies[0]` — кадр всегда
     /// начинается с него, а чётное число итераций солвера возвращает данные туда же.
+    /// Залить геометрию тел в пул на устройстве (локальные тетраэдры) и
+    /// записать на каждое тело смещение и число. Вызывается при спавне и
+    /// расколе, а не каждый кадр: поза берётся шейдером из самого тела.
+    pub fn upload_geometry(&mut self, shapes: &[Vec<[[f32; 3]; 4]>]) {
+        let mut flat: Vec<[f32; 4]> = Vec::new();
+        let mut spans: Vec<[u32; 2]> = vec![[0, 0]; shapes.len()];
+        for (bi, tets) in shapes.iter().enumerate() {
+            let start = flat.len() / 4;
+            for t in tets {
+                for v in t {
+                    flat.push([v[0], v[1], v[2], 0.0]);
+                }
+            }
+            let count = flat.len() / 4 - start;
+            spans[bi] = [start as u32, count as u32];
+        }
+        let n = flat.len().min(MAX_POOL_TETS * 4);
+        self.bytes_up += (n * 16 + spans.len() * 8) as u64;
+        unsafe {
+            check_status(
+                vf_buffer_write(self.ctx, self.tets, 0, flat.as_ptr() as *const c_void, n * 16),
+                "upload_geometry",
+            );
+            check_status(
+                vf_buffer_write(
+                    self.ctx,
+                    self.span,
+                    0,
+                    spans.as_ptr() as *const c_void,
+                    spans.len() * 8,
+                ),
+                "upload_spans",
+            );
+        }
+    }
+
+    /// Обратное чтение пула — только для проверок, в кадре не используется.
+    pub fn read_geometry(&self, bodies: usize) -> Vec<[[f32; 3]; 4]> {
+        let mut spans = vec![[0u32; 2]; bodies];
+        unsafe {
+            check_status(
+                vf_buffer_read(
+                    self.ctx,
+                    self.span,
+                    0,
+                    spans.as_mut_ptr() as *mut c_void,
+                    bodies * 8,
+                ),
+                "read_spans",
+            );
+        }
+        let total: usize = spans.iter().map(|s| s[1] as usize).sum();
+        let mut flat = vec![[0.0f32; 4]; total * 4];
+        unsafe {
+            check_status(
+                vf_buffer_read(
+                    self.ctx,
+                    self.tets,
+                    0,
+                    flat.as_mut_ptr() as *mut c_void,
+                    total * 64,
+                ),
+                "read_tets",
+            );
+        }
+        let mut out = Vec::with_capacity(total);
+        let mut k = 0usize;
+        for s in spans.iter() {
+            for _ in 0..s[1] {
+                let mut t = [[0.0f32; 3]; 4];
+                for v in 0..4 {
+                    t[v] = [flat[k * 4 + v][0], flat[k * 4 + v][1], flat[k * 4 + v][2]];
+                }
+                out.push(t);
+                k += 1;
+            }
+        }
+        out
+    }
+
     pub fn write_bodies(&mut self, bodies: &[GpuBody]) {
         self.bytes_up += (bodies.len() * BODY_BYTES) as u64;
         assert_eq!(bodies.len(), self.n, "число тел изменилось посреди прогона");
