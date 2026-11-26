@@ -6,7 +6,7 @@
 // ПРОБЕЛ/F — выстрел в центр, T — каркас тетраэдров, R — сброс.
 use std::ffi::{c_char, c_void, CString};
 
-use voxelforge_world::live::{model_matrix, Live, MAX_BODIES};
+use voxelforge_world::live::{model_matrix, Live};
 use voxelforge_world::sim::find_shaders;
 
 #[repr(C)]
@@ -34,6 +34,14 @@ struct VfInput {
     key_r: i32,
     key_t: i32,
     key_f: i32,
+    key_w: i32,
+    key_a: i32,
+    key_s: i32,
+    key_d: i32,
+    key_q: i32,
+    key_e: i32,
+    shift: i32,
+    ctrl: i32,
 }
 
 unsafe extern "C" {
@@ -66,9 +74,11 @@ unsafe extern "C" {
 
 fn persp(fovy: f32, aspect: f32, near: f32, far: f32) -> [f32; 16] {
     let f = 1.0 / (fovy * 0.5).tan();
+    // В Vulkan ось Y в clip space смотрит ВНИЗ, в отличие от GL: без минуса
+    // картинка получается вверх ногами.
     [
         f / aspect, 0.0, 0.0, 0.0,
-        0.0, f, 0.0, 0.0,
+        0.0, -f, 0.0, 0.0,
         0.0, 0.0, far / (near - far), -1.0,
         0.0, 0.0, (near * far) / (near - far), 0.0,
     ]
@@ -120,32 +130,63 @@ fn mul(a: [f32; 16], b: [f32; 16]) -> [f32; 16] {
 
 // ---------------------------------------------------------------- камера
 
-struct Orbit {
+/// Свободный полёт: WASD в плоскости взгляда, Q/E вниз/вверх, мышь — обзор.
+struct Fly {
+    pos: [f32; 3],
     yaw: f32,
     pitch: f32,
-    dist: f32,
-    target: [f32; 3],
+    speed: f32,
 }
 
-impl Orbit {
-    fn eye(&self) -> [f32; 3] {
+impl Fly {
+    fn forward(&self) -> [f32; 3] {
         let cp = self.pitch.cos();
-        [
-            self.target[0] + self.dist * cp * self.yaw.sin(),
-            self.target[1] + self.dist * self.pitch.sin(),
-            self.target[2] + self.dist * cp * self.yaw.cos(),
-        ]
+        [cp * self.yaw.sin(), self.pitch.sin(), cp * self.yaw.cos()]
+    }
+
+    /// Направление «вправо по экрану» = cross(forward, up): при yaw = 0 это -x,
+    /// потому что камера смотрит в +z и мир повёрнут к ней левым боком.
+    fn right(&self) -> [f32; 3] {
+        [-self.yaw.cos(), 0.0, self.yaw.sin()]
+    }
+
+    fn look_at(&mut self, target: [f32; 3]) {
+        let d = sub(target, self.pos);
+        let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-4);
+        self.pitch = (d[1] / len).asin();
+        self.yaw = d[0].atan2(d[2]);
+    }
+
+    fn move_by(&mut self, dirs: [f32; 3], dt: f32) {
+        let f = self.forward();
+        let r = self.right();
+        for i in 0..3 {
+            self.pos[i] += (f[i] * dirs[0] + r[i] * dirs[1] + dirs[2] * if i == 1 { 1.0 } else { 0.0 })
+                * self.speed
+                * dt;
+        }
     }
 }
 
 fn main() {
     let mut explicit: Option<std::path::PathBuf> = None;
+    let mut max_frames: u64 = 0; // 0 — без ограничения
+    let mut shots: Vec<u64> = Vec::new();
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--shaders" => explicit = it.next().map(Into::into),
+            "--frames" => max_frames = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+            "--shots" => {
+                shots = it
+                    .next()
+                    .unwrap_or_default()
+                    .split(',')
+                    .filter_map(|v| v.trim().parse().ok())
+                    .collect()
+            }
             other => {
-                eprintln!("неизвестный аргумент {other}\n  --shaders DIR");
+                eprintln!("неизвестный аргумент {other}\n  --shaders DIR --frames N --shots 10,40");
                 std::process::exit(2);
             }
         }
@@ -153,7 +194,7 @@ fn main() {
     let shaders = find_shaders(explicit.as_deref())
         .expect("нет SPIR-V: nix build .#spirv или --shaders DIR");
     let shaders_c = CString::new(shaders.display().to_string()).unwrap();
-    let title = CString::new("voxelforge — стреляйте в плиту: ЛКМ орбита, клик/пробел выстрел").unwrap();
+    let title = CString::new("voxelforge — WASD полёт, мышь обзор, клик/пробел выстрел").unwrap();
 
     let mut view: *mut c_void = std::ptr::null_mut();
     unsafe {
@@ -169,12 +210,13 @@ fn main() {
     }
 
     let mut world = Live::new(&shaders);
-    let mut orbit = Orbit {
-        yaw: 0.75,
-        pitch: 0.32,
-        dist: 7.5,
-        target: [0.0, 1.1, 0.0],
+    let mut cam = Fly {
+        pos: [3.6, 2.8, 4.6],
+        yaw: 0.0,
+        pitch: 0.0,
+        speed: 4.0,
     };
+    cam.look_at([0.0, 1.2, 0.0]);
     let mut near = 0.05f32;
     let mut far = 60.0f32;
     let mut uploaded: Vec<(usize, i32)> = Vec::new();
@@ -190,13 +232,13 @@ fn main() {
     }
     let grid_id = unsafe { vf_view_add_lines(view, grid.as_ptr(), (grid.len() / 6) as u32) };
 
-    println!("voxelforge live · тел до {MAX_BODIES} · ЛКМ/ПКМ орбита, клик = выстрел, T каркас, R сброс");
+    println!("voxelforge live · WASD полёт (Shift быстрее, Ctrl медленнее, Q/E вниз/вверх), мышь обзор, клик/пробел выстрел, T каркас, R сброс");
 
     let mut prev_lmb = 0;
     let mut press_x = 0.0f32;
     let mut press_y = 0.0f32;
-    let mut drag = 0.0f32;
     let mut frames = 0u64;
+    let mut frame_no = 0u64;
     let mut t0 = std::time::Instant::now();
     let mut last_upload: Vec<usize> = Vec::new();
 
@@ -207,29 +249,32 @@ fn main() {
             break;
         }
 
-        drag += input.dx.abs() + input.dy.abs();
-        if input.lmb != 0 {
-            orbit.yaw -= input.dx * 0.008;
-            orbit.pitch = (orbit.pitch + input.dy * 0.006).clamp(-1.3, 1.35);
-        }
-        if input.rmb != 0 {
-            // пан в плоскости экрана
-            let e = orbit.eye();
-            let f = norm(sub(orbit.target, e));
-            let r = norm(cross(f, [0.0, 1.0, 0.0]));
-            let u = cross(r, f);
-            let k = orbit.dist * 0.0016;
-            for i in 0..3 {
-                orbit.target[i] += (-input.dx * r[i] + input.dy * u[i]) * k;
-            }
+        // обзор: любая зажатая кнопка мыши
+        if input.lmb != 0 || input.rmb != 0 {
+            cam.yaw -= input.dx * 0.005;
+            cam.pitch = (cam.pitch - input.dy * 0.005).clamp(-1.5, 1.5);
         }
         if input.wheel != 0.0 {
-            orbit.dist = (orbit.dist * (1.0 - input.wheel * 0.10)).clamp(1.2, 40.0);
+            cam.speed = (cam.speed * (1.0 + input.wheel * 0.15)).clamp(0.4, 60.0);
+        }
+        // полёт: W/S вперёд-назад, A/D в стороны, Q/E вниз-вверх
+        let mut dirs = [0.0f32; 3];
+        if input.key_w != 0 { dirs[0] += 1.0; }
+        if input.key_s != 0 { dirs[0] -= 1.0; }
+        if input.key_d != 0 { dirs[1] += 1.0; }
+        if input.key_a != 0 { dirs[1] -= 1.0; }
+        if input.key_e != 0 { dirs[2] += 1.0; }
+        if input.key_q != 0 { dirs[2] -= 1.0; }
+        let boost = if input.shift != 0 { 4.0 } else if input.ctrl != 0 { 0.25 } else { 1.0 };
+        if dirs != [0.0, 0.0, 0.0] {
+            let save = cam.speed;
+            cam.speed *= boost;
+            cam.move_by(dirs, 1.0 / 60.0);
+            cam.speed = save;
         }
         if input.lmb_pressed != 0 {
             press_x = input.mx;
             press_y = input.my;
-            drag = 0.0;
         }
 
         let mut shoot = false;
@@ -252,9 +297,12 @@ fn main() {
             println!("сброс: снова один цельный объект");
         }
 
-        let eye = orbit.eye();
+        if !shots.is_empty() && shots.contains(&frame_no) {
+            shoot = true;
+        }
+        let eye = cam.pos;
         if shoot {
-            let dir = norm(sub(orbit.target, eye));
+            let dir = cam.forward();
             let from = [
                 eye[0] as f64 + dir[0] as f64 * 0.6,
                 eye[1] as f64 + dir[1] as f64 * 0.6,
@@ -316,7 +364,12 @@ fn main() {
             1.6
         };
         let proj = persp(1.05, aspect, near, far);
-        let viewm = look_at(eye, orbit.target, [0.0, 1.0, 0.0]);
+        let target = [
+            eye[0] + cam.forward()[0],
+            eye[1] + cam.forward()[1],
+            eye[2] + cam.forward()[2],
+        ];
+        let viewm = look_at(eye, target, [0.0, 1.0, 0.0]);
         let vp = mul(proj, viewm);
         near = world.near.max(0.02);
         far = world.far.max(2.0);
@@ -356,6 +409,16 @@ fn main() {
         }
 
         frames += 1;
+        frame_no += 1;
+        if max_frames > 0 && frame_no >= max_frames {
+            println!(
+                "[live] конец: кадров {frame_no} · тел {} · трещин {} · осколков {}",
+                world.alive_count(),
+                world.cracks,
+                world.shards_made
+            );
+            break;
+        }
         if frames % 120 == 0 {
             let dt = t0.elapsed().as_secs_f32();
             println!(

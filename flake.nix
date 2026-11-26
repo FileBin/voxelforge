@@ -26,6 +26,11 @@
         vulkan-loader
         vulkan-tools
         sdl3
+        # виртуальный композитор для headless-прогона живого окна
+        sway
+        grim
+        util-linux
+        gdb
         # CPU-Vulkan (lavapipe) — headless-прогоны и CI, без касания GPU
         mesa
         wayland
@@ -183,6 +188,27 @@
           test -s "$out/world.vfw"
           grep -q "раскалывается на" "$out/log.txt"
           echo "мир записан: $(stat -c%s "$out/world.vfw") байт"
+        '';
+
+        # Живое окно под виртуальным композитором: sway(headless) + lavapipe.
+        # Ловит именно те падения, которые видит пользователь в окне —
+        # начиная с segfault в vkQueuePresentKHR из-за pImageIndices = NULL.
+        live-headless = pkgs.runCommand "live-headless" {
+          nativeBuildInputs = [ pkgs.sway pkgs.mesa pkgs.util-linux pkgs.dbus ];
+        } ''
+          export HOME="$TMPDIR"
+          export VF_SHADERS=${self.packages.${system}.spirv}
+          # обёртке sway нужен dbus-демон и /etc/dbus-1: берём бинарь напрямую
+          export SWAY_BIN=${pkgs.sway-unwrapped}/bin/sway
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$TMPDIR/bus" 
+          bash ${./scripts/headless-run.sh} \
+            ${self.packages.${system}.live}/bin/voxelforge-live 120 20,60 \
+            | tee "$TMPDIR/live.txt"
+          grep -q "HEADLESS exit=0" "$TMPDIR/live.txt"
+          grep -q "cracks=1" "$TMPDIR/live.txt"
+          frames="$(sed -n 's/.*frames=\([0-9]*\).*/\1/p' "$TMPDIR/live.txt" | tail -1)"
+          test "''${frames:-0}" -gt 0
+          echo "живое окно headless: $frames кадров, трещин 1" > "$out"
         '';
 
         # Эталон: орбита замыкается, энергия не дрейфует.

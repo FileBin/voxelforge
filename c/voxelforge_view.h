@@ -20,6 +20,8 @@ typedef struct vf_input {
     int lmb, rmb;   // кнопки сейчас
     int lmb_pressed;    // нажатие в этом кадре
     int key_space, key_r, key_t, key_f;
+    int key_w, key_a, key_s, key_d, key_q, key_e;
+    int shift, ctrl;
 } vf_input;
 
 vf_status vf_view_new(int w, int h, const char *title, const char *shader_dir, vf_view **out);

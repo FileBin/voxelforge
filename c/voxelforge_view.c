@@ -59,6 +59,7 @@ struct vf_view {
     VkSemaphore sem_ready, sem_done;
     VkFence fence;
     int recording;
+    uint32_t cur_img;
 
     gpu_shape shapes[MAX_SHAPES];
     int n_shapes;
@@ -653,6 +654,19 @@ int vf_view_poll(vf_view *v, vf_input *in) {
             break;
         }
     }
+    // Удержание клавиш: события дают только нажатие, а полёту нужен
+    // непрерывный ввод, пока клавиша зажата.
+    const bool *ks = SDL_GetKeyboardState(NULL);
+    if (ks) {
+        in->key_w = ks[SDL_SCANCODE_W];
+        in->key_a = ks[SDL_SCANCODE_A];
+        in->key_s = ks[SDL_SCANCODE_S];
+        in->key_d = ks[SDL_SCANCODE_D];
+        in->key_q = ks[SDL_SCANCODE_Q];
+        in->key_e = ks[SDL_SCANCODE_E];
+        in->shift = ks[SDL_SCANCODE_LSHIFT] || ks[SDL_SCANCODE_RSHIFT];
+        in->ctrl = ks[SDL_SCANCODE_LCTRL] || ks[SDL_SCANCODE_RCTRL];
+    }
     SDL_MouseButtonFlags flags = SDL_GetMouseState(&in->mx, &in->my);
     in->lmb = (flags & SDL_BUTTON_LMASK) != 0;
     in->rmb = (flags & SDL_BUTTON_RMASK) != 0;
@@ -733,6 +747,7 @@ void vf_view_begin(vf_view *v, float r, float g, float b) {
         ar = vkAcquireNextImageKHR(v->dev, v->sc, UINT64_MAX, v->sem_ready, VK_NULL_HANDLE, &img);
     }
     if (ar != VK_SUCCESS) return;
+    v->cur_img = img;
     vkResetFences(v->dev, 1, &v->fence);
     vkResetCommandBuffer(v->cmd, 0);
 
@@ -815,6 +830,9 @@ void vf_view_end(vf_view *v) {
     pi.pWaitSemaphores = &v->sem_done;
     pi.swapchainCount = 1;
     pi.pSwapchains = &v->sc;
+    // pImageIndices обязателен: без него драйвер разыменовывает NULL и падает
+    // в wsi_common_queue_present.
+    pi.pImageIndices = &v->cur_img;
     VkResult pr = vkQueuePresentKHR(v->queue, &pi);
     if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) {
         vkDeviceWaitIdle(v->dev);
