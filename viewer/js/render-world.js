@@ -33,18 +33,17 @@ export class WorldRenderer {
       const vao = gl.createVertexArray();
       gl.bindVertexArray(vao);
 
+      // позиция и нормаль в одном буфере: 6 float на вершину
       const vb = gl.createBuffer();
       gl.bindBuffer(gl.ARRAY_BUFFER, vb);
-      gl.bufferData(gl.ARRAY_BUFFER, sh.positions, gl.STATIC_DRAW);
+      gl.bufferData(gl.ARRAY_BUFFER, sh.vertices, gl.STATIC_DRAW);
       gl.enableVertexAttribArray(this.loc.aPos);
-      gl.vertexAttribPointer(this.loc.aPos, 3, gl.FLOAT, false, 0, 0);
-
-      const ib = gl.createBuffer();
-      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib);
-      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, sh.indices, gl.STATIC_DRAW);
+      gl.vertexAttribPointer(this.loc.aPos, 3, gl.FLOAT, false, 24, 0);
+      gl.enableVertexAttribArray(this.loc.aNrm);
+      gl.vertexAttribPointer(this.loc.aNrm, 3, gl.FLOAT, false, 24, 12);
 
       gl.bindVertexArray(null);
-      return { vao, vb, ib, count: sh.indices.length };
+      return { vao, vb, count: sh.count };
     });
   }
 
@@ -69,7 +68,7 @@ export class WorldRenderer {
       gl.uniform4fv(this.uQuat, body.quat);
       gl.uniform3fv(this.uTint, tint(sh.level));
       gl.bindVertexArray(buf.vao);
-      gl.drawElements(gl.TRIANGLES, buf.count, gl.UNSIGNED_INT, 0);
+      gl.drawArrays(gl.TRIANGLES, 0, buf.count);
     }
     gl.bindVertexArray(null);
   }
@@ -80,7 +79,6 @@ export class WorldRenderer {
     for (const b of this.buffers) {
       gl.deleteVertexArray(b.vao);
       gl.deleteBuffer(b.vb);
-      gl.deleteBuffer(b.ib);
     }
     this.buffers = [];
   }

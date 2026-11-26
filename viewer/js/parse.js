@@ -106,7 +106,31 @@ export function parseWorld(buf) {
         bhi[k] = Math.max(bhi[k], positions[i + k]);
       }
     }
-    shapes.push({ level, positions, indices, edge: base / (1 << level), blo, bhi });
+    // Плоские нормали считаются здесь: меш фасеточный, у вершины на стыке
+    // граней «правильной» одной нормали нет, поэтому разворачиваем треугольники
+    // в отдельные вершины с нормалью грани. Иначе в шейдере normalize(vec3(0))
+    // даёт NaN и объекты рисуются чёрными.
+    const ntri = indices.length / 3;
+    const verts = new Float32Array(ntri * 3 * 6); // (pos3 + nrm3) × 3 вершины
+    let w = 0;
+    for (let t = 0; t < ntri; t++) {
+      const i0 = indices[t * 3], i1 = indices[t * 3 + 1], i2 = indices[t * 3 + 2];
+      const ax = positions[i0 * 3], ay = positions[i0 * 3 + 1], az = positions[i0 * 3 + 2];
+      const bx = positions[i1 * 3], by = positions[i1 * 3 + 1], bz = positions[i1 * 3 + 2];
+      const cx = positions[i2 * 3], cy = positions[i2 * 3 + 1], cz = positions[i2 * 3 + 2];
+      const e1x = bx - ax, e1y = by - ay, e1z = bz - az;
+      const e2x = cx - ax, e2y = cy - ay, e2z = cz - az;
+      let nx = e1y * e2z - e1z * e2y;
+      let ny = e1z * e2x - e1x * e2z;
+      let nz = e1x * e2y - e1y * e2x;
+      const len = Math.hypot(nx, ny, nz) || 1;
+      nx /= len; ny /= len; nz /= len;
+      for (const [px, py, pz] of [[ax, ay, az], [bx, by, bz], [cx, cy, cz]]) {
+        verts[w++] = px; verts[w++] = py; verts[w++] = pz;
+        verts[w++] = nx; verts[w++] = ny; verts[w++] = nz;
+      }
+    }
+    shapes.push({ level, vertices: verts, count: ntri * 3, edge: base / (1 << level), blo, bhi });
   }
 
   const frames = [];
