@@ -71,6 +71,8 @@
               echo "  nix run .#drop        D1: блок падает на пол и остаётся лежать"
               echo "  nix run .#stack       D2: стопка из 10 блоков стоит 10 секунд"
               echo "  nix run .#pile        D3: куча из 2000 сфер ложится и засыпает"
+              echo "  nix run .#gpu         то же на видеокарте (Vulkan compute)"
+              echo "  nix run .#mesh        BCC-меш поверхности → demos/out/voxel-*.vfm"
               echo "  nix run .#vf-ref -- --scenario stack --bodies 20   прямой доступ к CLI"
               echo "  nix run .#help        эта справка"
               echo ""
@@ -105,6 +107,19 @@
             program = "${demo "pile" "pile" "--bodies 2000 --frames 420 --substeps 8 --iterations 8"}/bin/voxelforge-pile";
           };
           vf-ref = { type = "app"; program = "${vfref}/bin/vf-ref"; };
+          mesh = {
+            type = "app";
+            program = "${pkgs.writeShellApplication {
+              name = "voxelforge-mesh";
+              text = ''
+                out="''${OUT_DIR:-demos/out}"
+                mkdir -p "$out"
+                shape="''${1:-sphere}"; shift || true
+                ${vfref}/bin/vf_mesh --shape "$shape" --out "$out/voxel-$shape.vfm" "$@"
+                echo "смотреть: viewer/index.html, перетащить $out/voxel-$shape.vfm"
+              '';
+            }}/bin/voxelforge-mesh";
+          };
           gpu = {
             type = "app";
             program = "${pkgs.writeShellApplication {

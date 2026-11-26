@@ -42,6 +42,7 @@
     <option value="120">2×</option>
     <option value="240">4×</option>
   </select>
+  <label class="hint" id="lat"><input id="lattice" type="checkbox" checked> каркас BCC</label>
   <span class="hint">ЛКМ — орбита · колесо — зум · ПКМ/Shift+ЛКМ — пан · пробел — пауза</span>
   <span id="meta">нет данных</span>
 </div>
@@ -59,6 +60,7 @@ const $ = (id) => document.getElementById(id);
 const cv = $("cv");
 
 let sim = null, play = true, frame = 0, speed = 60, acc = 0, last = 0;
+let mesh = null, showLattice = true;
 
 /* ---------------- .vfr ---------------- */
 function parseVFR(buf) {
@@ -91,8 +93,42 @@ function parseVFR(buf) {
   return { n, nf, pos, scale, shapes, lo, hi };
 }
 
+function parseVFM(buf) {
+  const dv = new DataView(buf);
+  const magic = String.fromCharCode(dv.getUint8(0), dv.getUint8(1), dv.getUint8(2), dv.getUint8(3));
+  if (magic !== "VFM1") throw new Error("не VFM1: " + magic);
+  const nv = dv.getUint32(4, true), ni = dv.getUint32(8, true), nl = dv.getUint32(12, true);
+  let off = 16;
+  const verts = new Float32Array(nv * 3);
+  for (let i = 0; i < nv * 3; i++) { verts[i] = dv.getFloat32(off, true); off += 4; }
+  const idx = new Uint32Array(ni);
+  for (let i = 0; i < ni; i++) { idx[i] = dv.getUint32(off, true); off += 4; }
+  const lines = new Float32Array(nl * 3);
+  for (let i = 0; i < nl * 3; i++) { lines[i] = dv.getFloat32(off, true); off += 4; }
+  const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+  for (let i = 0; i < nv; i++) for (let k = 0; k < 3; k++) {
+    const v = verts[i * 3 + k];
+    if (v < lo[k]) lo[k] = v;
+    if (v > hi[k]) hi[k] = v;
+  }
+  return { nv, ni, nl, verts, idx, lines, lo, hi };
+}
+
 function loadFile(file) {
   file.arrayBuffer().then((buf) => {
+    const magic = String.fromCharCode(buf[0], buf[1], buf[2], buf[3]);
+    if (magic === "VFM1") {
+      mesh = parseVFM(buf);
+      sim = null;
+      $("msg").style.display = "none";
+      $("frame").disabled = true;
+      $("meta").textContent = `${file.name} · меш: ${mesh.nv} вершин, ${mesh.ni / 3} треугольников`;
+      fitCameraMesh();
+      buildMeshGL();
+      return;
+    }
+    mesh = null;
+    $("frame").disabled = false;
     sim = parseVFR(buf);
     frame = 0; acc = 0;
     $("frame").max = String(sim.nf - 1); $("frame").value = "0";
@@ -114,6 +150,13 @@ function fitCamera() {
   cam.target = [(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2];
   const ext = Math.max(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2], 0.5);
   cam.dist = ext * 1.6;
+  cam.pitch = 0.35; cam.yaw = 0.6;
+}
+function fitCameraMesh() {
+  const { lo, hi } = mesh;
+  cam.target = [(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2];
+  const ext = Math.max(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2], 0.5);
+  cam.dist = ext * 1.9;
   cam.pitch = 0.35; cam.yaw = 0.6;
 }
 function eyePos() {
@@ -156,9 +199,11 @@ function mul(a, b) {                            // a * b, column-major
 
 /* ---------------- WebGL2 ---------------- */
 const gl = cv.getContext("webgl2", { antialias: true, alpha: false, depth: true });
-let prog = null, progGrid = null, uVP = null, uEye = null, loc = {};
+let prog = null, progGrid = null, progMesh = null, progLines = null;
+let uVP = null, uEye = null, loc = {}, locMesh = {}, locLine = {};
 let meshSphere = null, meshBox = null, meshPlane = null;
 let instSphere = null, instBox = null;
+let meshGL = null;
 
 const VS = `#version 300 es
 precision highp float;
@@ -224,6 +269,48 @@ void main() {
   col = mix(col, vec3(0.043, 0.059, 0.078), fog);
   outColor = vec4(col, 1.0);
 }`;
+
+const VS_MESH = `#version 300 es
+precision highp float;
+in vec3 aPos;
+uniform mat4 uVP;
+out vec3 vW;
+void main() {
+  vW = aPos;
+  gl_Position = uVP * vec4(aPos, 1.0);
+}`;
+
+/* Нормали считаем производными: в .vfm их нет, а для воксельной поверхности
+ * фасеточный вид даже правильнее — видно, из каких плоскостей собрана форма. */
+const FS_MESH = `#version 300 es
+precision highp float;
+in vec3 vW;
+uniform vec3 uEye;
+uniform vec3 uTint;
+out vec4 outColor;
+void main() {
+  vec3 n = normalize(cross(dFdx(vW), dFdy(vW)));
+  if (dot(n, uEye - vW) < 0.0) n = -n;
+  vec3 L = normalize(vec3(0.45, 0.9, 0.35));
+  float diff = max(dot(n, L), 0.0);
+  float sky = 0.5 + 0.5 * n.y;
+  vec3 col = uTint * (0.2 + 0.45 * sky) + uTint * diff * 0.9;
+  vec3 H = normalize(L + normalize(uEye - vW));
+  col += vec3(1.0) * pow(max(dot(n, H), 0.0), 40.0) * 0.2;
+  outColor = vec4(col, 1.0);
+}`;
+
+const VS_LINE = `#version 300 es
+precision highp float;
+in vec3 aPos;
+uniform mat4 uVP;
+void main() { gl_Position = uVP * vec4(aPos, 1.0); }`;
+
+const FS_LINE = `#version 300 es
+precision highp float;
+uniform vec3 uTint;
+out vec4 outColor;
+void main() { outColor = vec4(uTint, 0.55); }`;
 
 function compile(vsSrc, fsSrc) {
   const mk = (type, src) => {
@@ -366,6 +453,20 @@ function initGL() {
     uEye: gl.getUniformLocation(progGrid, "uEye"),
   };
 
+  progMesh = compile(VS_MESH, FS_MESH);
+  progLines = compile(VS_LINE, FS_LINE);
+  locMesh = {
+    aPos: gl.getAttribLocation(progMesh, "aPos"),
+    uVP: gl.getUniformLocation(progMesh, "uVP"),
+    uEye: gl.getUniformLocation(progMesh, "uEye"),
+    uTint: gl.getUniformLocation(progMesh, "uTint"),
+  };
+  locLine = {
+    aPos: gl.getAttribLocation(progLines, "aPos"),
+    uVP: gl.getUniformLocation(progLines, "uVP"),
+    uTint: gl.getUniformLocation(progLines, "uTint"),
+  };
+
   gl.enable(gl.DEPTH_TEST);
   /* Отсечение задних граней не включаем: при ручной намотке куба и икосферы
    * ошибка знака сделала бы объекты невидимыми, а проверить это без браузера
@@ -385,6 +486,70 @@ function buildInstances() {
   const box = cubeMesh();
   meshBox = makeMesh(box.positions, box.normals, box.indices);
   render();
+}
+
+function buildMeshGL() {
+  if (!mesh) return;
+  if (meshGL) {
+    gl.deleteVertexArray(meshGL.tris.vao);
+    gl.deleteVertexArray(meshGL.lines.vao);
+  }
+  const triVao = gl.createVertexArray();
+  gl.bindVertexArray(triVao);
+  const tv = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, tv);
+  gl.bufferData(gl.ARRAY_BUFFER, mesh.verts, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(locMesh.aPos);
+  gl.vertexAttribPointer(locMesh.aPos, 3, gl.FLOAT, false, 0, 0);
+  const ti = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ti);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, mesh.idx, gl.STATIC_DRAW);
+
+  const lineVao = gl.createVertexArray();
+  gl.bindVertexArray(lineVao);
+  const lv = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, lv);
+  gl.bufferData(gl.ARRAY_BUFFER, mesh.lines, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(locLine.aPos);
+  gl.vertexAttribPointer(locLine.aPos, 3, gl.FLOAT, false, 0, 0);
+  gl.bindVertexArray(null);
+
+  meshGL = {
+    tris: { vao: triVao, count: mesh.idx.length },
+    lines: { vao: lineVao, count: mesh.lines.length / 3 },
+  };
+}
+
+function drawMeshGL() {
+  if (!meshGL) return;
+  gl.viewport(0, 0, cv.width, cv.height);
+  gl.clearColor(0.043, 0.059, 0.078, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  const eye = eyePos();
+  const aspect = cv.width / Math.max(1, cv.height);
+  const vp = mul(persp(0.9, aspect, 0.01, 5000), lookAt(eye, cam.target, [0, 1, 0]));
+
+  gl.useProgram(progGrid);
+  gl.uniformMatrix4fv(meshPlane.uVP, false, vp);
+  gl.uniform3fv(meshPlane.uEye, eye);
+  gl.bindVertexArray(meshPlane.vao);
+  gl.drawElements(gl.TRIANGLES, meshPlane.count, gl.UNSIGNED_INT, 0);
+
+  gl.useProgram(progMesh);
+  gl.uniformMatrix4fv(locMesh.uVP, false, vp);
+  gl.uniform3fv(locMesh.uEye, eye);
+  gl.uniform3fv(locMesh.uTint, [0.62, 0.82, 0.95]);
+  gl.bindVertexArray(meshGL.tris.vao);
+  gl.drawElements(gl.TRIANGLES, meshGL.tris.count, gl.UNSIGNED_INT, 0);
+
+  if (showLattice) {
+    gl.useProgram(progLines);
+    gl.uniformMatrix4fv(locLine.uVP, false, vp);
+    gl.uniform3fv(locLine.uTint, [0.55, 0.75, 0.95]);
+    gl.bindVertexArray(meshGL.lines.vao);
+    gl.drawArrays(gl.LINES, 0, meshGL.lines.count);
+  }
+  gl.bindVertexArray(null);
 }
 
 function fillInstanceBuffer(mesh, list) {
@@ -453,7 +618,8 @@ function resize() {
 
 function render() {
   resize();
-  drawScene();
+  if (mesh) drawMeshGL();
+  else drawScene();
 }
 
 /* ---------------- цикл ---------------- */
@@ -517,6 +683,7 @@ window.addEventListener("keydown", (e) => {
 $("file").addEventListener("change", (e) => { if (e.target.files[0]) loadFile(e.target.files[0]); });
 $("play").addEventListener("click", () => { play = !play; syncPlay(); });
 $("speed").addEventListener("change", (e) => { speed = +e.target.value; });
+$("lattice").addEventListener("change", (e) => { showLattice = e.target.checked; });
 $("frame").addEventListener("input", (e) => { setFrame(+e.target.value); });
 
 // Ручной шаг всегда ставит на паузу: если вы смотрите кадр, листать дальше

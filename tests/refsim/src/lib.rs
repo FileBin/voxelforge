@@ -14,7 +14,9 @@
 pub mod contact;
 pub mod gpu;
 pub mod pile;
+pub mod mesher;
 pub mod voxel;
+pub mod water;
 
 pub use contact::ContactSim;
 pub use pile::{pile_demo, PileSim};

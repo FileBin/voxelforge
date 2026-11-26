@@ -1,0 +1,11 @@
+#version 450
+#include "w_push.glsl"
+
+layout(local_size_x = 256) in;
+layout(std430, set = 0, binding = 0) buffer Counts { uint cnt[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= NBUCKETS) return;
+    cnt[i] = 0u;
+}

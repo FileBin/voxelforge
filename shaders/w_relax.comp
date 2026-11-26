@@ -1,0 +1,69 @@
+#version 450
+#include "w_push.glsl"
+
+/* Двойная релаксация плотности (Clavet et al.): давление давит наружу,
+ * «ближнее» слагаемое не даёт частицам слипнуться в точку. Позиционная
+ * коррекция, а не силовая, поэтому схема устойчива при крупном шаге. */
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) buffer Pos { vec4 pos[]; };
+layout(std430, set = 0, binding = 1) buffer Counts { uint cnt[]; };
+layout(std430, set = 0, binding = 2) buffer Buckets { uint items[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint n = uint(wp.prm2.x);
+    if (i >= n) return;
+    float h = wp.prm0.y;
+    float h2 = h * h;
+    vec3 pi = pos[i].xyz;
+    ivec3 c = cell_of(pi, h);
+
+    float rho = 0.0, rho_near = 0.0;
+    for (int dz = -1; dz <= 1; dz++)
+    for (int dy = -1; dy <= 1; dy++)
+    for (int dx = -1; dx <= 1; dx++) {
+        uint b = hash_cell(c + ivec3(dx, dy, dz));
+        uint k = min(cnt[b], CAP);
+        for (uint s = 0u; s < k; s++) {
+            uint j = items[b * CAP + s];
+            if (j == i) continue;
+            vec3 d = pos[j].xyz - pi;
+            float r2 = dot(d, d);
+            if (r2 >= h2 || r2 < 1e-12) continue;
+            float q = 1.0 - sqrt(r2) / h;
+            rho += q * q;
+            rho_near += q * q * q;
+        }
+    }
+
+    float P = wp.prm0.w * (rho - wp.prm0.z);
+    float Pn = wp.prm1.x * rho_near;
+    vec3 disp = vec3(0.0);
+    for (int dz = -1; dz <= 1; dz++)
+    for (int dy = -1; dy <= 1; dy++)
+    for (int dx = -1; dx <= 1; dx++) {
+        uint b = hash_cell(c + ivec3(dx, dy, dz));
+        uint k = min(cnt[b], CAP);
+        for (uint s = 0u; s < k; s++) {
+            uint j = items[b * CAP + s];
+            if (j == i) continue;
+            vec3 d = pos[j].xyz - pi;
+            float r2 = dot(d, d);
+            if (r2 >= h2 || r2 < 1e-12) continue;
+            float r = sqrt(r2);
+            float q = 1.0 - r / h;
+            /* половинный вес: каждая пара считается дважды (со стороны i и j) */
+            /* минус — потому что d смотрит НА соседа, а давить надо ОТ него */
+            disp -= (d / r) * (P * q + Pn * q * q) * 0.5;
+        }
+    }
+
+    float cap = h * 0.25;
+    float len = length(disp);
+    if (len > cap) disp *= cap / len;
+    vec3 np = pi + disp;
+
+    float r0 = 0.04;
+    if (np.y < wp.prm1.z + r0) np.y = wp.prm1.z + r0;
+    pos[i] = vec4(np, rho);   /* плотность кладём в w — для метрик */
+}

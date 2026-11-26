@@ -1,0 +1,17 @@
+#version 450
+#include "w_push.glsl"
+
+/* Хеш-сетка без фиксированного домена: ячейка — это функция координаты,
+ * поэтому вода может уехать куда угодно, никакого «ящика» нет. */
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) buffer Particles { vec4 pos[]; };
+layout(std430, set = 0, binding = 1) buffer Counts { uint cnt[]; };
+layout(std430, set = 0, binding = 2) buffer Buckets { uint items[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(wp.prm2.x)) return;
+    uint b = hash_cell(cell_of(pos[i].xyz, wp.prm0.y));
+    uint slot = atomicAdd(cnt[b], 1u);
+    if (slot < CAP) items[b * CAP + slot] = i;
+}

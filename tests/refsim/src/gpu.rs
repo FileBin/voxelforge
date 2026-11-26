@@ -8,42 +8,42 @@ use std::ffi::{c_char, c_void, CStr};
 use std::path::{Path, PathBuf};
 
 #[repr(C)]
-struct VfStatus {
-    code: i32,
+pub(crate) struct VfStatus {
+    pub(crate) code: i32,
     msg: *const c_char,
 }
 
 #[repr(C)]
-struct VfDispatch {
-    pipeline: *mut c_void,
-    buffers: *mut *mut c_void,
-    n_buffers: u32,
-    push: *const c_void,
-    push_bytes: u32,
-    groups: [u32; 3],
+pub(crate) struct VfDispatch {
+    pub(crate) pipeline: *mut c_void,
+    pub(crate) buffers: *mut *mut c_void,
+    pub(crate) n_buffers: u32,
+    pub(crate) push: *const c_void,
+    pub(crate) push_bytes: u32,
+    pub(crate) groups: [u32; 3],
 }
 
 unsafe extern "C" {
-    fn vf_init(out: *mut *mut c_void) -> VfStatus;
-    fn vf_shutdown(c: *mut c_void);
-    fn vf_device_info(c: *mut c_void, name: *mut c_char, len: usize, api: *mut u32) -> VfStatus;
-    fn vf_buffer_new(c: *mut c_void, bytes: usize, host: i32, out: *mut *mut c_void) -> VfStatus;
-    fn vf_buffer_free(c: *mut c_void, b: *mut c_void);
-    fn vf_buffer_write(
+    pub(crate) fn vf_init(out: *mut *mut c_void) -> VfStatus;
+    pub(crate) fn vf_shutdown(c: *mut c_void);
+    pub(crate) fn vf_device_info(c: *mut c_void, name: *mut c_char, len: usize, api: *mut u32) -> VfStatus;
+    pub(crate) fn vf_buffer_new(c: *mut c_void, bytes: usize, host: i32, out: *mut *mut c_void) -> VfStatus;
+    pub(crate) fn vf_buffer_free(c: *mut c_void, b: *mut c_void);
+    pub(crate) fn vf_buffer_write(
         c: *mut c_void,
         b: *mut c_void,
         off: usize,
         src: *const c_void,
         n: usize,
     ) -> VfStatus;
-    fn vf_buffer_read(
+    pub(crate) fn vf_buffer_read(
         c: *mut c_void,
         b: *mut c_void,
         off: usize,
         dst: *mut c_void,
         n: usize,
     ) -> VfStatus;
-    fn vf_pipeline_new(
+    pub(crate) fn vf_pipeline_new(
         c: *mut c_void,
         spirv: *const u32,
         bytes: usize,
@@ -52,11 +52,11 @@ unsafe extern "C" {
         name: *const c_char,
         out: *mut *mut c_void,
     ) -> VfStatus;
-    fn vf_pipeline_free(c: *mut c_void, p: *mut c_void);
-    fn vf_run(c: *mut c_void, list: *mut VfDispatch, count: u32) -> VfStatus;
+    pub(crate) fn vf_pipeline_free(c: *mut c_void, p: *mut c_void);
+    pub(crate) fn vf_run(c: *mut c_void, list: *mut VfDispatch, count: u32) -> VfStatus;
 }
 
-fn check(s: VfStatus, what: &str) {
+pub(crate) fn check_status(s: VfStatus, what: &str) {
     if s.code != 0 {
         let msg = unsafe { CStr::from_ptr(s.msg) }.to_string_lossy();
         panic!("{what}: [{:#x}] {msg}", s.code);
@@ -276,6 +276,7 @@ const CAP: usize = 24;
 /// Body = 5 × vec4.
 const BODY_BYTES: usize = 112;
 const WG: u32 = 64;
+pub(crate) const BODY_WG: u32 = 64;
 
 struct Step {
     pipe: usize,
@@ -364,11 +365,11 @@ impl GpuSim {
     ) -> Self {
         let n = bodies.len();
         let mut ctx: *mut c_void = std::ptr::null_mut();
-        unsafe { check(vf_init(&mut ctx), "vf_init") };
+        unsafe { check_status(vf_init(&mut ctx), "vf_init") };
 
         let mut namebuf = [0i8; 256];
         let mut api = 0u32;
-        unsafe { check(vf_device_info(ctx, namebuf.as_mut_ptr(), 256, &mut api), "device_info") };
+        unsafe { check_status(vf_device_info(ctx, namebuf.as_mut_ptr(), 256, &mut api), "device_info") };
         let name = unsafe { CStr::from_ptr(namebuf.as_ptr()) }
             .to_string_lossy()
             .into_owned();
@@ -383,7 +384,7 @@ impl GpuSim {
         let mk = |bytes: usize, host: bool| {
             let mut b: *mut c_void = std::ptr::null_mut();
             unsafe {
-                check(
+                check_status(
                     vf_buffer_new(ctx, bytes, if host { 1 } else { 0 }, &mut b),
                     "buffer_new",
                 )
@@ -403,7 +404,7 @@ impl GpuSim {
                 let sdf = mk((v.data.len() * 4).max(16), true);
                 let prm = mk(64, true);
                 unsafe {
-                    check(
+                    check_status(
                         vf_buffer_write(ctx, sdf, 0, v.data.as_ptr() as *const c_void, v.data.len() * 4),
                         "upload sdf",
                     )
@@ -432,7 +433,7 @@ impl GpuSim {
                     }
                 }
                 unsafe {
-                    check(
+                    check_status(
                         vf_buffer_write(ctx, prm, 0, params_bytes.as_ptr() as *const c_void, 64),
                         "upload vox params",
                     )
@@ -443,7 +444,7 @@ impl GpuSim {
         };
 
         unsafe {
-            check(
+            check_status(
                 vf_buffer_write(
                     ctx,
                     bodies_a,
@@ -477,7 +478,7 @@ impl GpuSim {
             let mut p: *mut c_void = std::ptr::null_mut();
             let cname = std::ffi::CString::new(*nm).unwrap();
             unsafe {
-                check(
+                check_status(
                     vf_pipeline_new(
                         ctx,
                         bytes.as_ptr() as *const u32,
@@ -629,13 +630,13 @@ impl GpuSim {
                 groups: s.groups,
             })
             .collect();
-        unsafe { check(vf_run(self.ctx, ds.as_mut_ptr(), ds.len() as u32), "vf_run") };
+        unsafe { check_status(vf_run(self.ctx, ds.as_mut_ptr(), ds.len() as u32), "vf_run") };
     }
 
     pub fn read_bodies(&mut self) -> Vec<GpuBody> {
         let mut out = vec![GpuBody::default(); self.n];
         unsafe {
-            check(
+            check_status(
                 vf_buffer_read(
                     self.ctx,
                     self.bodies[0],
@@ -659,7 +660,7 @@ impl GpuSim {
     pub fn contact_counts(&mut self) -> Vec<u32> {
         let mut counts = vec![0u32; self.n];
         unsafe {
-            check(
+            check_status(
                 vf_buffer_read(
                     self.ctx,
                     self.lcount,
