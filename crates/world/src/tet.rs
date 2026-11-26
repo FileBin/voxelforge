@@ -449,8 +449,14 @@ impl TetBody {
     }
 
     pub fn surface_grid(&self) -> (Mesh, Grid) {
+        self.surface_grid_smoothed(1, 0.30)
+    }
+
+    /// То же, но с явным сглаживанием: 0 — гранёная поверхность (как у
+    /// настоящего скола), больше — «обтекаемая».
+    pub fn surface_grid_smoothed(&self, iterations: usize, lambda: f32) -> (Mesh, Grid) {
         let mut mesh = self.extract_faces();
-        smooth(&mut mesh, 1, 0.30);
+        smooth(&mut mesh, iterations, lambda);
         let level = mesh.level;
         let _step = node_step(level);
         let origin = self.centroid();

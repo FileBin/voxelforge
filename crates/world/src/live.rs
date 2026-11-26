@@ -555,7 +555,8 @@ impl Live {
     /// Выстрел из точки from в направлении dir.
     pub fn shoot(&mut self, from: [f64; 3], dir: [f64; 3], speed: f64) -> bool {
         let Some(slot) = self.free_slot() else { return false };
-        let ball = TetBody::ball([0.0, 0.0, 0.0], 0.14, 2);
+        // снаряд — гранёный кусок, а не шар
+        let ball = TetBody::cube([0.0, 0.0, 0.0], 2, 1);
         let mut body = LiveBody {
             pos: from,
             quat: [1.0, 0.0, 0.0, 0.0],
@@ -613,7 +614,8 @@ impl Live {
             origin: b.origin,
         };
         let c = tb.world_centroid();
-        let (mut mesh, grid) = tb.surface_grid();
+        // без сглаживания: у скола должны быть грани, а не блоб
+        let (mut mesh, grid) = tb.surface_grid_smoothed(0, 0.0);
         for p in mesh.positions.iter_mut() {
             p[0] -= c[0];
             p[1] -= c[1];
