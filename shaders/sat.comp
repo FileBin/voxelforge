@@ -23,9 +23,16 @@ layout(std430, set = 0, binding = 5) buffer ListCount { uint lc[]; };
 const uint EMPTY = 0xFFFFFFFFu;
 const uint TET_MASK = 0xFFFFFu;
 
+/* ВНИМАНИЕ: кватернион в common.glsl лежит как (w, x, y, z) — скаляр в .x,
+ * вектор в .yzw. Раньше здесь бралось .xyz/.w (порядок x,y,z,w): для identity
+ * это совпадает, а для повёрнутых тел вращение получалось чужим, геометрия
+ * уезжала, и SAT считал контакты не по тем граням — снаряд проходил сквозь
+ * плиту, а кубы «катились как шары». */
 vec3 qrot(vec4 q, vec3 v) {
-    vec3 t = 2.0 * cross(q.xyz, v);
-    return v + q.w * t + cross(q.xyz, t);
+    vec3 u = q.yzw;
+    float w = q.x;
+    vec3 t = 2.0 * cross(u, v);
+    return v + w * t + cross(u, t);
 }
 
 /* Четыре нормали граней тетраэдра. Знак не важен: SAT проецируется на ось
