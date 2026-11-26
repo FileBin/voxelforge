@@ -38,12 +38,14 @@ void main() {
             int j = ids[k];
             if (j <= int(i)) continue;
             Body o = b[j];
+            vec3 n;
+            float pen;
+            if (!pair_contact(a, o, n, pen)) continue;
+
             bool a_sleep = a.misc.y > 0.5;
             bool o_sleep = o.misc.y > 0.5;
             if (a_sleep && o_sleep) continue;
-            vec3 d = o.pos_r.xyz - a.pos_r.xyz;
-            float rr0 = a.pos_r.w + o.pos_r.w;
-            if (dot(d, d) >= rr0 * rr0) continue;
+
             /* Пробуждение: покоящееся тело трогает сосед, который реально
              * едет. Порог в 4 раза выше порога сна — иначе дрожание
              * разбудит весь штабель. */
@@ -54,6 +56,7 @@ void main() {
                 w.misc.x = 0.0;
                 w.vel_m.w = w.misc.z;
                 w.ang_i.w = w.misc.w;
+                w.anchor = vec4(w.pos_r.xyz, 0.0);
                 b[i] = w;
                 a = b[i];
             } else if (o_sleep && dot(a.vel_m.xyz, a.vel_m.xyz) > thr * thr) {
@@ -62,16 +65,13 @@ void main() {
                 w.misc.x = 0.0;
                 w.vel_m.w = w.misc.z;
                 w.ang_i.w = w.misc.w;
+                w.anchor = vec4(w.pos_r.xyz, 0.0);
                 b[j] = w;
                 o = b[j];
             }
-            float dist2 = dot(d, d);
-            float rr = a.pos_r.w + o.pos_r.w;
-            if (dist2 >= rr * rr || dist2 <= 1e-12) continue;
-            float dist = sqrt(dist2);
-            vec3 n = d / dist;
-            push(int(i), j, n, rr - dist);
-            push(j, int(i), -n, rr - dist);
+
+            push(int(i), j, n, pen);
+            push(j, int(i), -n, pen);
         }
     }
 }

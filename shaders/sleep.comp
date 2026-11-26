@@ -1,17 +1,18 @@
 #version 450
 #include "common.glsl"
 
-/* Сон: тело, которое долго не двигается, выключается из симуляции.
+/* Сон по СМЕЩЕНИЮ за окно времени, как в CPU-эталоне.
  *
- * Без этого куча на GPU никогда не «замирает»: остаточная скорость от bias
- * и от итераций солвера не даёт ей успокоиться, хотя визуально она стоит.
- * Пороги те же, что в CPU-эталоне: 5 см/с и 0.5 с покоя.
+ * Порог по мгновенной скорости не годится: тело, ползущее со скоростью
+ * чуть выше порога, не засыпает никогда, и куча из 5000 шаров на GPU
+ * «дышала» вместо того, чтобы встать. Смещение за 0.5 с — тот же критерий,
+ * что у эталона, поэтому время сна совпадает с точностью до кадра.
  */
 layout(local_size_x = 64) in;
 layout(std430, set = 0, binding = 0) buffer Bodies { Body b[]; };
 
-const float SLEEP_LINEAR = 0.05;
-const float SLEEP_TIME = 0.5;
+const float SLEEP_LINEAR = 0.05;   /* м/с — масштаб порога */
+const float SLEEP_TIME = 0.5;      /* с — окно покоя      */
 
 void main() {
     uint i = gl_GlobalInvocationID.x;
@@ -19,17 +20,19 @@ void main() {
     Body x = b[i];
     if (x.misc.y > 0.5) return;
 
-    float v2 = dot(x.vel_m.xyz, x.vel_m.xyz);
-    float w2 = dot(x.ang_i.xyz, x.ang_i.xyz);
-    bool quiet = (v2 < SLEEP_LINEAR * SLEEP_LINEAR) && (w2 < 1.0);
-
-    x.misc.x = quiet ? x.misc.x + pc.prm0.x : 0.0;
-    if (x.misc.x >= SLEEP_TIME) {
-        x.misc.y = 1.0;
-        x.misc.z = x.vel_m.w;
-        x.misc.w = x.ang_i.w;
-        x.vel_m = vec4(0.0);
-        x.ang_i = vec4(0.0);
+    float moved = length(x.pos_r.xyz - x.anchor.xyz);
+    if (moved > SLEEP_LINEAR * SLEEP_TIME) {
+        x.anchor = vec4(x.pos_r.xyz, 0.0);
+        x.misc.x = 0.0;
+    } else {
+        x.misc.x += pc.prm0.x;
+        if (x.misc.x >= SLEEP_TIME) {
+            x.misc.y = 1.0;
+            x.misc.z = x.vel_m.w;
+            x.misc.w = x.ang_i.w;
+            x.vel_m = vec4(0.0);
+            x.ang_i = vec4(0.0);
+        }
     }
     b[i] = x;
 }

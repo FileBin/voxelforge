@@ -63,7 +63,7 @@ fn check(s: VfStatus, what: &str) {
     }
 }
 
-/// Раскладка должна совпадать с `Body` в shaders/common.glsl — 64 байта.
+/// Раскладка должна совпадать с `Body` в shaders/common.glsl — 112 байт.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
 pub struct GpuBody {
@@ -73,6 +73,106 @@ pub struct GpuBody {
     pub quat: [f32; 4],
     /// x — таймер покоя, y — флаг сна, z/w — обратные масса и инерция.
     pub misc: [f32; 4],
+    /// Позиция на прошлом снимке сна (сон по смещению, как в эталоне).
+    pub anchor: [f32; 4],
+    /// Полуразмеры и код формы: 0 — сфера, 1 — коробка.
+    pub half_shape: [f32; 4],
+}
+
+impl GpuBody {
+    pub fn from_cpu(b: &crate::Body) -> Self {
+        let im = if b.mass > 0.0 { 1.0 / b.mass } else { 0.0 } as f32;
+        let shape = match b.shape {
+            crate::Shape::Sphere => 0.0,
+            crate::Shape::Block => 1.0,
+        };
+        Self {
+            pos_r: [b.pos[0] as f32, b.pos[1] as f32, b.pos[2] as f32, b.radius],
+            vel_m: [b.vel[0] as f32, b.vel[1] as f32, b.vel[2] as f32, im],
+            ang_i: [
+                b.ang[0] as f32,
+                b.ang[1] as f32,
+                b.ang[2] as f32,
+                b.inv_inertia as f32,
+            ],
+            quat: [b.rot[0] as f32, b.rot[1] as f32, b.rot[2] as f32, b.rot[3] as f32],
+            misc: [0.0, 0.0, im, b.inv_inertia as f32],
+            anchor: [b.pos[0] as f32, b.pos[1] as f32, b.pos[2] as f32, 0.0],
+            half_shape: [b.half[0] as f32, b.half[1] as f32, b.half[2] as f32, shape],
+        }
+    }
+}
+
+/// Готовая сцена: тела плюс параметры ящика и сетки.
+pub struct Scene {
+    pub name: &'static str,
+    /// Тела в представлении эталона: для записи `.vfr` и для сверки.
+    pub cpu: Vec<crate::Body>,
+    pub bodies: Vec<GpuBody>,
+    pub params: Params,
+}
+
+fn params_for(bodies: &[GpuBody], lo: [f32; 3], hi: [f32; 3], friction: f32) -> Params {
+    /* Ячейка обязана быть не меньше самого крупного тела: иначе пара,
+     * которая уже пересекается, окажется в ячейках дальше чем за один шаг. */
+    let max_half = bodies
+        .iter()
+        .map(|b| b.half_shape[0].max(b.half_shape[1]).max(b.half_shape[2]))
+        .fold(0.0f32, f32::max);
+    Params {
+        lo,
+        hi,
+        cell: (2.0 * max_half * 1.05).max(0.16),
+        friction,
+        ..Params::default()
+    }
+}
+
+pub fn scene_pile(count: usize) -> Scene {
+    let sim = crate::pile_demo(count);
+    let bodies: Vec<GpuBody> = sim.bodies.iter().map(GpuBody::from_cpu).collect();
+    let top = bodies
+        .iter()
+        .map(|b| b.pos_r[1] + b.half_shape[1])
+        .fold(0.0f32, f32::max);
+    let params = params_for(&bodies, [-0.05, 0.0, -0.05], [4.2, top + 0.5, 4.2], 0.7);
+    Scene {
+        name: "pile",
+        cpu: sim.bodies,
+        bodies,
+        params,
+    }
+}
+
+pub fn scene_drop() -> Scene {
+    let sim = crate::ContactSim::new(vec![crate::Body::block([0.0, 3.0, 0.0], [0.5, 0.5, 0.5])]);
+    let bodies: Vec<GpuBody> = sim.bodies.iter().map(GpuBody::from_cpu).collect();
+    // Трение выключено: эталонный ContactSim его не умеет, иначе сверять нечего.
+    let params = params_for(&bodies, [-3.0, 0.0, -3.0], [3.0, 12.0, 3.0], 0.0);
+    Scene {
+        name: "drop",
+        cpu: sim.bodies,
+        bodies,
+        params,
+    }
+}
+
+pub fn scene_stack(count: usize) -> Scene {
+    let half = [0.5f64, 0.2, 0.5];
+    let mut v = Vec::new();
+    for i in 0..count {
+        let y = half[1] + i as f64 * (2.0 * half[1] + 0.002);
+        v.push(crate::Body::block([0.0, y, 0.0], half));
+    }
+    let sim = crate::ContactSim::new(v);
+    let bodies: Vec<GpuBody> = sim.bodies.iter().map(GpuBody::from_cpu).collect();
+    let params = params_for(&bodies, [-3.0, 0.0, -3.0], [3.0, 12.0, 3.0], 0.0);
+    Scene {
+        name: "stack",
+        cpu: sim.bodies,
+        bodies,
+        params,
+    }
 }
 
 #[repr(C)]
@@ -98,7 +198,7 @@ const P_POS: usize = 9;
 
 const CAP: usize = 24;
 /// Body = 5 × vec4.
-const BODY_BYTES: usize = 80;
+const BODY_BYTES: usize = 112;
 const WG: u32 = 64;
 
 struct Step {

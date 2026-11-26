@@ -27,7 +27,7 @@ void main() {
     vec3 w = me.ang_i.xyz;
     float im = me.vel_m.w;
     float ii = me.ang_i.w;
-    float r = me.pos_r.w;
+    vec3 my_half = me.half_shape.xyz;
     float dt = pc.prm0.x;
     float mu = pc.prm0.w;
 
@@ -51,19 +51,22 @@ void main() {
         vec3 ov = vec3(0.0);
         vec3 ow = vec3(0.0);
         float oim = 0.0;
-        float orad = 0.0;
+        vec3 o_half = vec3(0.0);
         float oii = 0.0;
         if (j >= 0) {
             Body o = bin[j];
             ov = o.vel_m.xyz;
             ow = o.ang_i.xyz;
             oim = o.vel_m.w;
-            orad = o.pos_r.w;
+            o_half = o.half_shape.xyz;
             oii = o.ang_i.w;
         }
 
-        vec3 rself = nrm * r;
-        vec3 rother = -nrm * orad;
+        /* Плечо — полуразмер вдоль нормали: у сферы это радиус, у коробки
+         * расстояние до грани. Для оси-выровненных нормалей оно параллельно
+         * нормали, поэтому нормальный импульс вращение не создаёт. */
+        vec3 rself = nrm * half_along(nrm, my_half);
+        vec3 rother = -nrm * half_along(nrm, o_half);
         bool is_static = (j < 0);
         vec3 vrel = is_static
             ? (v + cross(w, rself))

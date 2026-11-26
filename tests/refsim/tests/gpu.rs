@@ -1,178 +1,232 @@
-//! D3 на видеокарте: та же сцена, что у CPU-эталона, те же числа на выходе.
+//! GPU-тесты: те же демки, что у CPU-эталона, но посчитанные на видеокарте.
 //!
-//! Тест сравнивает не «похоже/не похоже», а агрегаты: просадку кучи, глубину
-//! проникновения и остаточную скорость. Побитового совпадения быть не может —
-//! GPU считает во float32, CPU в f64, и порядок контактов в списке задаётся
-//! целочисленными атомиками. Совпадать должна физика, а не биты.
+//! Сравниваем не «похоже/не похоже», а те же числа, что проверяет CPU:
+//! просадку, проникновение, остаточную скорость, сон и снос кучи к стенке.
+//! Побитового совпадения быть не может — GPU считает во float32, CPU в f64,
+//! и порядок контактов в списке задаётся целочисленными атомиками. Совпадать
+//! должна физика, а не биты.
 
 use std::path::{Path, PathBuf};
 
-use voxelforge_refsim::gpu::{find_shaders, GpuBody, GpuSim, Params};
-use voxelforge_refsim::{pile_demo, Body};
+use voxelforge_refsim::gpu::{
+    find_shaders, scene_drop, scene_pile, scene_stack, GpuBody, GpuSim, Scene,
+};
+use voxelforge_refsim::{pile_demo, ContactSim};
 
 fn shader_dir() -> Option<PathBuf> {
     find_shaders(None)
 }
 
-fn to_gpu(body: &Body) -> GpuBody {
-    let im = if body.mass > 0.0 { 1.0 / body.mass } else { 0.0 };
-    GpuBody {
-        pos_r: [
-            body.pos[0] as f32,
-            body.pos[1] as f32,
-            body.pos[2] as f32,
-            body.radius,
-        ],
-        vel_m: [
-            body.vel[0] as f32,
-            body.vel[1] as f32,
-            body.vel[2] as f32,
-            im as f32,
-        ],
-        ang_i: [
-            body.ang[0] as f32,
-            body.ang[1] as f32,
-            body.ang[2] as f32,
-            body.inv_inertia as f32,
-        ],
-        quat: [body.rot[0] as f32, body.rot[1] as f32, body.rot[2] as f32, body.rot[3] as f32],
-        misc: [0.0, 0.0, im as f32, body.inv_inertia as f32],
+fn pair_pen(a: &GpuBody, b: &GpuBody) -> f64 {
+    let (ha, hb) = (a.half_shape, b.half_shape);
+    let d = [
+        (b.pos_r[0] - a.pos_r[0]) as f64,
+        (b.pos_r[1] - a.pos_r[1]) as f64,
+        (b.pos_r[2] - a.pos_r[2]) as f64,
+    ];
+    let a_box = ha[3] > 0.5;
+    let b_box = hb[3] > 0.5;
+    if !a_box && !b_box {
+        let dist = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        let rr = ha[0] as f64 + hb[0] as f64;
+        return (rr - dist).max(0.0);
     }
+    if a_box && b_box {
+        let ox = ha[0] as f64 + hb[0] as f64 - d[0].abs();
+        let oy = ha[1] as f64 + hb[1] as f64 - d[1].abs();
+        let oz = ha[2] as f64 + hb[2] as f64 - d[2].abs();
+        return ox.min(oy).min(oz).max(0.0);
+    }
+    0.0
 }
 
 struct Outcome {
     top: f32,
-    /// Центр масс по горизонтали: ловит систематический снос к стенке.
-    center: [f32; 2],
-    /// 99-й процентиль высоты: устойчив к паре шаров, заклинившихся в углу.
     p99: f32,
-    vmax: f32,
     pen: f64,
+    vmax: f32,
     asleep: usize,
     out_of_box: usize,
+    center: [f32; 2],
 }
 
-fn run_gpu(n: usize, frames: u32, iters: u32, shaders: &Path) -> Outcome {
-    let sim = pile_demo(n);
-    let top = sim
-        .bodies
-        .iter()
-        .map(|b| b.pos[1] as f32 + b.radius)
-        .fold(0.0f32, f32::max);
-    let params = Params {
-        lo: [-0.05, 0.0, -0.05],
-        hi: [4.2, top + 0.5, 4.2],
-        ..Params::default()
-    };
-    let bodies: Vec<GpuBody> = sim.bodies.iter().map(to_gpu).collect();
-    let mut gpu = GpuSim::new(bodies, shaders, params);
-    let dt = 1.0 / 60.0;
+fn run(sc: Scene, frames: u32, iters: u32, shaders: &Path) -> Outcome {
+    let n = sc.bodies.len();
+    let (lo, hi) = (sc.params.lo, sc.params.hi);
+    let mut gpu = GpuSim::new(sc.bodies, shaders, sc.params);
     for _ in 0..frames {
-        gpu.frame(dt, 8, iters);
+        gpu.frame(1.0 / 60.0, 8, iters);
     }
     let snap = gpu.read_bodies();
-    let top_end = snap
-        .iter()
-        .map(|b| b.pos_r[1] + b.pos_r[3])
-        .fold(0.0f32, f32::max);
+
+    let mut hs: Vec<f32> = snap.iter().map(|b| b.pos_r[1] + b.half_shape[1]).collect();
+    hs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p99 = hs[(hs.len() * 99 / 100).min(hs.len() - 1)];
+    let top = *hs.last().unwrap();
     let vmax = snap
         .iter()
         .map(|b| {
             (b.vel_m[0] * b.vel_m[0] + b.vel_m[1] * b.vel_m[1] + b.vel_m[2] * b.vel_m[2]).sqrt()
         })
         .fold(0.0f32, f32::max);
-    let mut hs: Vec<f32> = snap.iter().map(|b| b.pos_r[1] + b.pos_r[3]).collect();
-    hs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let p99 = hs[(hs.len() * 99 / 100).min(hs.len() - 1)];
-    let asleep = snap.iter().filter(|b| b.misc[1] > 0.5).count();
-    let cx = snap.iter().map(|b| b.pos_r[0]).sum::<f32>() / snap.len() as f32;
-    let cz = snap.iter().map(|b| b.pos_r[2]).sum::<f32>() / snap.len() as f32;
-    let out_of_box = snap
-        .iter()
-        .filter(|b| {
-            b.pos_r[0] < -0.12 || b.pos_r[0] > 4.27 || b.pos_r[2] < -0.12 || b.pos_r[2] > 4.27
-        })
-        .count();
     let mut pen = 0.0f64;
     for i in 0..snap.len() {
         for b in snap.iter().skip(i + 1) {
-            let dx = (snap[i].pos_r[0] - b.pos_r[0]) as f64;
-            let dy = (snap[i].pos_r[1] - b.pos_r[1]) as f64;
-            let dz = (snap[i].pos_r[2] - b.pos_r[2]) as f64;
-            let d = (dx * dx + dy * dy + dz * dz).sqrt();
-            let rr = (snap[i].pos_r[3] + b.pos_r[3]) as f64;
-            if d < rr {
-                pen = pen.max(rr - d);
-            }
+            pen = pen.max(pair_pen(&snap[i], b));
         }
     }
+    let cx = snap.iter().map(|b| b.pos_r[0]).sum::<f32>() / n as f32;
+    let cz = snap.iter().map(|b| b.pos_r[2]).sum::<f32>() / n as f32;
+    let out_of_box = snap
+        .iter()
+        .filter(|b| {
+            b.pos_r[0] < lo[0] - 0.07
+                || b.pos_r[0] > hi[0] + 0.07
+                || b.pos_r[2] < lo[2] - 0.07
+                || b.pos_r[2] > hi[2] + 0.07
+        })
+        .count();
     Outcome {
-        top: top_end,
-        center: [cx, cz],
+        top,
         p99,
-        vmax,
         pen,
-        asleep,
+        vmax,
+        asleep: snap.iter().filter(|b| b.misc[1] > 0.5).count(),
         out_of_box,
+        center: [cx, cz],
+    }
+}
+
+/// Есть ли вообще Vulkan-устройство. На голом CI-раннере его нет — тогда
+/// GPU-тесты честно пропускаются, а не падают.
+fn setup() -> Option<(PathBuf, String)> {
+    let shaders = shader_dir()?;
+    let probe = std::panic::catch_unwind(|| {
+        let sc = scene_drop();
+        let g = GpuSim::new(sc.bodies, &shaders, sc.params);
+        g.name.clone()
+    });
+    match probe {
+        Ok(name) => {
+            eprintln!("устройство: {name}");
+            Some((shaders, name))
+        }
+        Err(_) => None,
     }
 }
 
 #[test]
+fn gpu_drop_matches_cpu_reference() {
+    let Some((shaders, _)) = setup() else {
+        eprintln!("пропуск: нет SPIR-V или Vulkan-устройства");
+        return;
+    };
+    // D1: блок падает на пол и остаётся стоять.
+    let sc = scene_drop();
+    let cpu_bodies = sc.cpu.clone();
+    let gpu = run(sc, 300, 6, &shaders);
+
+    let mut cpu = ContactSim::new(cpu_bodies);
+    cpu.iterations = 6;
+    for _ in 0..300 {
+        cpu.step(1.0 / 60.0);
+    }
+    let cpu_y = cpu.bodies[0].pos[1];
+    let rest = gpu.top - 0.5; // top = центр + половина высоты
+    eprintln!(
+        "D1: GPU y={rest:.4} pen={:.4} v={:.4} | CPU y={cpu_y:.4} pen={:.4}",
+        gpu.pen,
+        gpu.vmax,
+        cpu.max_penetration()
+    );
+    assert!(
+        (rest as f64 - 0.5).abs() < 0.02,
+        "GPU: высота покоя {rest:.4} вместо ~0.5"
+    );
+    assert!(
+        (rest as f64 - cpu_y).abs() < 0.02,
+        "GPU {rest:.4} против CPU {cpu_y:.4}"
+    );
+    assert!(gpu.pen < 0.01, "GPU: просадка {:.4} м > 1 см", gpu.pen);
+    assert!(
+        gpu.vmax < 0.01,
+        "GPU: скорость покоя {:.4} м/с > 1 см/с",
+        gpu.vmax
+    );
+}
+
+#[test]
+fn gpu_stack_of_ten_stands() {
+    let Some((shaders, _)) = setup() else {
+        eprintln!("пропуск: нет SPIR-V или Vulkan-устройства");
+        return;
+    };
+    // D2: стопка из 10 блоков стоит и не складывается.
+    let sc = scene_stack(10);
+    let top0 = sc
+        .bodies
+        .iter()
+        .map(|b| b.pos_r[1] + b.half_shape[1])
+        .fold(0.0f32, f32::max);
+    let cpu_bodies = sc.cpu.clone();
+    let gpu = run(sc, 600, 8, &shaders);
+
+    let mut cpu = ContactSim::new(cpu_bodies);
+    for _ in 0..600 {
+        cpu.step(1.0 / 60.0);
+    }
+    let cpu_top = cpu.top() as f32;
+    let sag = (top0 - gpu.top) / top0;
+    eprintln!(
+        "D2: GPU top {top0:.3}->{:.3} (просадка {:.1}%) pen={:.4} v={:.4} | CPU top {cpu_top:.3}",
+        gpu.top,
+        100.0 * sag,
+        gpu.pen,
+        gpu.vmax
+    );
+    assert!(sag < 0.05, "GPU: стопка просела на {:.1}% > 5%", 100.0 * sag);
+    assert!(
+        (gpu.top - cpu_top).abs() / cpu_top < 0.05,
+        "GPU top {:.3} против CPU {cpu_top:.3}",
+        gpu.top
+    );
+    assert!(
+        gpu.pen < 0.02,
+        "GPU: проникновение в стопке {:.4} м > 2 см",
+        gpu.pen
+    );
+    assert!(
+        gpu.vmax < 0.02,
+        "GPU: стопка не успокоилась: {:.4} м/с",
+        gpu.vmax
+    );
+}
+
+#[test]
 fn gpu_pile_matches_cpu_reference() {
-    let Some(shaders) = shader_dir() else {
-        eprintln!("пропуск: нет скомпилированных шейдеров (shaders/spv/*.spv)");
+    let Some((shaders, _)) = setup() else {
+        eprintln!("пропуск: нет SPIR-V или Vulkan-устройства");
         return;
     };
-
-    // Нет ICD (например, голый CI-раннер) — GPU-часть не проверяем.
-    let probe = std::panic::catch_unwind(|| {
-        let sim = pile_demo(8);
-        let bodies: Vec<GpuBody> = sim.bodies.iter().map(to_gpu).collect();
-        let top = sim
-            .bodies
-            .iter()
-            .map(|b| b.pos[1] as f32 + b.radius)
-            .fold(0.0f32, f32::max);
-        let params = Params {
-            hi: [4.2, top + 0.5, 4.2],
-            ..Params::default()
-        };
-        let g = GpuSim::new(bodies, &shaders, params);
-        g.name.clone()
-    });
-    let Ok(device) = probe else {
-        eprintln!("пропуск: Vulkan-устройство недоступно");
-        return;
-    };
-    eprintln!("устройство: {device}");
-
     let n = 1000;
     let frames = 360;
-    let gpu = run_gpu(n, frames, 12, &shaders);
+    let gpu = run(scene_pile(n), frames, 12, &shaders);
 
     let mut cpu = pile_demo(n);
     for _ in 0..frames {
         cpu.step(1.0 / 60.0);
     }
-    let cpu_top = cpu
-        .bodies
-        .iter()
-        .map(|b| b.pos[1] + b.radius as f64)
-        .fold(0.0f64, f64::max);
-    let mut cpu_hs: Vec<f64> = cpu.bodies.iter().map(|b| b.pos[1] + b.radius as f64).collect();
+    let mut cpu_hs: Vec<f64> = cpu.bodies.iter().map(|b| b.pos[1] + b.half[1]).collect();
     cpu_hs.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let cpu_p99 = cpu_hs[(cpu_hs.len() * 99 / 100).min(cpu_hs.len() - 1)];
-    let cpu_awake = cpu.awake;
     let cpu_pen = cpu.max_penetration();
+    let cpu_awake = cpu.awake;
 
     eprintln!(
-        "GPU: p99={:.3} pen={:.4} v={:.3} asleep={} центр=({:.2},{:.2}) | CPU: p99={:.3} pen={:.4} awake={}",
-        gpu.p99, gpu.pen, gpu.vmax, gpu.asleep, gpu.center[0], gpu.center[1], cpu_p99, cpu_pen, cpu_awake
+        "D3: GPU p99={:.3} pen={:.4} v={:.3} asleep={} центр=({:.2},{:.2}) | CPU p99={cpu_p99:.3} pen={cpu_pen:.4} awake={cpu_awake}",
+        gpu.p99, gpu.pen, gpu.vmax, gpu.asleep, gpu.center[0], gpu.center[1]
     );
 
-    /* Проверка на «храповик»: раньше фиксированный порядок обхода контактов
-     * сносил всю кучу к одной стенке, и это было видно только глазами.
-     * Ящик 4.25 м, центр должен быть около 2.1 по обеим осям. */
     for (axis, c) in [("x", gpu.center[0]), ("z", gpu.center[1])] {
         assert!(
             (c - 2.12).abs() < 0.45,
@@ -181,10 +235,14 @@ fn gpu_pile_matches_cpu_reference() {
             c
         );
     }
-    assert_eq!(gpu.out_of_box, 0, "GPU: {} тел вылетели из ящика", gpu.out_of_box);
+    assert_eq!(
+        gpu.out_of_box, 0,
+        "GPU: {} тел вылетели из ящика",
+        gpu.out_of_box
+    );
     assert!(
-        gpu.asleep * 100 / n >= 90,
-        "GPU: уснуло только {} из {} тел",
+        gpu.asleep * 100 / n >= 95,
+        "GPU: уснуло только {} из {}",
         gpu.asleep,
         n
     );
@@ -193,25 +251,47 @@ fn gpu_pile_matches_cpu_reference() {
         "GPU: проникновение {:.4} м — контакты не держат",
         gpu.pen
     );
+    assert!(gpu.vmax < 0.05, "GPU: остаточная скорость {:.3} м/с", gpu.vmax);
     assert!(
-        gpu.vmax < 0.30,
-        "GPU: остаточная скорость {:.3} м/с — куча не успокоилась",
-        gpu.vmax
+        (gpu.p99 as f64 - cpu_p99).abs() / cpu_p99 < 0.35,
+        "толщина кучи разошлась с эталоном: GPU p99 {:.3} против CPU p99 {cpu_p99:.3}",
+        gpu.p99
     );
-    /* Высоты сравниваем не «в лоб»: у CPU-солвера накопленные импульсы
-     * (warm start) дают более жёсткий контакт, и куча растекается сильнее.
-     * Проверяем, что обе кучи в физически осмысленном диапазоне: не
-     * «пыль» на полу и не столб. */
-    assert!(
-        (gpu.p99 as f64 - cpu_p99).abs() / cpu_p99 < 0.5,
-        "толщина кучи разошлась с эталоном: GPU p99 {:.3} против CPU p99 {:.3}",
-        gpu.p99,
-        cpu_p99
+}
+
+/// Тот же D3, но на масштабе, где GPU раньше не сходился: 5000 тел.
+#[test]
+fn gpu_pile_of_5000_settles() {
+    let Some((shaders, _)) = setup() else {
+        eprintln!("пропуск: нет SPIR-V или Vulkan-устройства");
+        return;
+    };
+    let n = 5000;
+    let gpu = run(scene_pile(n), 300, 12, &shaders);
+
+    let mut cpu = pile_demo(n);
+    for _ in 0..300 {
+        cpu.step(1.0 / 60.0);
+    }
+    let mut cpu_hs: Vec<f64> = cpu.bodies.iter().map(|b| b.pos[1] + b.half[1]).collect();
+    cpu_hs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let cpu_p99 = cpu_hs[(cpu_hs.len() * 99 / 100).min(cpu_hs.len() - 1)];
+
+    eprintln!(
+        "D3-5000: GPU p99={:.3} pen={:.4} v={:.4} asleep={} | CPU p99={cpu_p99:.3}",
+        gpu.p99, gpu.pen, gpu.vmax, gpu.asleep
     );
+    assert_eq!(
+        gpu.out_of_box, 0,
+        "GPU: {} тел вылетели из ящика",
+        gpu.out_of_box
+    );
+    assert_eq!(gpu.asleep, n, "GPU: уснуло {} из {n}", gpu.asleep);
+    assert!(gpu.vmax < 0.01, "GPU: остаточная скорость {:.4} м/с", gpu.vmax);
+    assert!(gpu.pen < 0.01, "GPU: проникновение {:.4} м > 1 см", gpu.pen);
     assert!(
-        gpu.top > 0.35 && gpu.top < 2.4,
-        "высота кучи на GPU неправдоподобна: {:.3} м (CPU {:.3})",
-        gpu.top,
-        cpu_top
+        (gpu.p99 as f64 - cpu_p99).abs() / cpu_p99 < 0.25,
+        "толщина кучи на 5000 тел: GPU {:.3} против CPU {cpu_p99:.3}",
+        gpu.p99
     );
 }
