@@ -4,6 +4,13 @@ use voxelforge_world::live::{Kind, Live};
 use voxelforge_world::sim::find_shaders;
 
 fn world() -> Option<Live> {
+    // без Vulkan-драйвера (например, в голом CI) проверять нечего
+    if std::env::var("VK_ICD_FILENAMES").map(|v| v.is_empty()).unwrap_or(true)
+        && !std::path::Path::new("/dev/dri").exists()
+    {
+        eprintln!("нет Vulkan-драйвера — проверка живого мира пропущена");
+        return None;
+    }
     let sh = match find_shaders(None) {
         Some(p) => p,
         None => {

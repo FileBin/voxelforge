@@ -168,6 +168,7 @@
           # тестам раскола нужны SPIR-V: без них проверка пропускается
           preCheck = ''
             export VF_SHADERS=${self.packages.${system}.spirv}
+            export VK_ICD_FILENAMES="$(ls ${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.*.json | head -n1)"
           '';
         });
 
