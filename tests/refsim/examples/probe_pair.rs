@@ -15,6 +15,29 @@ fn main() {
     let walls = ([-8.0f32, 0.0, -8.0], [8.0f32, 10.0, 8.0]);
     let pairs = collide::build_pairs(&local, &pos, walls, 0.15);
     println!("пар {}", pairs.len());
+    // сверка пула: то, что лежит на устройстве, против локальных тетов CPU
+    w.gpu.upload_geometry(&local);
+    let back = w.gpu.read_geometry(w.bodies.len());
+    let mut flat_cpu: Vec<[[f32; 3]; 4]> = Vec::new();
+    for b in &local { flat_cpu.extend(b.iter().cloned()); }
+    let mut worst = 0.0f32;
+    let mut bad_at = 0usize;
+    for (k, t) in flat_cpu.iter().enumerate() {
+        if k >= back.len() { break; }
+        for v in 0..4 {
+            for a in 0..3 {
+                let d = (back[k][v][a] - t[v][a]).abs();
+                if d > worst { worst = d; bad_at = k; }
+            }
+        }
+    }
+    println!("пул: тетов CPU {} против {} с устройства, худшее расхождение {:.5} (тет {})", flat_cpu.len(), back.len(), worst, bad_at);
+    let gb = w.gpu.read_bodies();
+    for b in 0..w.bodies.len() {
+        println!("тело {b}: CPU pos y={:.3} quat=[{:.3},{:.3},{:.3},{:.3}] | GPU pos y={:.3} quat=[{:.3},{:.3},{:.3},{:.3}]",
+            w.bodies[b].pos[1], w.bodies[b].quat[0], w.bodies[b].quat[1], w.bodies[b].quat[2], w.bodies[b].quat[3],
+            gb[b].pos_r[1], gb[b].quat[0], gb[b].quat[1], gb[b].quat[2], gb[b].quat[3]);
+    }
     w.gpu.upload_geometry(&local);
 
     let mut shown = 0;
