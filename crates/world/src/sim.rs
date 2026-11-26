@@ -223,6 +223,8 @@ pub struct GpuSim {
     pub dims: [i32; 3],
     pub ncells: i32,
     pub params: Params,
+    pub bytes_up: u64,
+    pub bytes_down: u64,
     bodies: [*mut c_void; 2],
     list: *mut c_void,
     imp: *mut c_void,
@@ -339,6 +341,8 @@ impl GpuSim {
             dims,
             ncells,
             params,
+            bytes_up: 0,
+            bytes_down: 0,
             bodies: [bodies_a, bodies_b],
             list,
             imp,
@@ -546,6 +550,7 @@ impl GpuSim {
     /// прогона (импульс раскола при ударе). Пишем в `bodies[0]` — кадр всегда
     /// начинается с него, а чётное число итераций солвера возвращает данные туда же.
     pub fn write_bodies(&mut self, bodies: &[GpuBody]) {
+        self.bytes_up += (bodies.len() * BODY_BYTES) as u64;
         assert_eq!(bodies.len(), self.n, "число тел изменилось посреди прогона");
         unsafe {
             check_status(
@@ -562,6 +567,7 @@ impl GpuSim {
     }
 
     pub fn read_bodies(&mut self) -> Vec<GpuBody> {
+        self.bytes_down += (self.n * BODY_BYTES) as u64;
         let mut out = vec![GpuBody::default(); self.n];
         unsafe {
             check_status(
