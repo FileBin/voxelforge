@@ -134,6 +134,9 @@ pub struct Live {
     pub gpu_collide: bool,
     /// Геометрия изменилась (спавн/раскол/сброс) — нужно перезалить пул.
     geom_dirty: bool,
+    /// Раскол включён. В отладке столкновений его выключают: иначе не видно,
+    /// останавливает ли контакт снаряд вообще, или он проходит насквозь.
+    pub fracture_enabled: bool,
     /// Сон включён. Выключается флагом --no-sleep для отладки: если тела
     /// никогда не засыпают, сразу видно, кто не может разъехаться.
     pub sleep_enabled: bool,
@@ -211,6 +214,7 @@ impl Live {
             bullets: std::collections::VecDeque::new(),
             gpu_collide: std::env::var("VF_COLLIDE").map(|v| v == "gpu").unwrap_or(false),
             geom_dirty: true,
+            fracture_enabled: true,
             sleep_enabled: true,
             bodies: vec![body],
             gpu,
@@ -356,7 +360,9 @@ impl Live {
         // на CPU, поэтому читаем их один раз за такт (73 КБ при 64 телах).
         let contacts = self.gpu.read_contacts();
         self.wake_on_contact(&contacts);
-        self.fracture(&contacts);
+        if self.fracture_enabled {
+            self.fracture(&contacts);
+        }
         let snap = self.gpu.read_bodies();
         for i in 0..self.bodies.len() {
             if !self.bodies[i].alive {
@@ -417,6 +423,11 @@ impl Live {
         if woke {
             self.gpu.write_bodies(&self.mirror);
         }
+    }
+
+    /// Включить или выключить раскол.
+    pub fn set_fracture(&mut self, on: bool) {
+        self.fracture_enabled = on;
     }
 
     /// Включить или выключить сон тел.
