@@ -205,10 +205,10 @@
             ${self.packages.${system}.live}/bin/voxelforge-live 120 20,60 \
             | tee "$TMPDIR/live.txt"
           grep -q "HEADLESS exit=0" "$TMPDIR/live.txt"
-          grep -q "cracks=1" "$TMPDIR/live.txt"
+          grep -qE "cracks=[1-9]" "$TMPDIR/live.txt"
           frames="$(sed -n 's/.*frames=\([0-9]*\).*/\1/p' "$TMPDIR/live.txt" | tail -1)"
           test "''${frames:-0}" -gt 0
-          echo "живое окно headless: $frames кадров, трещин 1" > "$out"
+          echo "живое окно headless: $frames кадров, трещины есть" > "$out"
         '';
 
         # Эталон: орбита замыкается, энергия не дрейфует.

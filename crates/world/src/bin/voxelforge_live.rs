@@ -211,12 +211,12 @@ fn main() {
 
     let mut world = Live::new(&shaders);
     let mut cam = Fly {
-        pos: [3.6, 2.8, 4.6],
+        pos: [3.0, 2.0, 3.6],
         yaw: 0.0,
         pitch: 0.0,
         speed: 4.0,
     };
-    cam.look_at([0.0, 1.2, 0.0]);
+    cam.look_at(world.bodies[0].pos.map(|v| v as f32));
     let mut near = 0.05f32;
     let mut far = 60.0f32;
     let mut uploaded: Vec<(usize, i32)> = Vec::new();
@@ -294,6 +294,7 @@ fn main() {
         if input.key_r != 0 {
             world.reset();
             uploaded.clear();
+            cam.look_at(world.bodies[0].pos.map(|v| v as f32));
             println!("сброс: снова один цельный объект");
         }
 
@@ -315,6 +316,13 @@ fn main() {
 
         // физика
         world.step(1.0 / 60.0, 4, 10);
+        if std::env::var("VF_DEBUG").is_ok() && frame_no < 40 && frame_no % 4 == 0 {
+            for (i, b) in world.bodies.iter().enumerate() {
+                if b.alive && i > 0 {
+                    println!("  кадр {frame_no}: тело {i} {:?} v={:?}", b.pos.map(|v| (v * 100.0).round() / 100.0), b.vel.map(|v| (v * 10.0).round() / 10.0));
+                }
+            }
+        }
 
         // новые формы (появились осколки) — залить в окно
         for i in 0..world.bodies.len() {
@@ -392,12 +400,11 @@ fn main() {
                 let tint = match b.kind {
                     voxelforge_world::live::Kind::Bullet => [0.95, 0.62, 0.28, 1.0],
                     voxelforge_world::live::Kind::Target => [0.74, 0.70, 0.62, 1.0],
-                    _ => [
-                        0.62 + 0.10 * ((i % 5) as f32),
-                        0.60 + 0.06 * ((i % 3) as f32),
-                        0.54,
-                        1.0,
-                    ],
+                    _ => {
+                        // камень: светлые и тёмные осколки, без кислотных оттенков
+                        let k = 0.56 + 0.05 * ((i % 4) as f32);
+                        [k + 0.06, k + 0.035, k, 1.0]
+                    }
                 };
                 vf_view_draw(view, b.mesh, m.as_ptr(), tint.as_ptr());
                 if world.lines_on && b.lines >= 0 {

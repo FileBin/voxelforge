@@ -122,7 +122,12 @@ pub struct Live {
 
 impl Live {
     pub fn new(shader_dir: &std::path::Path) -> Live {
-        let plate = TetBody::cube([0.0, 1.2, 0.0], 4, 0);
+        // Плита сразу лежит на полу: центр на высоте полуразмера, иначе она
+        // падает с 1.2 м и к первому выстрелу оказывается не там, куда целятся.
+        let plate0 = TetBody::cube([0.0, 0.0, 0.0], 4, 0);
+        let (lo0, hi0) = plate0.bounds();
+        let rest_y = 0.5 * (hi0[1] - lo0[1]) + 0.001;
+        let plate = TetBody::cube([0.0, rest_y, 0.0], 4, 0);
         let params = Params {
             lo: [-8.0, 0.0, -8.0],
             hi: [8.0, 10.0, 8.0],
@@ -133,7 +138,7 @@ impl Live {
         };
 
         let mut body = LiveBody {
-            pos: [0.0, 1.2, 0.0],
+            pos: [0.0, rest_y as f64, 0.0],
             quat: [1.0, 0.0, 0.0, 0.0],
             vel: [0.0; 3],
             mass: DENSITY * plate.volume(),
@@ -231,6 +236,57 @@ impl Live {
         );
         for i in self.bodies.len()..MAX_BODIES {
             contacts[i].clear();
+        }
+
+        // Позиционная развязка: солвер работает со скоростями, и тяжёлая
+        // плита иначе проседает в пол. Расталкиваем по нормали контакта
+        // пропорционально обратным массам.
+        let mut delta: Vec<[f32; 3]> = vec![[0.0; 3]; self.mirror.len()];
+        let inert = self.mirror.clone();
+        for i in 0..self.bodies.len() {
+            if !self.bodies[i].alive {
+                continue;
+            }
+            for c in &contacts[i] {
+                if c.pen < 0.004 {
+                    continue;
+                }
+                let k = 0.8 * c.pen;
+                if c.other < 0 {
+                    for a in 0..3 {
+                        delta[i][a] += c.n[a] * k;
+                    }
+                } else if (c.other as usize) < self.bodies.len() {
+                    let j = c.other as usize;
+                    if !self.bodies[j].alive {
+                        continue;
+                    }
+                    let (mi, mj) = (inert[i].vel_m[3], inert[j].vel_m[3]);
+                    if mi <= 0.0 || mj <= 0.0 {
+                        continue;
+                    }
+                    let (wi, wj) = (mi, mj); // vel_m[3] — обратная масса
+                    let share = wi / (wi + wj);
+                    for a in 0..3 {
+                        // нормаль смотрит от тела к партнёру → отталкиваем назад
+                        delta[i][a] -= c.n[a] * k * share;
+                        delta[j][a] += c.n[a] * k * share;
+                    }
+                }
+            }
+        }
+        let mut moved = false;
+        for i in 0..self.bodies.len() {
+            if delta[i] == [0.0, 0.0, 0.0] {
+                continue;
+            }
+            self.mirror[i].pos_r[0] += delta[i][0];
+            self.mirror[i].pos_r[1] += delta[i][1];
+            self.mirror[i].pos_r[2] += delta[i][2];
+            moved = true;
+        }
+        if moved {
+            self.gpu.write_bodies(&self.mirror);
         }
 
         self.fracture(&contacts);
