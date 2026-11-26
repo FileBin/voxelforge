@@ -413,21 +413,8 @@ impl GpuSim {
         let mut lc = vec![0u32; self.n];
         let mut list = vec![0u8; self.n * cap * 48];
         for (i, cs) in contacts.iter().enumerate().take(self.n) {
-            /* В плотной куче у тела сотни пересечений, а мест 24. Берём САМЫЕ
-             * ГЛУБОКИЕ, а не первые попавшиеся: иначе разъезжаются случайные
-             * пары, а самые застрявшие места кучу и держат. */
-            let mut idx: Vec<usize> = (0..cs.len()).collect();
-            if cs.len() > cap {
-                idx.sort_unstable_by(|&a, &b| {
-                    cs[b]
-                        .pen
-                        .partial_cmp(&cs[a].pen)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-            }
             lc[i] = cs.len().min(cap) as u32;
-            for (k, &sidx) in idx.iter().take(cap).enumerate() {
-                let c = &cs[sidx];
+            for (k, c) in cs.iter().take(cap).enumerate() {
                 let off = (i * cap + k) * 48;
                 list[off..off + 4].copy_from_slice(&c.other.to_le_bytes());
                 list[off + 4..off + 8].copy_from_slice(&0i32.to_le_bytes());

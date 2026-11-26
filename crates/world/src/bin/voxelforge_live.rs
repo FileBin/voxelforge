@@ -458,7 +458,7 @@ impl Sim {
         match self {
             Sim::Direct(l) => {
                 if scripted {
-                    l.step(tick, 6, 10);
+                    l.step(tick, 10, 18);
                 }
                 let prev: Vec<([f64; 3], [f64; 4])> = l.bodies.iter().map(|b| (b.pos, b.quat)).collect();
                 let mut pending = Vec::new();
