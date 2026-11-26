@@ -315,6 +315,10 @@ impl Live {
     /// глубину контакта в кадр и давал дрожание, будто коллайдер шире меша.
     fn depenetrate(&mut self, contacts: &[Vec<collide::Contact>]) {
         let mut delta: Vec<[f32; 3]> = vec![[0.0; 3]; self.mirror.len()];
+        // Сколько точек контакта двигают тело. Без этого деления четыре точки
+        // пола поднимали тело в 4 раза сильнее нужного: куб отрывался вверх,
+        // падал и снова отрывался — «не может успокоиться».
+        let mut cnt: Vec<u32> = vec![0; self.mirror.len()];
         let mut any = false;
         for i in 0..self.bodies.len() {
             if !self.bodies[i].alive {
@@ -329,6 +333,7 @@ impl Live {
                     for a in 0..3 {
                         delta[i][a] += c.n[a] * k;
                     }
+                    cnt[i] += 1;
                     any = true;
                 } else if (c.other as usize) < self.bodies.len() {
                     let j = c.other as usize;
@@ -344,6 +349,8 @@ impl Live {
                         delta[i][a] -= c.n[a] * k * share;
                         delta[j][a] += c.n[a] * k * share;
                     }
+                    cnt[i] += 1;
+                    cnt[j] += 1;
                     any = true;
                 }
             }
@@ -355,12 +362,13 @@ impl Live {
             if delta[i] == [0.0; 3] {
                 continue;
             }
+            let n = cnt[i].max(1) as f32;
             for a in 0..3 {
-                self.mirror[i].pos_r[a] += delta[i][a];
+                self.mirror[i].pos_r[a] += delta[i][a] / n;
                 // Якорь сна сдвигаем вместе с телом: иначе GPU видит «прыжок»
                 // каждый кадр, таймер покоя сбрасывается и осколки дрожат
                 // вечно вместо того, чтобы уснуть.
-                self.mirror[i].anchor[a] += delta[i][a];
+                self.mirror[i].anchor[a] += delta[i][a] / n;
             }
         }
         self.gpu.write_bodies(&self.mirror);
