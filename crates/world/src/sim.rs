@@ -154,6 +154,7 @@ pub const MAX_POOL_TETS: usize = 64 * 768;
 const P_SOLVE_CONTACTS: usize = 10;
 const P_SOLVE_APPLY: usize = 11;
 const P_SAT: usize = 12;
+const P_DEP: usize = 13;
 /// Потолок пар тетраэдров за такт.
 pub const MAX_PAIRS: usize = 262144;
 
@@ -315,7 +316,7 @@ impl GpuSim {
             )
         };
 
-        let names: [(&str, u32); 13] = [
+        let names: [(&str, u32); 14] = [
             ("integrate", 1),
             ("clear", 2),
             ("count", 2),
@@ -329,6 +330,7 @@ impl GpuSim {
             ("solve_contacts", 4),
             ("solve_apply", 4),
             ("sat", 6),
+            ("depenetrate", 3),
         ];
         let mut pipes = Vec::new();
         for (nm, nb) in names.iter() {
@@ -478,6 +480,14 @@ impl GpuSim {
                 bufs: vec![a, self.tets, self.span, self.pairs, self.list, self.lcount],
                 push,
                 groups: [g_pairs.max(1), 1, 1],
+            });
+            // позиционная развязка на устройстве: без неё глубокие
+            // перекрытия не вынимаются и тела проходят друг сквозь друга
+            steps.push(Step {
+                pipe: P_DEP,
+                bufs: vec![a, self.list, self.lcount],
+                push,
+                groups: [g_body, 1, 1],
             });
             for it in 0..iterations {
                 let (src, dst) = if it % 2 == 0 { (a, b) } else { (b, a) };

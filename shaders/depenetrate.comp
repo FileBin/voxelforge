@@ -1,0 +1,64 @@
+#version 450
+#include "common.glsl"
+
+/* Позиционная развязка на GPU: порт CPU-шного depenetrate.
+ *
+ * Без этого прохода GPU-путь не может раздвигать тела — остаётся только
+ * bias в солвере, которого хватает на миллиметры, а не на сантиметры, и
+ * тела проходят друг сквозь друга «с небольшим влиянием».
+ *
+ * Один вызов на тело: читает свои контакты, копит сдвиг, применяет. Делим на
+ * число контактов — контакты считаются независимо, и сумма иначе перебирает
+ * коррекцию (тело подбрасывает). Шаг на контакт ограничен.
+ */
+
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) buffer Bodies { Body b[]; };
+layout(std430, set = 0, binding = 1) buffer Lists { C list[]; };
+layout(std430, set = 0, binding = 2) buffer ListCount { uint lc[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.grid.w)) return;
+
+    Body me = b[i];
+    if (me.misc.y > 0.5) return; /* спящее тело не двигаем */
+
+    uint n = lc[i];
+    if (n > uint(CAP)) n = uint(CAP);
+    if (n == 0u) return;
+
+    vec3 delta = vec3(0.0);
+    uint used = 0u;
+    for (uint k = 0u; k < n; k++) {
+        C c = list[i * uint(CAP) + k];
+        float pen = c.n_pen.w;
+        if (pen < 0.006) continue;          /* как на CPU: мелочь не трогаем */
+        float step = min(0.6 * pen, 0.015); /* шаг на контакт */
+        int j = c.meta.x;
+        vec3 nrm = c.n_pen.xyz;
+        if (j < 0) {
+            delta += nrm * step;           /* пол и стенки: толкаем только себя */
+        } else {
+            Body o = b[j];
+            float wi = me.vel_m.w;
+            float wj = o.vel_m.w;
+            if (wi <= 0.0 || wj <= 0.0) continue;
+            float share = wi / (wi + wj);
+            delta -= nrm * step * share;   /* нормаль пары смотрит ОТ нас */
+        }
+        used++;
+    }
+    if (used == 0u) return;
+
+    delta /= float(used);
+    /* Суммарный сдвиг ограничен, чтобы пара не обменялась сторонами. */
+    float len = length(delta);
+    if (len > 0.02) delta *= 0.02 / len;
+
+    me.pos_r = vec4(me.pos_r.xyz + delta, me.pos_r.w);
+    /* Якорь сна двигаем вместе с телом: иначе GPU видит «прыжок» каждый кадр
+     * и таймер покоя никогда не срабатывает. */
+    me.anchor = vec4(me.anchor.xyz + delta, me.anchor.w);
+    b[i] = me;
+}
