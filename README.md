@@ -7,8 +7,12 @@
 ```
 nix run .#world     # снаряд влетает в плиту: она раскалывается, ячейки дробятся
 nix run .#viewer    # http://localhost:8080/viewer/index.html, перетащить .vfw
+python3 tools/preview.py demos/out/world.vfw --frames 0,12,299 --out demos/out
 cargo test --locked # тесты: решётка, раскол, дробление, физика, сверка CPU/GPU
 ```
+
+`tools/preview.py` рисует кадры (и mp4 через ffmpeg) без браузера — тем же
+`.vfw`, что читает вьюер, так что результат можно смотреть и в CI.
 
 ## Что происходит в мире
 
