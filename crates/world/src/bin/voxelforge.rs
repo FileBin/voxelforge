@@ -201,47 +201,27 @@ fn main() {
                     bodies_now[i].vel_m[k] += d[k] / len * boost;
                     p_lost[k] += m * (d[k] / len) as f64 * boost as f64;
                 }
-            }
-            // Сон и обратная масса обязаны быть согласованы с новой скоростью:
-            // спящее тело с ненулевой скоростью ломает солвер (inv_mass 0 при
-            // движении). Будим и возвращаем обратную массу из сохранённой.
-            for i in 0..n_shards {
+                // Сон и обратная масса обязаны быть согласованы с новой
+                // скоростью: спящее тело с ненулевой скоростью ломает солвер.
                 bodies_now[i].misc[1] = 0.0;
                 bodies_now[i].vel_m[3] = bodies_now[i].misc[2];
                 bodies_now[i].ang_i[3] = bodies_now[i].misc[3];
                 bodies_now[i].misc[0] = 0.0;
-                bodies_now[i].anchor = [bodies_now[i].pos_r[0], bodies_now[i].pos_r[1], bodies_now[i].pos_r[2], 0.0];
             }
             let m_ball = cpu[n_shards].mass;
             for k in 0..3 {
                 bodies_now[n_shards].vel_m[k] -= (p_lost[k] / m_ball) as f32;
             }
-            if std::env::var("VF_IDENTITY").is_ok() {
-                let before = gpu.read_bodies();
-                gpu.write_bodies(&before);      // проверка: запись без изменений
-                let after = gpu.read_bodies();
-                let vmax = |v: &[GpuBody]| v.iter().map(|b| (b.vel_m[0].powi(2)+b.vel_m[1].powi(2)+b.vel_m[2].powi(2)).sqrt()).fold(0.0f32, f32::max);
-                println!("  до записи vmax {:.2}, после записи vmax {:.2}", vmax(&before), vmax(&after));
-            } else {
-                gpu.write_bodies(&bodies_now);
-                let back = gpu.read_bodies();
-                let vmax = |v: &[GpuBody]| v.iter().map(|b| (b.vel_m[0].powi(2)+b.vel_m[1].powi(2)+b.vel_m[2].powi(2)).sqrt()).fold(0.0f32, f32::max);
-                println!("  после записи: vmax {:.2} (ожидалось ~5)", vmax(&back));
-                for i in [0usize, 1] {
-                    println!("  тело {i} до:  pos_r {:?} vel_m {:?} misc {:?}", bodies_now[i].pos_r, bodies_now[i].vel_m, bodies_now[i].misc);
-                    println!("  тело {i} после: pos_r {:?} vel_m {:?} misc {:?}", back[i].pos_r, back[i].vel_m, back[i].misc);
-                }
-            }
+            gpu.write_bodies(&bodies_now);
             if !args.quiet {
-                println!("кадр {f}: удар — импульс раскола {:.1} кг·м/с", {
-                    let mut t = 0.0;
-                    for k in 0..3 { t += p_lost[k] * p_lost[k]; }
-                    t.sqrt()
-                });
+                let mut t = 0.0;
+                for k in 0..3 {
+                    t += p_lost[k] * p_lost[k];
+                }
+                println!("кадр {f}: удар — импульс раскола {:.1} кг·м/с", t.sqrt());
             }
         }
 
-        // Дробление: осколок в движении дробит свои ячейки, пока не упрётся в предел.
         global_cd = global_cd.saturating_sub(1);
         for i in 0..n_shards {
             cooldown[i] = cooldown[i].saturating_sub(1);
