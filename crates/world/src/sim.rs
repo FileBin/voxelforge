@@ -153,6 +153,9 @@ const P_POS: usize = 9;
 pub const MAX_POOL_TETS: usize = 64 * 768;
 const P_SOLVE_CONTACTS: usize = 10;
 const P_SOLVE_APPLY: usize = 11;
+const P_SAT: usize = 12;
+/// Потолок пар тетраэдров за такт.
+pub const MAX_PAIRS: usize = 262144;
 
 const CAP: usize = 24;
 /// Body = 5 × vec4.
@@ -236,6 +239,9 @@ pub struct GpuSim {
     tets: *mut c_void,
     /// На тело: смещение в пуле и число тетраэдров.
     span: *mut c_void,
+    /// Пары тетраэдров, посчитанные CPU один раз на такт.
+    pairs: *mut c_void,
+    pub n_pairs: usize,
     lcount: *mut c_void,
     cellcnt: *mut c_void,
     starts: *mut c_void,
@@ -287,6 +293,7 @@ impl GpuSim {
         // Пул геометрии: 4 vec4 на тетраэдр (a, b, c, d).
         let tets = mk(MAX_POOL_TETS * 64, true);
         let span = mk(n * 8, true);
+        let pairs = mk(MAX_PAIRS * 8, true);
         let lcount = mk(n * 4, true);
         let cellcnt = mk(ncells as usize * 4, false);
         let starts = mk((ncells as usize + 1) * 4, false);
@@ -306,7 +313,7 @@ impl GpuSim {
             )
         };
 
-        let names: [(&str, u32); 12] = [
+        let names: [(&str, u32); 13] = [
             ("integrate", 1),
             ("clear", 2),
             ("count", 2),
@@ -319,6 +326,7 @@ impl GpuSim {
             ("integrate_pos", 1),
             ("solve_contacts", 4),
             ("solve_apply", 4),
+            ("sat", 6),
         ];
         let mut pipes = Vec::new();
         for (nm, nb) in names.iter() {
@@ -359,6 +367,8 @@ impl GpuSim {
             imp,
             tets,
             span,
+            pairs,
+            n_pairs: 0,
             lcount,
             cellcnt,
             starts,
@@ -637,6 +647,104 @@ impl GpuSim {
                 }
                 out.push(t);
                 k += 1;
+            }
+        }
+        out
+    }
+
+    /// Пары тетраэдров на такт: `(body<<20|tet, body<<20|tet)`. Добиваем до
+    /// кратности 64 пустыми — шейдер их отбросит.
+    pub fn set_pairs(&mut self, pairs: &[(u32, u32)]) {
+        let mut flat: Vec<[u32; 2]> = pairs.iter().map(|(a, b)| [*a, *b]).collect();
+        while flat.len() % 64 != 0 {
+            flat.push([0xFFFF_FFFF, 0xFFFF_FFFF]);
+        }
+        self.n_pairs = flat.len();
+        self.bytes_up += (flat.len() * 8) as u64;
+        unsafe {
+            check_status(
+                vf_buffer_write(self.ctx, self.pairs, 0, flat.as_ptr() as *const c_void, flat.len() * 8),
+                "set_pairs",
+            );
+        }
+    }
+
+    /// Прогнать только SAT-проход (для сверки с CPU).
+    pub fn run_sat(&mut self) {
+        let mut zero = vec![0u8; self.n * 4];
+        unsafe {
+            check_status(
+                vf_buffer_write(self.ctx, self.lcount, 0, zero.as_mut_ptr() as *const c_void, self.n * 4),
+                "zero_counts",
+            );
+        }
+        let push = self.push(1.0 / 60.0, 1);
+        let groups = ((self.n_pairs as u32 + 63) / 64).max(1);
+        let mut steps = vec![Step {
+            pipe: P_SAT,
+            bufs: vec![
+                self.bodies[0],
+                self.tets,
+                self.span,
+                self.pairs,
+                self.list,
+                self.lcount,
+            ],
+            push,
+            groups: [groups, 1, 1],
+        }];
+        let mut keep: Vec<Vec<*mut c_void>> = steps.iter().map(|s| s.bufs.clone()).collect();
+        let push_keep: Vec<Push> = steps.iter().map(|s| s.push).collect();
+        let mut ds: Vec<VfDispatch> = steps
+            .iter_mut()
+            .enumerate()
+            .map(|(k, s)| VfDispatch {
+                pipeline: self.pipes[s.pipe],
+                buffers: keep[k].as_mut_ptr(),
+                n_buffers: keep[k].len() as u32,
+                push: &push_keep[k] as *const Push as *const c_void,
+                push_bytes: std::mem::size_of::<Push>() as u32,
+                groups: s.groups,
+            })
+            .collect();
+        unsafe {
+            check_status(vf_run(self.ctx, ds.as_mut_ptr(), ds.len() as u32), "run_sat");
+        }
+    }
+
+    /// Обратное чтение списков контактов (для сверки).
+    pub fn read_contacts(&self) -> Vec<Vec<crate::collide::Contact>> {
+        let mut counts = vec![0u32; self.n];
+        unsafe {
+            check_status(
+                vf_buffer_read(self.ctx, self.lcount, 0, counts.as_mut_ptr() as *mut c_void, self.n * 4),
+                "read_counts",
+            );
+        }
+        let mut raw = vec![0u8; self.n * CAP * 48];
+        unsafe {
+            check_status(
+                vf_buffer_read(self.ctx, self.list, 0, raw.as_mut_ptr() as *mut c_void, raw.len()),
+                "read_list",
+            );
+        }
+        let mut out: Vec<Vec<crate::collide::Contact>> = vec![Vec::new(); self.n];
+        for b in 0..self.n {
+            for k in 0..(counts[b] as usize).min(CAP) {
+                let off = (b * CAP + k) * 48;
+                let other = i32::from_le_bytes(raw[off..off + 4].try_into().unwrap());
+                let n = [
+                    f32::from_le_bytes(raw[off + 16..off + 20].try_into().unwrap()),
+                    f32::from_le_bytes(raw[off + 20..off + 24].try_into().unwrap()),
+                    f32::from_le_bytes(raw[off + 24..off + 28].try_into().unwrap()),
+                ];
+                let pen = f32::from_le_bytes(raw[off + 28..off + 32].try_into().unwrap());
+                let p = [
+                    f32::from_le_bytes(raw[off + 32..off + 36].try_into().unwrap()),
+                    f32::from_le_bytes(raw[off + 36..off + 40].try_into().unwrap()),
+                    f32::from_le_bytes(raw[off + 40..off + 44].try_into().unwrap()),
+                ];
+                out[b].push(crate::collide::Contact { other, n, pen, p });
             }
         }
         out

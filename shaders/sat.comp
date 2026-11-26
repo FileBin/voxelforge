@@ -1,0 +1,155 @@
+#version 450
+#include "common.glsl"
+
+/* SAT по двум тетраэдрам — порт collide::tet_tet на GPU.
+ *
+ * Один вызов на пару тетраэдров. Пары приходят из CPU один раз на такт
+ * (по AABB, растянутым вдоль скорости), поэтому промежуточных копий в кадре
+ * нет: контакты пишутся прямо в GPU-списки тел, счётчики — атомарные.
+ *
+ * Оси: 8 нормалей граней плюс 36 попарных векторных произведений рёбер.
+ * Без рёберных осей SAT пропускает разделяющую ось и выдаёт фантомное
+ * проникновение — на CPU это ловили на осколках, стоящих рядом.
+ */
+
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) buffer BodiesIn { Body bin[]; };
+layout(std430, set = 0, binding = 1) buffer Pool { vec4 tets[]; };   /* 4 vec4 на тет */
+layout(std430, set = 0, binding = 2) buffer Span { uvec2 span[]; };
+layout(std430, set = 0, binding = 3) buffer Pairs { uvec2 pairs[]; };
+layout(std430, set = 0, binding = 4) buffer Lists { C list[]; };
+layout(std430, set = 0, binding = 5) buffer ListCount { uint lc[]; };
+
+const uint EMPTY = 0xFFFFFFFFu;
+const uint TET_MASK = 0xFFFFFu;
+
+vec3 qrot(vec4 q, vec3 v) {
+    vec3 t = 2.0 * cross(q.xyz, v);
+    return v + q.w * t + cross(q.xyz, t);
+}
+
+/* Четыре нормали граней тетраэдра. Знак не важен: SAT проецируется на ось
+ * и в плюс, и в минус, а направление итоговой оси задаётся отдельно — от
+ * центроида A к центроиду B. */
+void face_normals(vec3 t[4], out vec3 out_n[4]) {
+    out_n[0] = normalize(cross(t[1] - t[0], t[2] - t[0])); /* грань 0,1,2 */
+    out_n[1] = normalize(cross(t[2] - t[0], t[3] - t[0])); /* грань 0,2,3 */
+    out_n[2] = normalize(cross(t[3] - t[1], t[2] - t[1])); /* грань 1,2,3 */
+    out_n[3] = normalize(cross(t[1] - t[0], t[3] - t[0])); /* грань 0,1,3 */
+}
+
+void project(vec3 t[4], vec3 n, out float lo, out float hi) {
+    lo = dot(t[0], n);
+    hi = lo;
+    for (int k = 1; k < 4; k++) {
+        float d = dot(t[k], n);
+        lo = min(lo, d);
+        hi = max(hi, d);
+    }
+}
+
+void main() {
+    uint pid = gl_GlobalInvocationID.x;
+    uint nbody = uint(pc.grid.w);
+
+    uvec2 pr = pairs[pid];
+    if (pr.x == EMPTY || pr.y == EMPTY) return;
+
+    uint ba = pr.x >> 20, ta = pr.x & TET_MASK;
+    uint bb = pr.y >> 20, tb = pr.y & TET_MASK;
+    if (ba >= nbody || bb >= nbody || ba == bb) return;
+
+    Body A = bin[ba];
+    Body B = bin[bb];
+    if (A.misc.y > 0.5 && B.misc.y > 0.5) return; /* обе спят — нечего решать */
+
+    uint ia = span[ba].x + ta;
+    uint ib = span[bb].x + tb;
+    if (ta >= span[ba].y || tb >= span[bb].y) return;
+
+    vec3 a[4];
+    vec3 b[4];
+    for (int k = 0; k < 4; k++) {
+        a[k] = qrot(A.quat, tets[ia * 4u + uint(k)].xyz) + A.pos_r.xyz;
+        b[k] = qrot(B.quat, tets[ib * 4u + uint(k)].xyz) + B.pos_r.xyz;
+    }
+
+    /* быстрый отсев по AABB */
+    vec3 alo = a[0], ahi = a[0], blo = b[0], bhi = b[0];
+    for (int k = 1; k < 4; k++) {
+        alo = min(alo, a[k]);
+        ahi = max(ahi, a[k]);
+        blo = min(blo, b[k]);
+        bhi = max(bhi, b[k]);
+    }
+    if (any(greaterThan(alo, bhi)) || any(greaterThan(blo, ahi))) return;
+
+    vec3 axes[44];
+    int na = 0;
+    vec3 na4[4];
+    vec3 nb4[4];
+    face_normals(a, na4);
+    face_normals(b, nb4);
+    for (int k = 0; k < 4; k++) axes[na++] = na4[k];
+    for (int k = 0; k < 4; k++) axes[na++] = nb4[k];
+
+    const int EDGES[6 * 2] = int[12](0, 1, 0, 2, 0, 3, 1, 2, 1, 3, 2, 3);
+    for (int i = 0; i < 6; i++) {
+        vec3 ea = a[EDGES[i * 2 + 1]] - a[EDGES[i * 2]];
+        for (int j = 0; j < 6; j++) {
+            vec3 eb = b[EDGES[j * 2 + 1]] - b[EDGES[j * 2]];
+            vec3 c = cross(ea, eb);
+            float len2 = dot(c, c);
+            if (len2 > 1e-8) axes[na++] = c * inversesqrt(len2);
+        }
+    }
+
+    vec3 ca = 0.25 * (a[0] + a[1] + a[2] + a[3]);
+    vec3 cb = 0.25 * (b[0] + b[1] + b[2] + b[3]);
+
+    vec3 best_axis = vec3(0.0);
+    float best_overlap = 3.4e38;
+    for (int k = 0; k < na; k++) {
+        vec3 n = axes[k];
+        float al, ah, bl, bh;
+        project(a, n, al, ah);
+        project(b, n, bl, bh);
+        float overlap = min(ah, bh) - max(al, bl);
+        if (overlap <= 0.0) return;
+        if (overlap < best_overlap) {
+            best_overlap = overlap;
+            best_axis = (dot(cb - ca, n) < 0.0) ? -n : n;
+        }
+    }
+    if (best_overlap == 3.4e38) return;
+
+    /* точка контакта: середина между самыми глубокими вершинами вдоль оси */
+    vec3 n = best_axis;
+    vec3 va = a[0];
+    float best = dot(a[0], n);
+    for (int k = 1; k < 4; k++) {
+        float d = dot(a[k], n);
+        if (d > best) { best = d; va = a[k]; }
+    }
+    vec3 vb = b[0];
+    float worst = dot(b[0], n);
+    for (int k = 1; k < 4; k++) {
+        float d = dot(b[k], n);
+        if (d < worst) { worst = d; vb = b[k]; }
+    }
+    vec3 point = 0.5 * (va + vb);
+
+    C ca_c;
+    ca_c.meta = ivec4(int(bb), 0, 0, 0);
+    ca_c.n_pen = vec4(n, best_overlap);
+    ca_c.point = vec4(point, 1.0);
+    uint sa = atomicAdd(lc[ba], 1u);
+    if (sa < uint(CAP)) list[ba * uint(CAP) + sa] = ca_c;
+
+    C cb_c;
+    cb_c.meta = ivec4(int(ba), 0, 0, 0);
+    cb_c.n_pen = vec4(-n, best_overlap);
+    cb_c.point = vec4(point, 1.0);
+    uint sb = atomicAdd(lc[bb], 1u);
+    if (sb < uint(CAP)) list[bb * uint(CAP) + sb] = cb_c;
+}
