@@ -704,7 +704,15 @@ pub fn split_surfaces(origin: [f32; 3], tets: &[Tet], shard_of: &[usize], n_shar
             (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]),
         ];
         let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-12);
-        for (shard, opposite) in owners {
+        // Грань может встретиться у трёх тетраэдров (два в одном осколке и
+        // один в соседнем). Каждому осколку — РОВНО один треугольник, иначе
+        // в меше появляются дубликаты и рвётся водонепроницаемость.
+        let mut per_owner: std::collections::BTreeMap<usize, [f32; 3]> =
+            std::collections::BTreeMap::new();
+        for (shard, opposite) in &owners {
+            per_owner.entry(*shard).or_insert(*opposite);
+        }
+        for (shard, opposite) in per_owner {
             let to_out = [
                 (a[0] + b[0] + c[0]) / 3.0 - opposite[0],
                 (a[1] + b[1] + c[1]) / 3.0 - opposite[1],
