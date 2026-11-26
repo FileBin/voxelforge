@@ -11,7 +11,8 @@
 
 use std::path::PathBuf;
 
-use voxelforge_world::bcc::{Lcg, VoxelBody, BASE};
+use voxelforge_world::bcc::BASE;
+use voxelforge_world::tet::{split_surfaces, Lcg, TetBody};
 use voxelforge_world::sim::{find_shaders, GpuBody, GpuSim, Params};
 use voxelforge_world::types::Body;
 use voxelforge_world::vfw::{self, BodyFrame, Shape};
@@ -63,16 +64,40 @@ fn main() {
 
     // ---- мир ----------------------------------------------------------
     // Плита: 3 кубические ячейки по ребру = 0.84 м, ячейки уровня 0.
-    let plate = VoxelBody::cube([0.0, 1.0, 0.0], 3, 0);
+    let plate = TetBody::cube([0.0, 1.0, 0.0], 4, 0);
     let plate_vol = plate.volume() as f64;
 
     // Снаряд — воксельный шар, летит сбоку.
-    let ball = VoxelBody::ball([-3.0, 1.0, 0.0], 0.30, 1);
+    let ball = TetBody::ball([-3.0, 1.0, 0.0], 0.30, 1);
     let ball_vol = ball.volume() as f64;
 
     // Раскол плиты по Вороному: 9 затравок → неровные осколки.
-    let mut shards: Vec<VoxelBody> = plate.shatter(20, 0xC0FF_EE00_1234);
-    let mut shapes: Vec<Shape> = shards.iter().map(vfw::shape_of).collect();
+    let mut shards: Vec<TetBody> = plate.shatter(14, 0xC0FF_EE00_1234);
+    // Меши всех осколков считаются ОДНИМ проходом по общему списку тетраэдров:
+    // грани на стыке двух осколков попадают в оба меша, поэтому у каждого
+    // осколка поверхность замкнута.
+    fn rebuild(shards: &[TetBody], origin: [f32; 3]) -> Vec<Shape> {
+        let mut tets = Vec::new();
+        let mut owner = Vec::new();
+        for (i, s) in shards.iter().enumerate() {
+            tets.extend_from_slice(&s.tets);
+            owner.extend(std::iter::repeat(i).take(s.tets.len()));
+        }
+        let mut meshes = split_surfaces(origin, &tets, &owner, shards.len());
+        // Вершины локальные: кадр прибавит позицию тела, поэтому вычитаем
+        // центроид осколка — тот же, что уходит в физику.
+        for (k, m) in meshes.iter_mut().enumerate() {
+            let c = shards[k].centroid();
+            for p in m.positions.iter_mut() {
+                p[0] -= c[0];
+                p[1] -= c[1];
+                p[2] -= c[2];
+            }
+        }
+        meshes.into_iter().map(|m| Shape { level: m.level, mesh: m }).collect()
+    }
+
+    let mut shapes: Vec<Shape> = rebuild(&shards, plate.origin);
     let mut shape_id: Vec<u32> = (0..shards.len() as u32).collect();
     let ball_shape = shapes.len() as u32;
     shapes.push(vfw::shape_of(&ball));
@@ -81,7 +106,9 @@ fn main() {
     let mut bodies: Vec<GpuBody> = Vec::new();
     let mut cpu: Vec<Body> = Vec::new();
     for s in &shards {
-        let c = s.centroid();
+        // центроид тетраэдров локальный — возвращаем его в мир через origin
+        let c0 = s.centroid();
+        let c = [c0[0] + plate.origin[0], c0[1] + plate.origin[1], c0[2] + plate.origin[2]];
         let (lo, hi) = s.bounds();
         // Коллизионная коробка осколка чуть меньше его габарита: у осколка
         // рваные края, и по полному AABB соседние осколки «склеены» — они бы
@@ -129,13 +156,10 @@ fn main() {
     let mut gpu = GpuSim::new(bodies, &shaders, params);
 
     if !args.quiet {
-        let cells: usize = shards.iter().map(|s| s.cells.len()).sum();
+        let tets: usize = shards.iter().map(|s| s.tets.len()).sum();
+        println!("voxelforge · {} · шаг решётки {:.3} м", gpu.name, BASE);
         println!(
-            "voxelforge · {} · ячейка {:.3} м",
-            gpu.name, BASE
-        );
-        println!(
-            "мир: плита {:.3} м³ на {cells} ячеек, {} осколков, снаряд {:.3} м³",
+            "мир: плита {:.3} м³ на {tets} тетраэдров, {} осколков, снаряд {:.3} м³",
             plate_vol,
             shards.len(),
             ball_vol
@@ -147,6 +171,7 @@ fn main() {
     let n_shards = shards.len();
     let mut frames: Vec<Vec<BodyFrame>> = Vec::with_capacity(args.frames as usize);
     let mut cooldown = vec![0u32; n_shards];
+    let mut global_cd = 0u32;
     let mut subdiv_log: Vec<String> = Vec::new();
     let mut broke = false;
 
@@ -217,26 +242,42 @@ fn main() {
         }
 
         // Дробление: осколок в движении дробит свои ячейки, пока не упрётся в предел.
+        global_cd = global_cd.saturating_sub(1);
         for i in 0..n_shards {
             cooldown[i] = cooldown[i].saturating_sub(1);
             if cooldown[i] > 0 || snap[i].misc[1] > 0.5 {
                 continue;
             }
             let speed = (snap[i].vel_m[0].powi(2) + snap[i].vel_m[1].powi(2) + snap[i].vel_m[2].powi(2)).sqrt();
-            let lvl = shards[i].cells.iter().map(|c| c.level).max().unwrap_or(0);
-            if speed < 1.5 || lvl >= shards[i].level_cap {
+            if speed < 1.5 {
                 continue;
             }
-            if shards[i].subdivide() {
-                shapes.push(vfw::shape_of(&shards[i]));
-                shape_id[i] = (shapes.len() - 1) as u32;
-                cooldown[i] = 12;
+            // Детализация дробится у ВСЕХ осколков разом: если уточнить только
+            // один, на стыке с соседом получится T-стык и щель в поверхности.
+            let lvl = shards[0].tets[0].level;
+            if lvl >= shards[0].level_cap || global_cd > 0 {
+                continue;
+            }
+            let mut refined = false;
+            for s in shards.iter_mut() {
+                refined |= s.subdivide();
+            }
+            if refined {
+                let base_len = shapes.len();
+                let new_meshes = rebuild(&shards, plate.origin);
+                shapes.extend(new_meshes);
+                for (k, id) in shape_id.iter_mut().enumerate() {
+                    *id = (base_len + k) as u32;
+                }
+                global_cd = 14;
+                let step = BASE / (1u32 << shards[0].tets[0].level) as f32;
                 subdiv_log.push(format!(
-                    "кадр {f}: осколок {i} (v={speed:.1} м/с) → {} ячеек по {:.3} м",
-                    shards[i].cells.len(),
-                    shards[i].cells[0].edge()
+                    "кадр {f}: детализация → {} тетраэдров на осколок, шаг {:.3} м",
+                    shards[0].tets.len(),
+                    step
                 ));
             }
+            let _ = i;
         }
 
         if std::env::var("VF_DEBUG").is_ok() && f < 6 {
@@ -273,13 +314,13 @@ fn main() {
         frames.push(row);
     }
 
-    let total_cells: usize = shapes.iter().map(|s| s.offsets.len()).sum();
+    let total_tris: usize = shapes.iter().map(|s| s.mesh.triangles()).sum();
     if !args.quiet {
         println!(
-            "кадров {}, форм {}, ячеек в записи {}",
+            "кадров {}, форм {}, треугольников в мешах {}",
             frames.len(),
             shapes.len(),
-            total_cells
+            total_tris
         );
         for line in subdiv_log.iter().take(6) {
             println!("  {line}");

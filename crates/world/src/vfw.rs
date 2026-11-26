@@ -1,24 +1,22 @@
 //! Формат `.vfw` — мир воксельных тел по кадрам.
 //!
 //! ```text
-//! "VFW1"
-//! u32 frames | u32 shapes | u32 cells_total | f32 base
-//! shape:  u32 level | u32 n | n × (f32 x, y, z)   — смещения ячеек от центра тела
-//! frame:  u32 n_bodies | n_bodies × (u32 shape | f32 pos×3 | f32 quat×4)
+//! "VFW2"
+//! u32 frames | u32 shapes | u32 verts_total | f32 base
+//! shape:  u32 level | u32 nv | u32 ni | nv × (f32 x,y,z) | ni × u32
+//! frame:  u32 m | m × (u32 shape | f32 pos×3 | f32 quat×4)
 //! ```
 //!
-//! Таблица форм растёт по ходу записи: осколок, раздробившийся на кадре 40,
-//! получает новую форму, и кадры после него ссылаются уже на неё. Так видно
-//! ровно то, что происходит: крупные ячейки становятся мелкими.
+//! Меш формы считается марчингом по тетраэдрам BCC (см. `tet::mesh_body`) и
+//! хранится один раз; кадр задаёт только жёсткое движение. Когда осколок
+//! дробит ячейки, у него появляется новая форма с более подробным мешем —
+//! поэтому в кадре видно, как крупные воксели становятся мелкими.
 
-use crate::bcc::VoxelBody;
+use crate::tet::{Mesh, TetBody};
 
 pub struct Shape {
     pub level: u8,
-    /// Смещения ячеек относительно центра масс тела.
-    pub offsets: Vec<[f32; 3]>,
-    /// Полуразмеры — для отладки и камеры.
-    pub half: [f32; 3],
+    pub mesh: Mesh,
 }
 
 pub struct BodyFrame {
@@ -27,30 +25,23 @@ pub struct BodyFrame {
     pub quat: [f32; 4],
 }
 
-pub fn shape_of(body: &VoxelBody) -> Shape {
+pub fn shape_of(body: &TetBody) -> Shape {
+    let mut mesh = body.surface();
+    // Меш строится в мировых координатах (узлы решётки), а кадр задаёт
+    // позицию тела — значит вершины должны быть ЛОКАЛЬНЫМИ.
     let c = body.centroid();
-    let level = body.cells.iter().map(|x| x.level).max().unwrap_or(0);
-    let offsets = body
-        .cells
-        .iter()
-        .map(|x| [x.c[0] - c[0], x.c[1] - c[1], x.c[2] - c[2]])
-        .collect();
-    let (lo, hi) = body.bounds();
-    Shape {
-        level,
-        offsets,
-        half: [
-            0.5 * (hi[0] - lo[0]),
-            0.5 * (hi[1] - lo[1]),
-            0.5 * (hi[2] - lo[2]),
-        ],
+    for p in mesh.positions.iter_mut() {
+        p[0] -= c[0];
+        p[1] -= c[1];
+        p[2] -= c[2];
     }
+    Shape { level: mesh.level, mesh }
 }
 
 pub fn encode(frames: &[Vec<BodyFrame>], shapes: &[Shape]) -> Vec<u8> {
-    let total: usize = shapes.iter().map(|s| s.offsets.len()).sum();
+    let total: usize = shapes.iter().map(|s| s.mesh.positions.len()).sum();
     let mut out = Vec::new();
-    out.extend_from_slice(b"VFW1");
+    out.extend_from_slice(b"VFW2");
     out.extend_from_slice(&(frames.len() as u32).to_le_bytes());
     out.extend_from_slice(&(shapes.len() as u32).to_le_bytes());
     out.extend_from_slice(&(total as u32).to_le_bytes());
@@ -58,11 +49,15 @@ pub fn encode(frames: &[Vec<BodyFrame>], shapes: &[Shape]) -> Vec<u8> {
 
     for s in shapes {
         out.extend_from_slice(&(s.level as u32).to_le_bytes());
-        out.extend_from_slice(&(s.offsets.len() as u32).to_le_bytes());
-        for o in &s.offsets {
+        out.extend_from_slice(&(s.mesh.positions.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(s.mesh.indices.len() as u32).to_le_bytes());
+        for p in &s.mesh.positions {
             for k in 0..3 {
-                out.extend_from_slice(&o[k].to_le_bytes());
+                out.extend_from_slice(&p[k].to_le_bytes());
             }
+        }
+        for i in &s.mesh.indices {
+            out.extend_from_slice(&i.to_le_bytes());
         }
     }
 

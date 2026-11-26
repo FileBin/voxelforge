@@ -17,7 +17,7 @@ function magicOf(buf) {
 export function detectFormat(buf) {
   const m = magicOf(buf);
   if (m === "VFR1" || m === "VFR2") return "vfr";
-  if (m === "VFW1") return "vfw";
+  if (m === "VFW1" || m === "VFW2") return "vfw";
   return null;
 }
 
@@ -67,14 +67,14 @@ export function parseTrace(buf) {
   return { kind: "trace", n, nf, radius, shapes, half, pos, lo, hi };
 }
 
-/** Мир движка:
- *  `"VFW1" | u32 frames | u32 shapes | u32 cells | f32 base`
- *  `shape: u32 level | u32 n | n × (f32 x, y, z)`
+/** Мир движка (v2 — с мешами марчинга):
+ *  `"VFW2" | u32 frames | u32 shapes | u32 verts | f32 base`
+ *  `shape: u32 level | u32 nv | u32 ni | nv × (f32 x,y,z) | ni × u32`
  *  `frame: u32 m | m × (u32 shape | f32 pos×3 | f32 quat×4)` */
 export function parseWorld(buf) {
   const dv = new DataView(buf);
   const magic = magicOf(buf);
-  if (magic !== "VFW1") throw new Error("не VFW1: " + magic);
+  if (magic !== "VFW2") throw new Error("не VFW2: " + magic);
   const nf = dv.getUint32(4, true);
   const nShapes = dv.getUint32(8, true);
   const total = dv.getUint32(12, true);
@@ -84,14 +84,29 @@ export function parseWorld(buf) {
   const shapes = [];
   for (let s = 0; s < nShapes; s++) {
     const level = dv.getUint32(off, true);
-    const n = dv.getUint32(off + 4, true);
-    off += 8;
-    const offsets = new Float32Array(n * 3);
-    for (let i = 0; i < n * 3; i++) {
-      offsets[i] = dv.getFloat32(off, true);
+    const nv = dv.getUint32(off + 4, true);
+    const ni = dv.getUint32(off + 8, true);
+    off += 12;
+    const positions = new Float32Array(nv * 3);
+    for (let i = 0; i < nv * 3; i++) {
+      positions[i] = dv.getFloat32(off, true);
       off += 4;
     }
-    shapes.push({ level, n, offsets, edge: base / (1 << level) });
+    const indices = new Uint32Array(ni);
+    for (let i = 0; i < ni; i++) {
+      indices[i] = dv.getUint32(off, true);
+      off += 4;
+    }
+    // габарит формы — по вершинам меша
+    const blo = [Infinity, Infinity, Infinity];
+    const bhi = [-Infinity, -Infinity, -Infinity];
+    for (let i = 0; i < nv * 3; i += 3) {
+      for (let k = 0; k < 3; k++) {
+        blo[k] = Math.min(blo[k], positions[i + k]);
+        bhi[k] = Math.max(bhi[k], positions[i + k]);
+      }
+    }
+    shapes.push({ level, positions, indices, edge: base / (1 << level), blo, bhi });
   }
 
   const frames = [];
@@ -110,16 +125,18 @@ export function parseWorld(buf) {
         dv.getFloat32(off + 8, true),
       ];
       off += 12;
-      off += 16;                                // кватернион: тела пока не вращаются
-      row.push({ shape, pos });
+      const quat = [
+        dv.getFloat32(off, true),
+        dv.getFloat32(off + 4, true),
+        dv.getFloat32(off + 8, true),
+        dv.getFloat32(off + 12, true),
+      ];
+      off += 16;
+      row.push({ shape, pos, quat });
       const sh = shapes[shape];
-      const r = sh.edge * 0.5;
-      for (let c = 0; c < sh.n; c++) {
-        for (let k = 0; k < 3; k++) {
-          const v = pos[k] + sh.offsets[c * 3 + k];
-          lo[k] = Math.min(lo[k], v - r);
-          hi[k] = Math.max(hi[k], v + r);
-        }
+      for (let k = 0; k < 3; k++) {
+        lo[k] = Math.min(lo[k], pos[k] + sh.blo[k]);
+        hi[k] = Math.max(hi[k], pos[k] + sh.bhi[k]);
       }
     }
     frames.push(row);

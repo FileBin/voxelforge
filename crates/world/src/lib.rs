@@ -10,5 +10,6 @@
 
 pub mod bcc;
 pub mod sim;
+pub mod tet;
 pub mod types;
 pub mod vfw;
