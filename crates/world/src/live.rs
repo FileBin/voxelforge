@@ -205,6 +205,90 @@ impl Live {
         }
     }
 
+    /// Расталкивает только что созданные осколки ЧИСТО ПОЗИЦИОННО.
+    ///
+    /// Осколки делят объём родителя и поэтому рождаются впритык, а местами
+    /// перекрываясь. Солвер видит это как глубокое проникновение и выдаёт
+    /// импульсы — кучу разбрасывает ещё до того, как она успела упасть.
+    /// Здесь перекрытия снимаются сдвигом позиций (без скоростей), и только
+    /// на столько, чтобы тела перестали пересекаться.
+    fn settle_new_shards(&mut self, slots: &[usize]) {
+        if slots.len() < 2 {
+            return;
+        }
+        let mut boxes: Vec<[f64; 6]> = Vec::with_capacity(slots.len());
+        for &s in slots {
+            let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
+            for t in self.bodies[s].rotated_tets() {
+                for v in t {
+                    for k in 0..3 {
+                        lo[k] = lo[k].min(v[k] as f64);
+                        hi[k] = hi[k].max(v[k] as f64);
+                    }
+                }
+            }
+            let p = self.bodies[s].pos;
+            boxes.push([p[0] + lo[0], p[1] + lo[1], p[2] + lo[2], p[0] + hi[0], p[1] + hi[1], p[2] + hi[2]]);
+        }
+
+        for _ in 0..8 {
+            let mut moved = false;
+            for a in 0..slots.len() {
+                for b in (a + 1)..slots.len() {
+                    let (ba, bb) = (boxes[a], boxes[b]);
+                    let mut ov = [0.0f64; 3];
+                    let mut ok = true;
+                    for k in 0..3 {
+                        ov[k] = ba[k + 3].min(bb[k + 3]) - ba[k].max(bb[k]);
+                        if ov[k] <= 0.0 {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if !ok {
+                        continue;
+                    }
+                    // расталкиваем по оси наименьшего перекрытия
+                    let axis = (0..3).min_by(|x, y| ov[*x].partial_cmp(&ov[*y]).unwrap()).unwrap();
+                    let step = (0.5 * ov[axis]).min(0.02);
+                    let dir = if self.bodies[slots[a]].pos[axis] <= self.bodies[slots[b]].pos[axis] { -1.0 } else { 1.0 };
+                    for k in 0..2 {
+                        let s = slots[[a, b][k]];
+                        self.bodies[s].pos[axis] += dir * step * if k == 0 { 1.0 } else { -1.0 };
+                        let p = self.bodies[s].pos;
+                        let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
+                        for t in self.bodies[s].rotated_tets() {
+                            for v in t {
+                                for q in 0..3 {
+                                    lo[q] = lo[q].min(v[q] as f64);
+                                    hi[q] = hi[q].max(v[q] as f64);
+                                }
+                            }
+                        }
+                        boxes[[a, b][k]] = [p[0] + lo[0], p[1] + lo[1], p[2] + lo[2], p[0] + hi[0], p[1] + hi[1], p[2] + hi[2]];
+                    }
+                    moved = true;
+                }
+            }
+            if !moved {
+                break;
+            }
+        }
+
+        // и над полом: осколок не должен рождаться внутри пола
+        for &s in slots {
+            let low = boxes[slots.iter().position(|x| *x == s).unwrap()][1];
+            if low < 0.0 {
+                self.bodies[s].pos[1] -= low;
+            }
+            let p = self.bodies[s].pos;
+            self.mirror[s].pos_r = [p[0] as f32, p[1] as f32, p[2] as f32, self.mirror[s].pos_r[3]];
+            self.mirror[s].anchor[0] = p[0] as f32;
+            self.mirror[s].anchor[1] = p[1] as f32;
+            self.mirror[s].anchor[2] = p[2] as f32;
+        }
+    }
+
     /// Новый устойчивый id. Слот переиспользуется, id — никогда.
     fn new_id(&mut self) -> u64 {
         let id = self.next_id;
@@ -454,7 +538,7 @@ impl Live {
                 let d = [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
                 let n = [c.n[0] as f64, c.n[1] as f64, c.n[2] as f64];
                 let vrel = (d[0] * n[0] + d[1] * n[1] + d[2] * n[2]).abs();
-                if vrel < 8.0 {
+                if vrel < 4.0 {
                     continue;
                 }
                 // цель — не снаряд: снаряд мелкий и колется только он сам,
@@ -479,7 +563,7 @@ impl Live {
                 }
                 let mu = 1.0 / (1.0 / self.bodies[ti].mass + 1.0 / self.bodies[oi].mass);
                 let e = 0.5 * mu * vrel * vrel;
-                if e < 1500.0 {
+                if e < 500.0 {
                     continue;
                 }
                 let pi = self.bodies[ti].pos;
@@ -572,6 +656,7 @@ impl Live {
 
         let mut rng = crate::tet::Lcg::new(0xB17E_5EED ^ (self.cracks as u64));
         let mut created = 0usize;
+        let mut new_slots: Vec<usize> = Vec::new();
 
         for (k, fr) in frags.iter().enumerate() {
             let lc = fr.world_centroid();
@@ -616,6 +701,7 @@ impl Live {
             } else {
                 self.bodies.push(body);
             }
+            new_slots.push(slot);
             created += 1;
         }
 
@@ -624,6 +710,9 @@ impl Live {
         // на его место (выглядит как пинг). Раньше запись делалась только при
         // created >= 2, а при нехватке слотов выходило ровно один.
         if created > 0 {
+            // сначала аккуратно расталкиваем новорождённых позициями,
+            // и только потом отдаём их солверу
+            self.settle_new_shards(&new_slots);
             self.gpu.write_bodies(&self.mirror);
             self.bodies[ti].crack_after = self.frames + 30;
         }
