@@ -760,9 +760,9 @@ impl Live {
                 pos: wp,
                 quat: tq,
                 vel: [
-                    d[0] / len * speed + tvel[0] * 0.4,
-                    d[1] / len * speed + tvel[1] * 0.4,
-                    d[2] / len * speed + tvel[2] * 0.4,
+                    d[0] / len * speed + tvel[0] * 0.4 - drift[0],
+                    d[1] / len * speed + tvel[1] * 0.4 - drift[1],
+                    d[2] / len * speed + tvel[2] * 0.4 - drift[2],
                 ],
                 mass: DENSITY * fr.volume(),
                 radius: 0.2,

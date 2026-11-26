@@ -168,6 +168,28 @@ impl Fly {
     }
 }
 
+/// Интерполяция кватернионов (по короткой дуге) для сглаживания кадров.
+fn slerp(a: [f64; 4], b: [f64; 4], t: f64) -> [f64; 4] {
+    let dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
+    let b = if dot < 0.0 { [-b[0], -b[1], -b[2], -b[3]] } else { b };
+    let d = dot.abs().min(1.0);
+    let (sa, sb) = if d > 0.9995 {
+        (1.0 - t, t)
+    } else {
+        let th = d.acos();
+        let s = th.sin();
+        (((1.0 - t) * th).sin() / s, (t * th).sin() / s)
+    };
+    let q = [
+        a[0] * sa + b[0] * sb,
+        a[1] * sa + b[1] * sb,
+        a[2] * sa + b[2] * sb,
+        a[3] * sa + b[3] * sb,
+    ];
+    let l = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+    [q[0] / l, q[1] / l, q[2] / l, q[3] / l]
+}
+
 fn main() {
     let mut explicit: Option<std::path::PathBuf> = None;
     let mut max_frames: u64 = 0; // 0 — без ограничения
@@ -245,6 +267,12 @@ fn main() {
     let mut frame_no = 0u64;
     let mut t0 = std::time::Instant::now();
     let mut last_frame = std::time::Instant::now();
+    // Физика идёт своим фиксированным тактом, кадры — своим: рендер
+    // интерполирует между двумя последними состояниями симуляции.
+    const TICK: f32 = 1.0 / 60.0;
+    let mut acc = 0.0f32;
+    let mut prev_state: Vec<([f64; 3], [f64; 4])> = Vec::new();
+    let mut alpha = 1.0f32;
     let mut last_upload: Vec<usize> = Vec::new();
 
     loop {
@@ -339,8 +367,28 @@ fn main() {
             }
         }
 
-        // физика
-        world.step(1.0 / 60.0, 4, 10);
+        // Физика: столько тактов, сколько прошло реального времени. В
+        // скриптовом режиме (--frames) шаг строго один на кадр — иначе прогон
+        // зависел бы от скорости машины и перестал быть воспроизводимым.
+        let mut stepped = 0;
+        if max_frames > 0 {
+            prev_state.clear();
+            prev_state.extend(world.bodies.iter().map(|b| (b.pos, b.quat)));
+            world.step(TICK, 4, 10);
+            stepped = 1;
+            acc = 0.0;
+        } else {
+            acc += frame_dt;
+        }
+        while max_frames == 0 && acc >= TICK && stepped < 4 {
+            prev_state.clear();
+            prev_state.extend(world.bodies.iter().map(|b| (b.pos, b.quat)));
+            world.step(TICK, 4, 10);
+            acc -= TICK;
+            stepped += 1;
+        }
+        // доля между последним и следующим тактом — по ней и рисуем
+        alpha = if stepped > 0 { (acc / TICK).clamp(0.0, 1.0) } else { 1.0 };
         if std::env::var("VF_DEBUG").is_ok() && frame_no < 40 && frame_no % 4 == 0 {
             for (i, b) in world.bodies.iter().enumerate() {
                 if b.alive && i > 0 {
@@ -421,7 +469,18 @@ fn main() {
                 if !b.alive || b.mesh < 0 {
                     continue;
                 }
-                let m = model_matrix(b.pos, b.quat);
+                let (rpos, rquat) = match prev_state.get(i) {
+                    Some((pp, pq)) if alpha < 0.999 => (
+                        [
+                            pp[0] + (b.pos[0] - pp[0]) * alpha as f64,
+                            pp[1] + (b.pos[1] - pp[1]) * alpha as f64,
+                            pp[2] + (b.pos[2] - pp[2]) * alpha as f64,
+                        ],
+                        slerp(*pq, b.quat, alpha as f64),
+                    ),
+                    _ => (b.pos, b.quat),
+                };
+                let m = model_matrix(rpos, rquat);
                 let tint = match b.kind {
                     voxelforge_world::live::Kind::Bullet => [0.95, 0.62, 0.28, 1.0],
                     voxelforge_world::live::Kind::Target => [0.74, 0.70, 0.62, 1.0],

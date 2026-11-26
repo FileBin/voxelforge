@@ -227,8 +227,6 @@ pub fn build(
     let mut out: Vec<Vec<Contact>> = vec![Vec::new(); shapes.len()];
 
     // мировые тетраэдры и их AABB
-    let mut world: Vec<Vec<[[f32; 3]; 4]>> = Vec::with_capacity(shapes.len());
-
     // Плоская сетка вместо HashMap: счёт, префиксные суммы, раскладка.
     // HashMap на каждом тетраэдре (хэш ключа + аллокация Vec на клетку) стоил
     // дороже самого SAT: на сцене из 22 тел фаза контактов занимала 209 мс.
