@@ -397,7 +397,10 @@ impl Live {
         let per = (substeps / chunks).max(1);
         let sdt = dt / chunks as f32;
 
+        let timing = std::env::var("VF_TIME").is_ok();
+        let (mut t_collide, mut t_dep, mut t_solve, mut t_frac) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
         for _ in 0..chunks {
+            let t0 = std::time::Instant::now();
             let mut tet_shapes: Vec<Vec<[[f32; 3]; 4]>> = Vec::with_capacity(MAX_BODIES);
             for b in &self.bodies {
                 tet_shapes.push(if b.alive { b.rotated_tets() } else { Vec::new() });
@@ -421,12 +424,19 @@ impl Live {
                 contacts[i].clear();
             }
 
+            if timing { t_collide += t0.elapsed().as_secs_f64(); }
+            let t1 = std::time::Instant::now();
             self.wake_on_contact(&contacts);
             self.depenetrate(&contacts);
+            if timing { t_dep += t1.elapsed().as_secs_f64(); }
+            let t2 = std::time::Instant::now();
             self.fracture(&contacts);
+            if timing { t_frac += t2.elapsed().as_secs_f64(); }
 
+            let t3 = std::time::Instant::now();
             self.gpu.write_contacts(&contacts);
             self.gpu.frame_with_contacts(sdt, per, iterations);
+            if timing { t_solve += t3.elapsed().as_secs_f64(); }
             let snap = self.gpu.read_bodies();
 
             for i in 0..self.bodies.len() {
@@ -448,6 +458,11 @@ impl Live {
             self.mirror[..n].copy_from_slice(&snap[..n]);
         }
 
+        if timing {
+            eprintln!("[time] кадр {}: контакты {:.2} мс, развязка {:.2} мс, солвер {:.2} мс, раскол {:.2} мс, всего {:.2} мс",
+                self.frames, t_collide * 1e3, t_dep * 1e3, t_solve * 1e3, t_frac * 1e3,
+                (t_collide + t_dep + t_solve + t_frac) * 1e3);
+        }
         // улетевшее за пределы ящика убираем
         let mut moved = false;
         for i in 0..self.bodies.len() {
