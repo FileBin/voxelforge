@@ -322,7 +322,7 @@ impl GpuSim {
             ("count", 2),
             ("scan", 3),
             ("fill", 4),
-            ("static_contacts", 3),
+            ("static_contacts", 5),
             ("broad", 5),
             ("solve", 4),
             ("sleep", 1),
@@ -471,7 +471,7 @@ impl GpuSim {
             });
             steps.push(Step {
                 pipe: P_STATIC,
-                bufs: vec![a, self.list, self.lcount],
+                bufs: vec![a, self.tets, self.span, self.list, self.lcount],
                 push,
                 groups: [g_body, 1, 1],
             });
@@ -595,7 +595,7 @@ impl GpuSim {
             if !external_contacts {
                 steps.push(Step {
                     pipe: P_STATIC,
-                    bufs: vec![a, self.list, self.lcount],
+                    bufs: vec![a, self.tets, self.span, self.list, self.lcount],
                     push,
                     groups: [g_body, 1, 1],
                 });

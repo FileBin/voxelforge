@@ -1,13 +1,29 @@
 #version 450
 #include "common.glsl"
 
-/* Контакты со статикой: пол и четыре стенки ящика. Партнёр — GROUND.
- * Для коробки берётся её полуразмер по оси, для сферы — радиус: формула
- * одна и та же, потому что у сферы half = (r, r, r). */
+/* Контакты со статикой: пол и четыре стенки ящика (партнёр — GROUND).
+ *
+ * Раньше здесь брались полуразмеры AABB и одна точка в центре грани: поворот
+ * тела игнорировался, и куб чувствовал пол как сфера — катился и не вставал
+ * на грань. Теперь контакты строятся по РЕАЛЬНЫМ вершинам тетраэдров, как на
+ * CPU: пол даёт до четырёх точек опоры (иначе коробка балансирует на одной
+ * точке), стенки — по одной.
+ */
+
 layout(local_size_x = 64) in;
 layout(std430, set = 0, binding = 0) buffer Bodies { Body b[]; };
-layout(std430, set = 0, binding = 1) buffer Lists { C list[]; };
-layout(std430, set = 0, binding = 2) buffer ListCount { uint lc[]; };
+layout(std430, set = 0, binding = 1) buffer Pool { vec4 tets[]; };
+layout(std430, set = 0, binding = 2) buffer Span { uvec2 span[]; };
+layout(std430, set = 0, binding = 3) buffer Lists { C list[]; };
+layout(std430, set = 0, binding = 4) buffer ListCount { uint lc[]; };
+
+vec3 qrot(vec4 q, vec3 v) {
+    /* кватернион в common.glsl лежит как (w, x, y, z) */
+    vec3 u = q.yzw;
+    float w = q.x;
+    vec3 t = 2.0 * cross(u, v);
+    return v + w * t + cross(u, t);
+}
 
 void push(uint self, vec3 n, float pen, vec3 at) {
     uint slot = atomicAdd(lc[self], 1u);
@@ -22,19 +38,63 @@ void push(uint self, vec3 n, float pen, vec3 at) {
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= uint(pc.grid.w)) return;
+
     Body x = b[i];
-    vec3 h = x.half_shape.xyz;
+    if (x.misc.y > 0.5) return; /* спящее тело контакты не трогает */
+    uint cnt = span[i].y;
+    if (cnt == 0u) return;
+    uint base = span[i].x;
+
     float m = pc.prm1.z;
+    float floor_y = 0.0;
 
-    float floor_pen = h.y - x.pos_r.y;
-    if (floor_pen > -m) push(i, vec3(0.0, 1.0, 0.0), floor_pen, x.pos_r.xyz - vec3(0.0, h.y, 0.0));
+    /* четыре самые глубокие вершины под полом — точки опоры */
+    vec3 pts[4];
+    float pens[4];
+    int have = 0;
+    for (uint t = 0u; t < cnt; t++) {
+        for (int k = 0; k < 4; k++) {
+            vec3 v = qrot(x.quat, tets[(base + t) * 4u + uint(k)].xyz) + x.pos_r.xyz;
+            float pen = floor_y - v.y;
+            if (pen <= -m) continue;
+            /* вставляем в список четырёх самых глубоких */
+            if (have < 4) {
+                pts[have] = v;
+                pens[have] = pen;
+                have++;
+            } else {
+                int worst = 0;
+                for (int j = 1; j < 4; j++) if (pens[j] < pens[worst]) worst = j;
+                if (pen > pens[worst]) {
+                    pts[worst] = v;
+                    pens[worst] = pen;
+                }
+            }
+        }
+    }
+    for (int j = 0; j < have; j++) {
+        push(i, vec3(0.0, 1.0, 0.0), pens[j], pts[j]);
+    }
 
-    float left = pc.lo.x - (x.pos_r.x - h.x);
-    if (left > -m) push(i, vec3(1.0, 0.0, 0.0), left, x.pos_r.xyz - vec3(h.x, 0.0, 0.0));
-    float right = (x.pos_r.x + h.x) - pc.hi.x;
-    if (right > -m) push(i, vec3(-1.0, 0.0, 0.0), right, x.pos_r.xyz + vec3(h.x, 0.0, 0.0));
-    float back = pc.lo.z - (x.pos_r.z - h.z);
-    if (back > -m) push(i, vec3(0.0, 0.0, 1.0), back, x.pos_r.xyz - vec3(0.0, 0.0, h.z));
-    float front = (x.pos_r.z + h.z) - pc.hi.z;
-    if (front > -m) push(i, vec3(0.0, 0.0, -1.0), front, x.pos_r.xyz + vec3(0.0, 0.0, h.z));
+    /* стенки: по одной точке — самая выступившая вершина за границей */
+    float left = 0.0, right = 0.0, back = 0.0, front = 0.0;
+    vec3 at_left = x.pos_r.xyz, at_right = x.pos_r.xyz, at_back = x.pos_r.xyz, at_front = x.pos_r.xyz;
+    for (uint t = 0u; t < cnt; t++) {
+        for (int k = 0; k < 4; k++) {
+            vec3 v = qrot(x.quat, tets[(base + t) * 4u + uint(k)].xyz) + x.pos_r.xyz;
+            float d;
+            d = pc.lo.x - v.x;
+            if (d > left) { left = d; at_left = v; }
+            d = v.x - pc.hi.x;
+            if (d > right) { right = d; at_right = v; }
+            d = pc.lo.z - v.z;
+            if (d > back) { back = d; at_back = v; }
+            d = v.z - pc.hi.z;
+            if (d > front) { front = d; at_front = v; }
+        }
+    }
+    if (left > -m) push(i, vec3(1.0, 0.0, 0.0), left, at_left);
+    if (right > -m) push(i, vec3(-1.0, 0.0, 0.0), right, at_right);
+    if (back > -m) push(i, vec3(0.0, 0.0, 1.0), back, at_back);
+    if (front > -m) push(i, vec3(0.0, 0.0, -1.0), front, at_front);
 }
