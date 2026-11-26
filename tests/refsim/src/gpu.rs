@@ -106,6 +106,8 @@ impl GpuBody {
 /// Готовая сцена: тела плюс параметры ящика и сетки.
 pub struct Scene {
     pub name: &'static str,
+    /// Воксельный статический коллайдер (поле SDF), если он есть у сцены.
+    pub voxel: Option<crate::VoxelBody>,
     /// Тела в представлении эталона: для записи `.vfr` и для сверки.
     pub cpu: Vec<crate::Body>,
     pub bodies: Vec<GpuBody>,
@@ -138,6 +140,7 @@ pub fn scene_pile(count: usize) -> Scene {
     let params = params_for(&bodies, [-0.05, 0.0, -0.05], [4.2, top + 0.5, 4.2], 0.7);
     Scene {
         name: "pile",
+        voxel: None,
         cpu: sim.bodies,
         bodies,
         params,
@@ -151,7 +154,78 @@ pub fn scene_drop() -> Scene {
     let params = params_for(&bodies, [-3.0, 0.0, -3.0], [3.0, 12.0, 3.0], 0.0);
     Scene {
         name: "drop",
+        voxel: None,
         cpu: sim.bodies,
+        bodies,
+        params,
+    }
+}
+
+/// Разрушение: воксельное тело пре-фрактурировано на 8 октантов. Осколки
+/// спят в исходной упаковке, пока в них не врежется тяжёлый шар; после удара
+/// они просыпаются и разлетаются.
+pub fn scene_fracture() -> Scene {
+    let center = [0.0f32, 0.5, 0.0];
+    let half = [0.5f32, 0.5, 0.5];
+    let vox = crate::VoxelBody::cube(center, half, 24, 0.05);
+    // Плотность 100 кг/м³: осколок 12.5 кг против снаряда 20 кг — удар
+    // пробивает тело, а не подбрасывает его целиком.
+    let chunks = vox.fracture_octants(center, half, 100.0);
+
+    let mut cpu = Vec::new();
+    for (c, h, m) in &chunks {
+        let mut b = crate::Body::block(
+            [c[0] as f64, c[1] as f64, c[2] as f64],
+            [h[0] as f64, h[1] as f64, h[2] as f64],
+        );
+        b.mass = *m;
+        cpu.push(b);
+    }
+    /* Снаряд бьёт СБОКУ, а не сверху: удар сверху только прижимает куски
+     * друг к другу и к полу — тело остаётся целым, и это физически верно.
+     * Боковой удар разносит осколки в стороны, как и должно при расколе. */
+    let ball = crate::Body::new([-2.5, 0.75, 0.0], [25.0, 0.0, 0.0], 20.0, 0.25);
+    cpu.push(ball);
+
+    let mut bodies: Vec<GpuBody> = cpu.iter().map(GpuBody::from_cpu).collect();
+    // Осколки стартуют спящими: тело ещё целое, пока в него не попали.
+    for b in bodies.iter_mut().take(8) {
+        b.misc[1] = 1.0;
+        b.vel_m[3] = 0.0;
+        b.ang_i[3] = 0.0;
+    }
+
+    // При мягком выталкивании осколки остаются вложенными друг в друга:
+    // удар сминает упаковку быстрее, чем солвер успевает её развести.
+    let mut params = params_for(&bodies, [-3.0, 0.0, -3.0], [3.0, 5.0, 3.0], 0.5);
+    params.max_push = 1.0;
+    Scene {
+        name: "fracture",
+        voxel: None,
+        cpu,
+        bodies,
+        params,
+    }
+}
+
+/// Тело падает на воксельное тело: поле SDF как статический коллайдер.
+pub fn scene_voxel_fall(speed: f32) -> Scene {
+    let center = [0.0f32, 0.6, 0.0];
+    let radius = 0.5f32;
+    let mut body = crate::VoxelBody::sphere(center, radius, 24, 0.05);
+    // Уточняем верхнюю часть — там, куда прилетит шар.
+    body.refine_region(center, radius, [-0.3, 0.35, -0.3], [0.3, 1.15, 0.3]);
+
+    let ball = crate::Body::new([0.0, 3.0, 0.0], [0.0, -speed as f64, 0.0], 1.0, 0.1);
+    let bodies = vec![GpuBody::from_cpu(&ball)];
+    // Трение нужно: без него шар на макушке сферы не удержится вовсе.
+    let mut params = params_for(&bodies, [-2.0, 0.0, -2.0], [2.0, 4.0, 2.0], 0.8);
+    // Мягкое выталкивание: при 1.0 м/с шар на сфере подпрыгивает вечно.
+    params.max_push = 0.2;
+    Scene {
+        name: "voxel",
+        voxel: Some(body),
+        cpu: vec![ball],
         bodies,
         params,
     }
@@ -169,6 +243,7 @@ pub fn scene_stack(count: usize) -> Scene {
     let params = params_for(&bodies, [-3.0, 0.0, -3.0], [3.0, 12.0, 3.0], 0.0);
     Scene {
         name: "stack",
+        voxel: None,
         cpu: sim.bodies,
         bodies,
         params,
@@ -195,6 +270,7 @@ const P_BROAD: usize = 6;
 const P_SOLVE: usize = 7;
 const P_SLEEP: usize = 8;
 const P_POS: usize = 9;
+const P_VOX: usize = 10;
 
 const CAP: usize = 24;
 /// Body = 5 × vec4.
@@ -273,11 +349,19 @@ pub struct GpuSim {
     starts: *mut c_void,
     cursor: *mut c_void,
     cbody: *mut c_void,
+    vox_sdf: *mut c_void,
+    vox_params: *mut c_void,
+    has_voxel: bool,
     pipes: Vec<*mut c_void>,
 }
 
 impl GpuSim {
-    pub fn new(mut bodies: Vec<GpuBody>, shader_dir: &Path, params: Params) -> Self {
+    pub fn new(
+        mut bodies: Vec<GpuBody>,
+        shader_dir: &Path,
+        params: Params,
+        voxel: Option<&crate::VoxelBody>,
+    ) -> Self {
         let n = bodies.len();
         let mut ctx: *mut c_void = std::ptr::null_mut();
         unsafe { check(vf_init(&mut ctx), "vf_init") };
@@ -314,6 +398,49 @@ impl GpuSim {
         let starts = mk((ncells as usize + 1) * 4, false);
         let cursor = mk(ncells as usize * 4, false);
         let cbody = mk(n * 4, false);
+        let (vox_sdf, vox_params) = match voxel {
+            Some(v) => {
+                let sdf = mk((v.data.len() * 4).max(16), true);
+                let prm = mk(64, true);
+                unsafe {
+                    check(
+                        vf_buffer_write(ctx, sdf, 0, v.data.as_ptr() as *const c_void, v.data.len() * 4),
+                        "upload sdf",
+                    )
+                };
+                let mut params_bytes = [0u8; 64];
+                let put4f = |bytes: &mut [u8], off: usize, v: [f32; 4]| {
+                    for (k, x) in v.iter().enumerate() {
+                        bytes[off + k * 4..off + k * 4 + 4].copy_from_slice(&x.to_le_bytes());
+                    }
+                };
+                let put4i = |bytes: &mut [u8], off: usize, v: [i32; 4]| {
+                    for (k, x) in v.iter().enumerate() {
+                        bytes[off + k * 4..off + k * 4 + 4].copy_from_slice(&x.to_le_bytes());
+                    }
+                };
+                put4f(&mut params_bytes, 0, [v.base.origin[0], v.base.origin[1], v.base.origin[2], v.base.cell]);
+                put4i(&mut params_bytes, 16, [v.base.dim as i32, v.base.offset as i32, 0, 0]);
+                match &v.fine {
+                    Some(f) => {
+                        put4f(&mut params_bytes, 32, [f.origin[0], f.origin[1], f.origin[2], f.cell]);
+                        put4i(&mut params_bytes, 48, [f.dim as i32, f.offset as i32, 1, 0]);
+                    }
+                    None => {
+                        put4f(&mut params_bytes, 32, [0.0, 0.0, 0.0, 1.0]);
+                        put4i(&mut params_bytes, 48, [1, 0, 0, 0]);
+                    }
+                }
+                unsafe {
+                    check(
+                        vf_buffer_write(ctx, prm, 0, params_bytes.as_ptr() as *const c_void, 64),
+                        "upload vox params",
+                    )
+                };
+                (sdf, prm)
+            }
+            None => (std::ptr::null_mut(), std::ptr::null_mut()),
+        };
 
         unsafe {
             check(
@@ -339,6 +466,7 @@ impl GpuSim {
             ("solve", 4),
             ("sleep", 1),
             ("integrate_pos", 1),
+            ("voxel", 5),
         ];
         let mut pipes = Vec::new();
         for (nm, nb) in names.iter() {
@@ -379,6 +507,9 @@ impl GpuSim {
             starts,
             cursor,
             cbody,
+            vox_sdf,
+            vox_params,
+            has_voxel: voxel.is_some(),
             pipes,
         }
     }
@@ -444,6 +575,14 @@ impl GpuSim {
                 push,
                 groups: [g_body, 1, 1],
             });
+            if self.has_voxel {
+                steps.push(Step {
+                    pipe: P_VOX,
+                    bufs: vec![a, self.list, self.lcount, self.vox_sdf, self.vox_params],
+                    push,
+                    groups: [g_body, 1, 1],
+                });
+            }
             steps.push(Step {
                 pipe: P_BROAD,
                 bufs: vec![a, self.starts, self.cbody, self.list, self.lcount],
@@ -540,6 +679,10 @@ impl Drop for GpuSim {
         unsafe {
             for p in &self.pipes {
                 vf_pipeline_free(self.ctx, *p);
+            }
+            if !self.vox_sdf.is_null() {
+                vf_buffer_free(self.ctx, self.vox_sdf);
+                vf_buffer_free(self.ctx, self.vox_params);
             }
             for b in [
                 self.bodies[0],

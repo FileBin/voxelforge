@@ -1,0 +1,92 @@
+#version 450
+#include "common.glsl"
+
+/* Контакт тел с воксельным полем.
+ *
+ * Поле — знаковое расстояние на решётке. Внутри поверхности оно отрицательное,
+ * и тело выталкивается по градиенту. Никаких «дыр» между вокселями нет:
+ * выборка трилинейная, поэтому мелкий шаг не проваливается сквозь крупный —
+ * он провалился бы только при шаге больше ячейки за подшаг.
+ */
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) buffer Bodies { Body b[]; };
+layout(std430, set = 0, binding = 1) buffer Lists { C list[]; };
+layout(std430, set = 0, binding = 2) buffer ListCount { uint lc[]; };
+layout(std430, set = 0, binding = 3) buffer Sdf { float sdf[]; };
+
+layout(std430, set = 0, binding = 4) buffer VoxParams {
+    vec4 base;      /* origin.xyz, cell                              */
+    ivec4 base_h;   /* dim, offset, 0, 0                             */
+    vec4 fine;      /* origin.xyz, cell                              */
+    ivec4 fine_h;   /* dim, offset, active, 0                        */
+} vox;
+
+const float FAR = 1e9;
+
+float sample_grid(vec3 origin, float cell, int dim, int offset, vec3 p) {
+    vec3 f = (p - origin) / cell;
+    float n = float(dim) - 1.0;
+    if (f.x < 0.0 || f.y < 0.0 || f.z < 0.0 || f.x > n || f.y > n || f.z > n) return FAR;
+    ivec3 i0 = ivec3(floor(f));
+    vec3 t = f - vec3(i0);
+    ivec3 i1 = min(i0 + ivec3(1), ivec3(dim - 1));
+    int d = dim;
+    int o = offset;
+    float c000 = sdf[o + (i0.z * d + i0.y) * d + i0.x];
+    float c100 = sdf[o + (i0.z * d + i0.y) * d + i1.x];
+    float c010 = sdf[o + (i0.z * d + i1.y) * d + i0.x];
+    float c110 = sdf[o + (i0.z * d + i1.y) * d + i1.x];
+    float c001 = sdf[o + (i1.z * d + i0.y) * d + i0.x];
+    float c101 = sdf[o + (i1.z * d + i0.y) * d + i1.x];
+    float c011 = sdf[o + (i1.z * d + i1.y) * d + i0.x];
+    float c111 = sdf[o + (i1.z * d + i1.y) * d + i1.x];
+    float c00 = mix(c000, c100, t.x);
+    float c10 = mix(c010, c110, t.x);
+    float c01 = mix(c001, c101, t.x);
+    float c11 = mix(c011, c111, t.x);
+    return mix(mix(c00, c10, t.y), mix(c01, c11, t.y), t.z);
+}
+
+float field(vec3 p) {
+    if (vox.fine_h.z != 0) {
+        float s = sample_grid(vox.fine.xyz, vox.fine.w, vox.fine_h.x, vox.fine_h.y, p);
+        if (s < FAR) return s;
+    }
+    return sample_grid(vox.base.xyz, vox.base.w, vox.base_h.x, vox.base_h.y, p);
+}
+
+void push(uint self, vec3 n, float pen) {
+    uint slot = atomicAdd(lc[self], 1u);
+    if (int(slot) >= CAP) return;
+    C c;
+    c.meta = ivec4(GROUND, 0, 0, 0);
+    c.n_pen = vec4(n, pen);
+    list[self * CAP + slot] = c;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.grid.w)) return;
+    Body x = b[i];
+    if (x.misc.y > 0.5) return;   /* спящие не трогаем */
+
+    float r = half_along(vec3(1.0, 0.0, 0.0), x.half_shape.xyz);
+    vec3 p = x.pos_r.xyz;
+    float d = field(p);
+    if (d >= FAR) return;
+
+    float pen = r - d;
+    if (pen <= pc.prm1.z) return;
+
+    /* Градиент поля — направление выталкивания. Шаг — четверть ячейки,
+     * чтобы не выскочить за пределы патча. */
+    float h = vox.base.w * 0.25;
+    vec3 g = vec3(
+        field(p + vec3(h, 0.0, 0.0)) - field(p - vec3(h, 0.0, 0.0)),
+        field(p + vec3(0.0, h, 0.0)) - field(p - vec3(0.0, h, 0.0)),
+        field(p + vec3(0.0, 0.0, h)) - field(p - vec3(0.0, 0.0, h))
+    );
+    float gl2 = dot(g, g);
+    if (gl2 < 1e-12) return;
+    push(i, normalize(g), pen);
+}

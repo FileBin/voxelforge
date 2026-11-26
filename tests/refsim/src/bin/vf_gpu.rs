@@ -7,7 +7,8 @@
 use std::path::PathBuf;
 
 use voxelforge_refsim::gpu::{
-    find_shaders, scene_drop, scene_pile, scene_stack, GpuBody, GpuSim, Params, Scene,
+    find_shaders, scene_drop, scene_fracture, scene_pile, scene_stack, scene_voxel_fall, GpuBody,
+    GpuSim, Params, Scene,
 };
 use voxelforge_refsim::{pile_demo, ContactSim};
 
@@ -26,6 +27,7 @@ struct Args {
     beta: Option<f32>,
     max_push: Option<f32>,
     ang_damp: Option<f32>,
+    speed: f32,
 }
 
 fn parse() -> Args {
@@ -44,6 +46,7 @@ fn parse() -> Args {
         beta: None,
         max_push: None,
         ang_damp: None,
+        speed: 0.0,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -63,6 +66,7 @@ fn parse() -> Args {
             "--beta" => a.beta = Some(v().parse().unwrap()),
             "--max-push" => a.max_push = Some(v().parse().unwrap()),
             "--ang-damp" => a.ang_damp = Some(v().parse().unwrap()),
+            "--speed" => a.speed = v().parse().unwrap(),
             other => panic!("неизвестный аргумент {other}"),
         }
     }
@@ -104,18 +108,20 @@ fn max_penetration(bodies: &[GpuBody]) -> f64 {
     worst
 }
 
-fn build(scene: &str, n: usize) -> Scene {
+fn build(scene: &str, n: usize, speed: f32) -> Scene {
     match scene {
         "pile" => scene_pile(n),
         "drop" => scene_drop(),
         "stack" => scene_stack(n),
+        "voxel" => scene_voxel_fall(speed),
+        "fracture" => scene_fracture(),
         other => panic!("неизвестная сцена {other}: pile | drop | stack"),
     }
 }
 
 fn main() {
     let args = parse();
-    let mut sc = build(&args.scene, args.bodies);
+    let mut sc = build(&args.scene, args.bodies, args.speed);
     let mut params: Params = sc.params;
     if let Some(f) = args.friction {
         params.friction = f;
@@ -134,7 +140,12 @@ fn main() {
         panic!("нет SPIR-V: соберите shaders/*.comp через glslc или укажите --shaders")
     });
     let n = sc.bodies.len();
-    let mut gpu = GpuSim::new(std::mem::take(&mut sc.bodies), &shaders, params);
+    let mut gpu = GpuSim::new(
+        std::mem::take(&mut sc.bodies),
+        &shaders,
+        params,
+        sc.voxel.as_ref(),
+    );
     println!("устройство: {}", gpu.name);
     println!(
         "сцена: {} · сетка {}×{}×{} = {} ячеек · тел {} · ячейка {:.3} м",
@@ -149,7 +160,8 @@ fn main() {
     for f in 0..args.frames {
         gpu.frame(args.dt, args.substeps, args.iterations);
         // С треком читаем каждый кадр: иначе во вьюере будет дёрганое видео.
-        if f % 10 == 0 || f + 1 == args.frames || args.out.is_some() {
+        let trace = std::env::var("VF_TRACE").is_ok();
+        if f % 10 == 0 || f + 1 == args.frames || args.out.is_some() || trace {
             let snap = gpu.read_bodies();
             let top_of = |s: &[GpuBody]| {
                 s.iter()
@@ -170,14 +182,13 @@ fn main() {
             if slept_at < 0.0 && asleep == n {
                 slept_at = f as f32 * args.dt;
             }
-            let trace = std::env::var("VF_TRACE").is_ok();
             if trace && n <= 20 {
                 let ys: Vec<String> = snap
                     .iter()
                     .map(|b| {
                         format!(
-                            "{:.3}/v{:.2}/s{:.0}/h{:.2}",
-                            b.pos_r[1], b.vel_m[1], b.misc[1], b.half_shape[1]
+                            "{:.2}/v{:.1}/s{:.0}/i{:.3}/m{:.3}",
+                            b.pos_r[1], b.vel_m[1], b.misc[1], b.vel_m[3], b.misc[2]
                         )
                     })
                     .collect();

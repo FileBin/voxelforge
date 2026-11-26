@@ -14,9 +14,11 @@
 pub mod contact;
 pub mod gpu;
 pub mod pile;
+pub mod voxel;
 
 pub use contact::ContactSim;
 pub use pile::{pile_demo, PileSim};
+pub use voxel::VoxelBody;
 
 /// Форма тела: сфера (гравитационные демки) или блок (контактные демки).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
