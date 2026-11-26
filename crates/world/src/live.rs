@@ -505,7 +505,16 @@ impl Live {
             (p_local[2] + c[2] as f64) as f32,
         ];
 
-        let n = (2.0 + energy / 700.0).clamp(3.0, max_new as f32) as usize;
+        // clamp(3.0, max_new) паниковал, когда свободных слотов меньше трёх:
+        // у clamp минимум оказывался больше максимума. Если мест мало —
+        // просто режем на сколько есть.
+        let want = 2.0 + energy / 700.0;
+        let hi = max_new as f32;
+        let n = if hi <= 3.0 {
+            hi.max(1.0) as usize
+        } else {
+            want.clamp(3.0, hi) as usize
+        };
         let mut frags = tb.shatter_biased(n, 0x51ED_2A17 ^ (self.cracks as u64 + 1), focus);
         frags.truncate(max_new);
         if frags.len() < 2 {
@@ -679,9 +688,82 @@ impl Live {
     }
 }
 
+/// Момент инерции по самим тетраэдрам.
+///
+/// Раньше тело строилось как сфера: `1/(0.4·m·r²)` с радиусом 0.5, хотя у
+/// плиты полуразмер 0.56 и она куб. Инерция выходила вдвое меньше настоящей —
+/// коробка крутилась слишком легко, качалась на грани и не могла успокоиться.
+/// Осколки от этого почти не страдали: они мелкие и по форме близки к
+/// компактным, а коробка — нет.
+///
+/// Для точечных масс I_xx = (2/3)·Σ mᵢ·|rᵢ|², что для куба со стороной a
+/// даёт ровно m·a²/6.
+fn solid_inertia(b: &LiveBody) -> f64 {
+    if b.local.is_empty() {
+        return 0.0;
+    }
+    let mut total = 0.0f64;
+    let mut moment = 0.0f64;
+    let mut w = [0.0f64; 3];
+    for t in &b.local {
+        let a = [t[0][0] as f64, t[0][1] as f64, t[0][2] as f64];
+        let bb = [t[1][0] as f64, t[1][1] as f64, t[1][2] as f64];
+        let c = [t[2][0] as f64, t[2][1] as f64, t[2][2] as f64];
+        let d = [t[3][0] as f64, t[3][1] as f64, t[3][2] as f64];
+        let u = [bb[0] - a[0], bb[1] - a[1], bb[2] - a[2]];
+        let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+        let w2 = [d[0] - a[0], d[1] - a[1], d[2] - a[2]];
+        let det = u[0] * (v[1] * w2[2] - v[2] * w2[1]) - u[1] * (v[0] * w2[2] - v[2] * w2[0])
+            + u[2] * (v[0] * w2[1] - v[1] * w2[0]);
+        let vol = (det / 6.0).abs();
+        if vol <= 0.0 {
+            continue;
+        }
+        let m = DENSITY * vol;
+        let cen = [
+            0.25 * (a[0] + bb[0] + c[0] + d[0]),
+            0.25 * (a[1] + bb[1] + c[1] + d[1]),
+            0.25 * (a[2] + bb[2] + c[2] + d[2]),
+        ];
+        total += m;
+        for k in 0..3 {
+            w[k] += m * cen[k];
+        }
+    }
+    if total <= 0.0 {
+        return 0.0;
+    }
+    let com = [w[0] / total, w[1] / total, w[2] / total];
+    for t in &b.local {
+        let a = [t[0][0] as f64, t[0][1] as f64, t[0][2] as f64];
+        let bb = [t[1][0] as f64, t[1][1] as f64, t[1][2] as f64];
+        let c = [t[2][0] as f64, t[2][1] as f64, t[2][2] as f64];
+        let d = [t[3][0] as f64, t[3][1] as f64, t[3][2] as f64];
+        let u = [bb[0] - a[0], bb[1] - a[1], bb[2] - a[2]];
+        let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+        let w2 = [d[0] - a[0], d[1] - a[1], d[2] - a[2]];
+        let det = u[0] * (v[1] * w2[2] - v[2] * w2[1]) - u[1] * (v[0] * w2[2] - v[2] * w2[0])
+            + u[2] * (v[0] * w2[1] - v[1] * w2[0]);
+        let vol = (det / 6.0).abs();
+        if vol <= 0.0 {
+            continue;
+        }
+        let m = DENSITY * vol;
+        let cen = [
+            0.25 * (a[0] + bb[0] + c[0] + d[0]) - com[0],
+            0.25 * (a[1] + bb[1] + c[1] + d[1]) - com[1],
+            0.25 * (a[2] + bb[2] + c[2] + d[2]) - com[2],
+        ];
+        moment += m * (cen[0] * cen[0] + cen[1] * cen[1] + cen[2] * cen[2]);
+    }
+    (2.0 / 3.0) * moment
+}
+
 fn gpu_body(b: &LiveBody) -> GpuBody {
     let mut cpu = Body::new(b.pos, b.vel, b.mass, b.radius);
     cpu.rot = b.quat;
+    let i = solid_inertia(b);
+    cpu.inv_inertia = if i > 0.0 { 1.0 / i } else { 0.0 };
     let mut g = GpuBody::from_cpu(&cpu);
     // Настоящие полуразмеры, а не радиус: солвер берёт по ним плечо для
     // контактов, которые считает сам GPU. Точка контакта из SAT теперь

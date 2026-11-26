@@ -80,7 +80,14 @@ void main() {
             ? (v + cross(w, rself))
             : (ov + cross(ow, rother)) - (v + cross(w, rself));
         float vn = dot(vrel, nrm);
-        float wn = im + oim;
+        /* Угловая часть в знаменателе НОРМАЛЬНОГО импульса. Без неё импульс
+         * в точке далеко от центра (угол коробки) считался так, будто тело
+         * не может повернуться: dl выходил больше нужного, тело получало
+         * лишний момент и качалось на грани. У осколков точка контакта
+         * ближе к центру, поэтому они и страдали меньше. */
+        vec3 ra_n = cross(rself, nrm);
+        vec3 rb_n = cross(rother, nrm);
+        float wn = im + oim + dot(ra_n, ra_n) * ii + dot(rb_n, rb_n) * oii;
         if (wn <= 0.0) continue;
         float sgn = is_static ? 1.0 : -1.0;
 
