@@ -326,6 +326,8 @@ impl Sim {
         lines_on: bool,
         sleep_on: bool,
         fracture_on: bool,
+        substeps: u32,
+        iterations: u32,
     ) -> Result<Self, String> {
         let shared = std::sync::Arc::new(std::sync::Mutex::new(Shared {
             bodies: Vec::new(),
@@ -372,7 +374,7 @@ impl Sim {
                     while acc >= tick && steps < 2 {
                         let prev: Vec<([f64; 3], [f64; 4])> =
                             live.bodies.iter().map(|b| (b.pos, b.quat)).collect();
-                        live.step(tick, 6, 10);
+                        live.step(tick, substeps, iterations);
                         // геометрия новых тел — сразу, чтобы главный поток успел
                         for i in 0..live.bodies.len() {
                             if !live.bodies[i].alive || live.bodies[i].mesh >= 0 {
@@ -457,11 +459,11 @@ impl Sim {
 
     /// Снимок для рисования. В скриптовом режиме (Direct) шагает физику сам
     /// и отдаёт alpha = 1: прогон должен быть воспроизводимым.
-    fn frame(&mut self, tick: f32, scripted: bool) -> SnapOut {
+    fn frame(&mut self, tick: f32, scripted: bool, substeps: u32, iterations: u32) -> SnapOut {
         match self {
             Sim::Direct(l) => {
                 if scripted {
-                    l.step(tick, 10, 18);
+                    l.step(tick, substeps, iterations);
                 }
                 let prev: Vec<([f64; 3], [f64; 4])> = l.bodies.iter().map(|b| (b.pos, b.quat)).collect();
                 let mut pending = Vec::new();
@@ -524,6 +526,10 @@ fn main() {
     // Раскол включён по умолчанию; --no-fracture выключает его для отладки
     // столкновений: с цельной целью видно, останавливает ли контакт снаряд.
     let mut fracture_on = true;
+    // Подшаги и итерации солвера: раньше были жёстко 10 и 18, и на кучу это
+    // ложилось тяжело (6 подпроходов x 18 итераций на такт).
+    let mut substeps_arg: u32 = 10;
+    let mut iterations_arg: u32 = 18;
     let mut shots: Vec<u64> = Vec::new();
     let mut tets_at_start = false;
     let mut it = std::env::args().skip(1);
@@ -534,6 +540,8 @@ fn main() {
             "--tick" => tick_arg = it.next().and_then(|v| v.parse::<f32>().ok()),
             "--no-sleep" => sleep_on = false,
             "--no-fracture" => fracture_on = false,
+            "--substeps" => substeps_arg = it.next().and_then(|v| v.parse().ok()).unwrap_or(10),
+            "--iterations" => iterations_arg = it.next().and_then(|v| v.parse().ok()).unwrap_or(18),
             "--tets" => tets_at_start = true,
             "--shots" => {
                 shots = it
@@ -544,7 +552,7 @@ fn main() {
                     .collect()
             }
             other => {
-                eprintln!("неизвестный аргумент {other}\n  --shaders DIR --frames N --shots 10,40 [--no-sleep] [--no-fracture]");
+                eprintln!("неизвестный аргумент {other}\n  --shaders DIR --frames N --shots 10,40 [--no-sleep] [--no-fracture] [--substeps N] [--iterations N]");
                 std::process::exit(2);
             }
         }
@@ -577,7 +585,7 @@ fn main() {
     let mut sim = if max_frames > 0 {
         Sim::direct(Live::new(&shaders), tets_at_start, sleep_on, fracture_on)
     } else {
-        match Sim::threaded(&shaders, tick, tets_at_start, sleep_on, fracture_on) {
+        match Sim::threaded(&shaders, tick, tets_at_start, sleep_on, fracture_on, substeps_arg, iterations_arg) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("физика не запустилась: {e}");
@@ -714,7 +722,7 @@ fn main() {
 
         // Кадр: физика к этому моменту уже посчитана в своём потоке
         // (или шагнула здесь, если режим скриптовый).
-        let out = sim.frame(tick, max_frames > 0);
+        let out = sim.frame(tick, max_frames > 0, substeps_arg, iterations_arg);
 
         // новые формы (появились осколки) — залить в окно
         for (id, m) in out.pending.iter() {
