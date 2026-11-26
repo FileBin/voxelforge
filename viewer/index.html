@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>voxelforge · 3D (WebGPU)</title>
+<title>voxelforge · 3D (WebGL2)</title>
 <style>
   :root { color-scheme: dark; }
   html, body { margin: 0; height: 100%; background: #0b0f14; color: #cfd8e3;
@@ -51,16 +51,14 @@
 <script type="module">
 "use strict";
 
+/* Вьюер на WebGL2, а не на WebGPU: WebGPU в Firefox падает на ровном месте
+ * (краш драйвера/композитора на части конфигураций), а WebGL2 есть везде и
+ * для десятков тысяч инстансов его хватает с запасом. */
+
 const $ = (id) => document.getElementById(id);
 const cv = $("cv");
 
 let sim = null, play = true, frame = 0, speed = 60, acc = 0, last = 0;
-
-let device = null, gpuCtx = null, canvasFormat = "bgra8unorm";
-let pipeSphere = null, pipeBlock = null, bgl = null;
-let ubo = null, bufPos = null, bufScale = null, bufIdxS = null, bufIdxB = null;
-let vgS = null, vgB = null, vtxS = 0, vtxB = 0, cntS = 0, cntB = 0;
-let bgS = null, bgB = null, depthTex = null;
 
 /* ---------------- .vfr ---------------- */
 function parseVFR(buf) {
@@ -77,9 +75,9 @@ function parseVFR(buf) {
       const shape = dv.getUint8(off); off += 1;
       const hx = dv.getFloat32(off, true), hy = dv.getFloat32(off + 4, true), hz = dv.getFloat32(off + 8, true);
       off += 12;
-      scale.push([r, hx, hy, hz]); shapes.push(shape);
+      scale.push([hx, hy, hz]); shapes.push(shape);
     } else {
-      scale.push([r, r, r, r]); shapes.push(0);
+      scale.push([r, r, r]); shapes.push(0);
     }
   }
   const pos = new Float32Array(n * nf * 3);
@@ -98,10 +96,11 @@ function loadFile(file) {
     sim = parseVFR(buf);
     frame = 0; acc = 0;
     $("frame").max = String(sim.nf - 1); $("frame").value = "0";
+    $("pos").textContent = `1 / ${sim.nf}`;
     $("msg").style.display = "none";
     $("meta").textContent = `${file.name} · тел ${sim.n} · кадров ${sim.nf}`;
     fitCamera();
-    upload();
+    buildInstances();
   }).catch((e) => {
     $("msg").style.display = "grid";
     $("msg").innerHTML = `<b>ошибка чтения</b><span>${e.message}</span>`;
@@ -114,7 +113,7 @@ function fitCamera() {
   const { lo, hi } = sim;
   cam.target = [(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2];
   const ext = Math.max(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2], 0.5);
-  cam.dist = ext * 1.5;
+  cam.dist = ext * 1.6;
   cam.pitch = 0.35; cam.yaw = 0.6;
 }
 function eyePos() {
@@ -155,253 +154,309 @@ function mul(a, b) {                            // a * b, column-major
   return o;
 }
 
-/* ---------------- меши ---------------- */
+/* ---------------- WebGL2 ---------------- */
+const gl = cv.getContext("webgl2", { antialias: true, alpha: false, depth: true });
+let prog = null, progGrid = null, uVP = null, uEye = null, loc = {};
+let meshSphere = null, meshBox = null, meshPlane = null;
+let instSphere = null, instBox = null;
+
+const VS = `#version 300 es
+precision highp float;
+in vec3 aPos;
+in vec3 aNrm;
+in vec3 iPos;
+in vec3 iScale;
+uniform mat4 uVP;
+out vec3 vN;
+out vec3 vW;
+void main() {
+  vW = aPos * iScale + iPos;
+  vN = aNrm;                     /* оси-выровненные коробки: масштаб не меняет нормаль */
+  gl_Position = uVP * vec4(vW, 1.0);
+}`;
+
+const FS = `#version 300 es
+precision highp float;
+in vec3 vN;
+in vec3 vW;
+uniform vec3 uEye;
+uniform vec3 uTint;
+out vec4 outColor;
+void main() {
+  vec3 n = normalize(vN);
+  vec3 L = normalize(vec3(0.45, 0.9, 0.35));
+  float diff = max(dot(n, L), 0.0);
+  float sky = 0.5 + 0.5 * n.y;
+  vec3 col = uTint * (0.22 + 0.5 * sky) + uTint * diff * 0.85;
+  vec3 V = normalize(uEye - vW);
+  vec3 H = normalize(L + V);
+  col += vec3(1.0) * pow(max(dot(n, H), 0.0), 48.0) * 0.22;
+  float fog = clamp(1.0 - exp(-length(uEye - vW) * 0.012), 0.0, 0.8);
+  col = mix(col, vec3(0.043, 0.059, 0.078), fog);
+  outColor = vec4(col, 1.0);
+}`;
+
+const VS_GRID = `#version 300 es
+precision highp float;
+in vec3 aPos;
+uniform mat4 uVP;
+out vec2 vXZ;
+void main() {
+  vXZ = aPos.xz;
+  gl_Position = uVP * vec4(aPos, 1.0);
+}`;
+
+const FS_GRID = `#version 300 es
+precision highp float;
+in vec2 vXZ;
+uniform vec3 uEye;
+out vec4 outColor;
+float lineAt(vec2 p, float stepSize) {
+  vec2 g = abs(fract(p / stepSize - 0.5) - 0.5) / fwidth(p / stepSize);
+  return 1.0 - min(min(g.x, g.y), 1.0);
+}
+void main() {
+  float fine = lineAt(vXZ, 0.5) * 0.35;
+  float big = lineAt(vXZ, 2.0) * 0.55;
+  float a = clamp(fine + big, 0.0, 1.0);
+  vec3 col = mix(vec3(0.043, 0.059, 0.078), vec3(0.22, 0.29, 0.36), a);
+  float fog = clamp(1.0 - exp(-length(uEye - vec3(vXZ.x, 0.0, vXZ.y)) * 0.012), 0.0, 0.85);
+  col = mix(col, vec3(0.043, 0.059, 0.078), fog);
+  outColor = vec4(col, 1.0);
+}`;
+
+function compile(vsSrc, fsSrc) {
+  const mk = (type, src) => {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+      throw new Error(gl.getShaderInfoLog(s) || "shader");
+    }
+    return s;
+  };
+  const p = gl.createProgram();
+  gl.attachShader(p, mk(gl.VERTEX_SHADER, vsSrc));
+  gl.attachShader(p, mk(gl.FRAGMENT_SHADER, fsSrc));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    throw new Error(gl.getProgramInfoLog(p) || "link");
+  }
+  return p;
+}
+
+function makeMesh(positions, normals, indices) {
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const vb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vb);
+  const data = new Float32Array(positions.length * 6);
+  for (let i = 0; i < positions.length; i++) {
+    data[i * 6 + 0] = positions[i][0];
+    data[i * 6 + 1] = positions[i][1];
+    data[i * 6 + 2] = positions[i][2];
+    data[i * 6 + 3] = normals[i][0];
+    data[i * 6 + 4] = normals[i][1];
+    data[i * 6 + 5] = normals[i][2];
+  }
+  gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(loc.aPos);
+  gl.vertexAttribPointer(loc.aPos, 3, gl.FLOAT, false, 24, 0);
+  gl.enableVertexAttribArray(loc.aNrm);
+  gl.vertexAttribPointer(loc.aNrm, 3, gl.FLOAT, false, 24, 12);
+  const ib = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint32Array(indices), gl.STATIC_DRAW);
+
+  /* Инстансный буфер привязывается прямо в VAO: тогда drawElementsInstanced
+   * сам подхватит атрибуты с divisor = 1. */
+  const inst = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, inst);
+  gl.enableVertexAttribArray(loc.iPos);
+  gl.vertexAttribPointer(loc.iPos, 3, gl.FLOAT, false, 24, 0);
+  gl.vertexAttribDivisor(loc.iPos, 1);
+  gl.enableVertexAttribArray(loc.iScale);
+  gl.vertexAttribPointer(loc.iScale, 3, gl.FLOAT, false, 24, 12);
+  gl.vertexAttribDivisor(loc.iScale, 1);
+  gl.bindVertexArray(null);
+  return { vao, count: indices.length, inst };
+}
+
+function icosphere(subdiv) {
+  const t = (1 + Math.sqrt(5)) / 2;
+  let verts = [
+    [-1, t, 0], [1, t, 0], [-1, -t, 0], [1, -t, 0],
+    [0, -1, t], [0, 1, t], [0, -1, -t], [0, 1, -t],
+    [t, 0, -1], [t, 0, 1], [-t, 0, -1], [-t, 0, 1],
+  ].map(norm);
+  let idx = [
+    0, 11, 5, 0, 5, 1, 0, 1, 7, 0, 7, 10, 0, 10, 11,
+    1, 5, 9, 5, 11, 4, 11, 10, 2, 10, 7, 6, 7, 1, 8,
+    3, 9, 4, 3, 4, 2, 3, 2, 6, 3, 6, 8, 3, 8, 9,
+    4, 9, 5, 2, 4, 11, 6, 2, 10, 8, 6, 7, 9, 8, 1,
+  ];
+  for (let s = 0; s < subdiv; s++) {
+    const mid = new Map();
+    const getMid = (a, b) => {
+      const key = a < b ? a * 100000 + b : b * 100000 + a;
+      if (mid.has(key)) return mid.get(key);
+      const va = verts[a], vb = verts[b];
+      const v = norm([(va[0] + vb[0]) / 2, (va[1] + vb[1]) / 2, (va[2] + vb[2]) / 2]);
+      verts.push(v);
+      mid.set(key, verts.length - 1);
+      return verts.length - 1;
+    };
+    const next = [];
+    for (let i = 0; i < idx.length; i += 3) {
+      const a = idx[i], b = idx[i + 1], c = idx[i + 2];
+      const ab = getMid(a, b), bc = getMid(b, c), ca = getMid(c, a);
+      next.push(a, ab, ca, b, bc, ab, c, ca, bc, ab, bc, ca);
+    }
+    idx = next;
+  }
+  return { positions: verts, normals: verts, indices: idx };
+}
+
 function cubeMesh() {
   const faces = [
-    [[0, 0, 1], [1, 0, 0], [0, 1, 0]], [[0, 0, -1], [-1, 0, 0], [0, 1, 0]],
-    [[1, 0, 0], [0, 0, -1], [0, 1, 0]], [[-1, 0, 0], [0, 0, 1], [0, 1, 0]],
-    [[0, 1, 0], [1, 0, 0], [0, 0, -1]], [[0, -1, 0], [1, 0, 0], [0, 0, 1]],
+    { n: [0, 1, 0], v: [[-1, 1, -1], [1, 1, -1], [1, 1, 1], [-1, 1, 1]] },
+    { n: [0, -1, 0], v: [[-1, -1, 1], [1, -1, 1], [1, -1, -1], [-1, -1, -1]] },
+    { n: [1, 0, 0], v: [[1, -1, 1], [1, 1, 1], [1, 1, -1], [1, -1, -1]] },
+    { n: [-1, 0, 0], v: [[-1, -1, -1], [-1, 1, -1], [-1, 1, 1], [-1, -1, 1]] },
+    { n: [0, 0, 1], v: [[-1, -1, 1], [-1, 1, 1], [1, 1, 1], [1, -1, 1]] },
+    { n: [0, 0, -1], v: [[1, -1, -1], [1, 1, -1], [-1, 1, -1], [-1, -1, -1]] },
   ];
-  const v = [];
-  for (const [n, u, w] of faces) {
-    // Центр грани — это ровно n (нормаль единичной длины). Раньше здесь было
-    // n + u + w, и все шесть квадов съезжали в угол: грани не смыкались,
-    // четыре из них смотрели внутрь и отсекались как изнанка — коробка
-    // выглядела «раскрытой».
-    const c = n;
-    const p = (s1, s2) => [c[0] + s1 * u[0] + s2 * w[0], c[1] + s1 * u[1] + s2 * w[1], c[2] + s1 * u[2] + s2 * w[2]];
-    const a = p(-1, -1), b = p(1, -1), d = p(1, 1), e = p(-1, 1);
-    for (const tri of [[a, b, d], [a, d, e]]) for (const q of tri) v.push(q[0], q[1], q[2], n[0], n[1], n[2]);
-  }
-  return new Float32Array(v);
-}
-function sphereMesh(subdiv) {
-  const t = (1 + Math.sqrt(5)) / 2;
-  let verts = [[-1, t, 0], [1, t, 0], [-1, -t, 0], [1, -t, 0], [0, -1, t], [0, 1, t],
-               [0, -1, -t], [0, 1, -t], [t, 0, -1], [t, 0, 1], [-t, 0, -1], [-t, 0, 1]].map(norm);
-  let faces = [[0, 11, 5], [0, 5, 1], [0, 1, 7], [0, 7, 10], [0, 10, 11], [1, 5, 9], [5, 11, 4],
-               [11, 10, 2], [10, 7, 6], [7, 1, 8], [3, 9, 4], [3, 4, 2], [3, 2, 6], [3, 6, 8],
-               [3, 8, 9], [4, 9, 5], [2, 4, 11], [6, 2, 10], [8, 6, 7], [9, 8, 1]];
-  for (let s = 0; s < subdiv; s++) {
-    const mid = new Map(), nf = [];
-    const m = (a, b) => {
-      const k = a < b ? a + ":" + b : b + ":" + a;
-      if (mid.has(k)) return mid.get(k);
-      const p = norm([(verts[a][0] + verts[b][0]) / 2, (verts[a][1] + verts[b][1]) / 2, (verts[a][2] + verts[b][2]) / 2]);
-      verts.push(p); mid.set(k, verts.length - 1); return verts.length - 1;
-    };
-    for (const [a, b, c] of faces) {
-      const ab = m(a, b), bc = m(b, c), ca = m(c, a);
-      nf.push([a, ab, ca], [b, bc, ab], [c, ca, bc], [ab, bc, ca]);
-    }
-    faces = nf;
-  }
-  const v = [];
-  for (const [a, b, c] of faces) for (const i of [a, b, c]) {
-    const p = verts[i];
-    v.push(p[0], p[1], p[2], p[0], p[1], p[2]);
-  }
-  return new Float32Array(v);
-}
-
-/* ---------------- WGSL ---------------- */
-const WGSL = `
-struct U { vp: mat4x4f, frame: u32, n: u32, pad0: u32, pad1: u32 };
-@group(0) @binding(0) var<uniform> u: U;
-@group(0) @binding(1) var<storage, read> pos: array<f32>;
-@group(0) @binding(2) var<storage, read> sc: array<vec4f>;
-@group(0) @binding(3) var<storage, read> idx: array<u32>;
-
-struct VSOut {
-  @builtin(position) clip: vec4f,
-  @location(0) nrm: vec3f,
-  @location(1) col: vec3f,
-};
-
-fn body_pos(b: u32) -> vec3f {
-  let base = (u.frame * u.n + b) * 3u;
-  return vec3f(pos[base], pos[base + 1u], pos[base + 2u]);
-}
-
-fn body_col(b: u32) -> vec3f {
-  var pal = array<vec3f, 6>(
-    vec3f(0.35, 0.65, 1.00), vec3f(1.00, 0.70, 0.28), vec3f(0.49, 0.88, 0.54),
-    vec3f(1.00, 0.42, 0.54), vec3f(0.77, 0.54, 1.00), vec3f(0.31, 0.84, 0.84));
-  return pal[b % 6u];
-}
-
-@vertex fn vs_sphere(@location(0) p: vec3f, @location(1) n: vec3f,
-                     @builtin(instance_index) ii: u32) -> VSOut {
-  let b = idx[ii];
-  let wp = body_pos(b) + p * sc[b].x;
-  var o: VSOut;
-  o.clip = u.vp * vec4f(wp, 1.0);
-  o.nrm = n;
-  o.col = body_col(b);
-  return o;
-}
-
-@vertex fn vs_block(@location(0) p: vec3f, @location(1) n: vec3f,
-                    @builtin(instance_index) ii: u32) -> VSOut {
-  let b = idx[ii];
-  let h = sc[b].yzw;
-  let wp = body_pos(b) + p * h;
-  var o: VSOut;
-  o.clip = u.vp * vec4f(wp, 1.0);
-  o.nrm = normalize(n / h);
-  o.col = body_col(b);
-  return o;
-}
-
-@fragment fn fs(v: VSOut) -> @location(0) vec4f {
-  let n = normalize(v.nrm);
-  let l1 = normalize(vec3f(0.45, 0.90, 0.35));
-  let l2 = normalize(vec3f(-0.70, 0.25, -0.45));
-  let d = max(dot(n, l1), 0.0) * 0.85 + max(dot(n, l2), 0.0) * 0.22;
-  let base = v.col * (0.30 + d);
-  return vec4f(pow(base, vec3f(0.4545)), 1.0);
-}
-`;
-
-/* ---------------- WebGPU ---------------- */
-async function initGPU() {
-  if (!navigator.gpu) throw new Error("браузер не поддерживает WebGPU");
-  const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
-  if (!adapter) throw new Error("нет адаптера WebGPU");
-  device = await adapter.requestDevice();
-  gpuCtx = cv.getContext("webgpu");
-  canvasFormat = navigator.gpu.getPreferredCanvasFormat();
-  gpuCtx.configure({ device, format: canvasFormat, alphaMode: "opaque" });
-
-  const module = device.createShaderModule({ code: WGSL });
-  bgl = device.createBindGroupLayout({
-    entries: [
-      { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } },
-      { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
-      { binding: 2, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
-      { binding: 3, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
-    ],
+  const positions = [], normals = [], indices = [];
+  faces.forEach((f, fi) => {
+    f.v.forEach((p) => { positions.push(p); normals.push(f.n); });
+    const b = fi * 4;
+    indices.push(b, b + 1, b + 2, b, b + 2, b + 3);
   });
-  const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl] });
-  const mk = (vs) => device.createRenderPipeline({
-    layout,
-    vertex: {
-      module, entryPoint: vs,
-      buffers: [{ arrayStride: 24, attributes: [
-        { shaderLocation: 0, offset: 0, format: "float32x3" },
-        { shaderLocation: 1, offset: 12, format: "float32x3" },
-      ] }],
-    },
-    fragment: { module, entryPoint: "fs", targets: [{ format: canvasFormat }] },
-    primitive: { topology: "triangle-list", cullMode: "back" },
-    depthStencil: { format: "depth24plus", depthWriteEnabled: true, depthCompare: "less" },
-  });
-  pipeSphere = mk("vs_sphere");
-  pipeBlock = mk("vs_block");
-
-  const sv = sphereMesh(2), bv = cubeMesh();
-  vtxS = sv.length / 6; vtxB = bv.length / 6;
-  vgS = device.createBuffer({ size: sv.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
-  device.queue.writeBuffer(vgS, 0, sv);
-  vgB = device.createBuffer({ size: bv.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
-  device.queue.writeBuffer(vgB, 0, bv);
-
-  // 80 байт: mat4 (64) + frame(4) + n(4) + 8 выравнивания
-  ubo = device.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-
-  const name = adapter.info?.description || adapter.info?.vendor || "adapter";
-  $("meta").textContent = "WebGPU · " + name;
-  requestAnimationFrame(loop);
+  return { positions, normals, indices };
 }
 
-function upload() {
-  if (!device || !sim) return;
-  const n = sim.n;
+function initGL() {
+  if (!gl) throw new Error("нет WebGL2 в этом браузере");
+  prog = compile(VS, FS);
+  loc.aPos = gl.getAttribLocation(prog, "aPos");
+  loc.aNrm = gl.getAttribLocation(prog, "aNrm");
+  loc.iPos = gl.getAttribLocation(prog, "iPos");
+  loc.iScale = gl.getAttribLocation(prog, "iScale");
+  uVP = gl.getUniformLocation(prog, "uVP");
+  uEye = gl.getUniformLocation(prog, "uEye");
+  loc.uTint = gl.getUniformLocation(prog, "uTint");
 
-  bufPos = device.createBuffer({ size: sim.pos.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-  device.queue.writeBuffer(bufPos, 0, sim.pos);
-
-  const sc = new Float32Array(n * 4);
-  for (let i = 0; i < n; i++) sc.set(sim.scale[i], i * 4);
-  bufScale = device.createBuffer({ size: sc.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-  device.queue.writeBuffer(bufScale, 0, sc);
-
-  const sIdx = [], bIdx = [];
-  for (let i = 0; i < n; i++) (sim.shapes[i] === 1 ? bIdx : sIdx).push(i);
-  cntS = sIdx.length; cntB = bIdx.length;
-
-  const mkIdx = (arr) => {
-    const size = Math.max(4, arr.length * 4);
-    const b = device.createBuffer({ size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-    if (arr.length) device.queue.writeBuffer(b, 0, new Uint32Array(arr));
-    return b;
+  progGrid = compile(VS_GRID, FS_GRID);
+  const aGrid = gl.getAttribLocation(progGrid, "aPos");
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const vb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vb);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-500, 0, -500, 500, 0, -500, 500, 0, 500, -500, 0, 500]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(aGrid);
+  gl.vertexAttribPointer(aGrid, 3, gl.FLOAT, false, 0, 0);
+  const ib = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint32Array([0, 1, 2, 0, 2, 3]), gl.STATIC_DRAW);
+  gl.bindVertexArray(null);
+  meshPlane = {
+    vao,
+    count: 6,
+    uVP: gl.getUniformLocation(progGrid, "uVP"),
+    uEye: gl.getUniformLocation(progGrid, "uEye"),
   };
-  bufIdxS = mkIdx(sIdx);
-  bufIdxB = mkIdx(bIdx);
 
-  const bind = (idxBuf) => device.createBindGroup({
-    layout: bgl,
-    entries: [
-      { binding: 0, resource: { buffer: ubo } },
-      { binding: 1, resource: { buffer: bufPos } },
-      { binding: 2, resource: { buffer: bufScale } },
-      { binding: 3, resource: { buffer: idxBuf } },
-    ],
-  });
-  bgS = bind(bufIdxS);
-  bgB = bind(bufIdxB);
+  gl.enable(gl.DEPTH_TEST);
+  /* Отсечение задних граней не включаем: при ручной намотке куба и икосферы
+   * ошибка знака сделала бы объекты невидимыми, а проверить это без браузера
+   * нельзя. Глубина и так даёт правильный результат для замкнутых мешей. */
 }
 
-/* ---------------- рендер ---------------- */
+function buildInstances() {
+  if (!sim) return;
+  // Перезагрузка файла не должна копить старые буферы.
+  for (const m of [meshSphere, meshBox]) {
+    if (!m) continue;
+    gl.deleteVertexArray(m.vao);
+    gl.deleteBuffer(m.inst);
+  }
+  const sphere = icosphere(2);
+  meshSphere = makeMesh(sphere.positions, sphere.normals, sphere.indices);
+  const box = cubeMesh();
+  meshBox = makeMesh(box.positions, box.normals, box.indices);
+  render();
+}
+
+function fillInstanceBuffer(mesh, list) {
+  const data = new Float32Array(list.length * 6);
+  for (let i = 0; i < list.length; i++) {
+    data[i * 6 + 0] = list[i][0];
+    data[i * 6 + 1] = list[i][1];
+    data[i * 6 + 2] = list[i][2];
+    data[i * 6 + 3] = list[i][3];
+    data[i * 6 + 4] = list[i][4];
+    data[i * 6 + 5] = list[i][5];
+  }
+  gl.bindBuffer(gl.ARRAY_BUFFER, mesh.inst);
+  gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
+  return list.length;
+}
+
+function drawInstanced(mesh, count, tint) {
+  if (!count) return;
+  gl.uniform3fv(loc.uTint, tint);
+  gl.bindVertexArray(mesh.vao);
+  gl.drawElementsInstanced(gl.TRIANGLES, mesh.count, gl.UNSIGNED_INT, 0, count);
+}
+
+function drawScene() {
+  if (!sim || !meshSphere) return;
+  const base = frame * sim.n * 3;
+  const spheres = [], boxes = [];
+  for (let i = 0; i < sim.n; i++) {
+    const x = sim.pos[base + i * 3], y = sim.pos[base + i * 3 + 1], z = sim.pos[base + i * 3 + 2];
+    const s = sim.scale[i];
+    if (sim.shapes[i] === 1) boxes.push([x, y, z, s[0], s[1], s[2]]);
+    else spheres.push([x, y, z, s[0], s[0], s[0]]);
+  }
+  const nSpheres = fillInstanceBuffer(meshSphere, spheres);
+  const nBoxes = fillInstanceBuffer(meshBox, boxes);
+
+  gl.viewport(0, 0, cv.width, cv.height);
+  gl.clearColor(0.043, 0.059, 0.078, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  const eye = eyePos();
+  const aspect = cv.width / Math.max(1, cv.height);
+  const vp = mul(persp(0.9, aspect, 0.01, 5000), lookAt(eye, cam.target, [0, 1, 0]));
+
+  gl.useProgram(progGrid);
+  gl.uniformMatrix4fv(meshPlane.uVP, false, vp);
+  gl.uniform3fv(meshPlane.uEye, eye);
+  gl.bindVertexArray(meshPlane.vao);
+  gl.drawElements(gl.TRIANGLES, meshPlane.count, gl.UNSIGNED_INT, 0);
+
+  gl.useProgram(prog);
+  gl.uniformMatrix4fv(uVP, false, vp);
+  gl.uniform3fv(uEye, eye);
+  drawInstanced(meshSphere, nSpheres, [0.55, 0.72, 0.92]);
+  drawInstanced(meshBox, nBoxes, [0.95, 0.72, 0.42]);
+  gl.bindVertexArray(null);
+}
+
 function resize() {
-  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
   const w = Math.max(1, Math.floor(cv.clientWidth * dpr));
   const h = Math.max(1, Math.floor(cv.clientHeight * dpr));
-  if (cv.width === w && cv.height === h && depthTex) return;
-  cv.width = w; cv.height = h;
-  depthTex = device.createTexture({
-    size: [w, h], format: "depth24plus", usage: GPUTextureUsage.RENDER_ATTACHMENT,
-  });
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
 }
 
 function render() {
-  if (!device || !sim) return;
   resize();
-  const w = cv.width, h = cv.height;
-
-  const vp = mul(persp(0.9, w / h, 0.02, 20000), lookAt(eyePos(), cam.target, [0, 1, 0]));
-  const ab = new ArrayBuffer(80), f32 = new Float32Array(ab), u32 = new Uint32Array(ab);
-  f32.set(vp, 0); u32[16] = frame; u32[17] = sim.n;
-  device.queue.writeBuffer(ubo, 0, ab);
-
-  const enc = device.createCommandEncoder();
-  const pass = enc.beginRenderPass({
-    colorAttachments: [{
-      view: gpuCtx.getCurrentTexture().createView(),
-      clearValue: { r: 0.043, g: 0.059, b: 0.078, a: 1 },
-      loadOp: "clear", storeOp: "store",
-    }],
-    depthStencilAttachment: {
-      view: depthTex.createView(), depthClearValue: 1,
-      depthLoadOp: "clear", depthStoreOp: "store",
-    },
-  });
-  if (cntB > 0) {
-    pass.setPipeline(pipeBlock);
-    pass.setBindGroup(0, bgB);
-    pass.setVertexBuffer(0, vgB);
-    pass.draw(vtxB, cntB);
-  }
-  if (cntS > 0) {
-    pass.setPipeline(pipeSphere);
-    pass.setBindGroup(0, bgS);
-    pass.setVertexBuffer(0, vgS);
-    pass.draw(vtxS, cntS);
-  }
-  pass.end();
-  device.queue.submit([enc.finish()]);
+  drawScene();
 }
 
+/* ---------------- цикл ---------------- */
 function loop(now) {
   const dt = Math.min(0.1, (now - last) / 1000 || 0);
   last = now;
@@ -448,7 +503,7 @@ cv.addEventListener("wheel", (e) => {
 }, { passive: false });
 window.addEventListener("keydown", (e) => {
   const tag = (e.target && e.target.tagName) || "";
-  if (tag === "INPUT" && e.code !== "Space") return;   // не мешаем полю выбора файла
+  if (tag === "INPUT" && e.code !== "Space") return;
   switch (e.code) {
     case "Space": e.preventDefault(); play = !play; syncPlay(); break;
     case "ArrowLeft": e.preventDefault(); stepFrame(e.shiftKey ? -10 : -1); break;
@@ -493,11 +548,13 @@ if (q) fetch(q).then((r) => r.arrayBuffer()).then((b) => {
 }).catch(() => {});
 
 syncPlay();
-initGPU().catch((e) => {
+try {
+  initGL();
+  requestAnimationFrame(loop);
+} catch (e) {
   $("msg").style.display = "grid";
-  $("msg").innerHTML = `<b>WebGPU недоступен</b><span>${e.message}</span>` +
-    `<span>нужен Chrome/Chromium 113+ или Firefox с включённым WebGPU</span>`;
-});
+  $("msg").innerHTML = `<b>WebGL2 недоступен</b><span>${e.message}</span>`;
+}
 </script>
 </body>
 </html>
