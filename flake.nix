@@ -73,6 +73,7 @@
               echo "  nix run .#pile        D3: куча из 2000 сфер ложится и засыпает"
               echo "  nix run .#gpu         то же на видеокарте (Vulkan compute)"
               echo "  nix run .#mesh        BCC-меш поверхности → demos/out/voxel-*.vfm"
+              echo "  nix run .#fracture    воксельное тело раскалывается на осколки (Вороной)"
               echo "  nix run .#viewer      локальный сервер вьюера (http://localhost:8080)"
               echo "  nix run .#vf-ref -- --scenario stack --bodies 20   прямой доступ к CLI"
               echo "  nix run .#help        эта справка"
@@ -126,6 +127,26 @@
                 exec python3 -m http.server 8080 --directory "$root"
               '';
             }}/bin/voxelforge-viewer";
+          };
+          fracture = {
+            type = "app";
+            program = "${pkgs.writeShellApplication {
+              name = "voxelforge-fracture";
+              runtimeInputs = [ pkgs.mesa pkgs.vulkan-loader ];
+              text = ''
+                out="''${OUT_DIR:-demos/out}"
+                mkdir -p "$out"
+                if [ -z "''${VK_ICD_FILENAMES:-}" ]; then
+                  lvp="$(ls ${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.*.json 2>/dev/null | head -n1)"
+                  [ -n "$lvp" ] && export VK_ICD_FILENAMES="$lvp"
+                fi
+                ${vfref}/bin/vf_fracture \
+                  --shaders ${self.packages.${system}.spirv} \
+                  --out "$out/fracture-voxel.vfx" "$@"
+                echo ""
+                echo "смотреть: nix run .#viewer → перетащить $out/fracture-voxel.vfx"
+              '';
+            }}/bin/voxelforge-fracture";
           };
           mesh = {
             type = "app";

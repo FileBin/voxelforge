@@ -14,6 +14,7 @@
 pub mod contact;
 pub mod gpu;
 pub mod pile;
+pub mod fracture;
 pub mod mesher;
 pub mod voxel;
 pub mod water;

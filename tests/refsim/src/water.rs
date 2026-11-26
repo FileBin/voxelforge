@@ -11,7 +11,7 @@
 //! «ближнее» слагаемое не даёт частицам слипнуться, а коррекция позиционная,
 //! поэтому шаг интегрирования можно держать крупным.
 
-use std::ffi::{c_char, c_void, CStr};
+use std::ffi::c_void;
 use std::path::Path;
 
 use crate::gpu::{check_status, VfDispatch, BODY_WG};
@@ -217,7 +217,7 @@ impl WaterSim {
         }
 
         let mut bufs_keep: Vec<Vec<*mut c_void>> = steps.iter().map(|s| s.bufs.clone()).collect();
-        let mut push_keep: Vec<WPush> = steps.iter().map(|s| s.push).collect();
+        let push_keep: Vec<WPush> = steps.iter().map(|s| s.push).collect();
         let pipes = self.pipes.clone();
         let mut ds: Vec<VfDispatch> = steps
             .iter()

@@ -9,8 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use voxelforge_refsim::gpu::{
-    find_shaders, scene_drop, scene_fracture, scene_pile, scene_stack, scene_voxel_fall, GpuBody,
-    GpuSim, Scene,
+    find_shaders, scene_drop, scene_pile, scene_stack, scene_voxel_fall, GpuBody, GpuSim, Scene,
 };
 use voxelforge_refsim::{pile_demo, ContactSim};
 
@@ -352,48 +351,4 @@ fn gpu_fast_body_does_not_tunnel_voxel() {
         "после удара на 30 м/с шар покоится на {center:.3}, ожидалось ~1.20"
     );
     assert!(gpu.asleep == 1, "шар не успокоился после удара");
-}
-
-/// Разрушение: пре-фрактурированное тело раскалывается от удара.
-///
-/// Проверяем три вещи, которые и означают «раскололось»: осколки разъехались,
-/// масса сохранилась, и всё это успокоилось, не провалившись друг в друга.
-#[test]
-fn gpu_voxel_body_shatters() {
-    let Some((shaders, _)) = setup() else {
-        eprintln!("пропуск: нет SPIR-V или Vulkan-устройства");
-        return;
-    };
-    let sc = scene_fracture();
-    let mass: f64 = sc.cpu.iter().take(8).map(|b| b.mass).sum();
-    let spread0 = {
-        let mut worst = 0.0f32;
-        for i in 0..8 {
-            for j in (i + 1)..8 {
-                let d = ((sc.bodies[i].pos_r[0] - sc.bodies[j].pos_r[0]).powi(2)
-                    + (sc.bodies[i].pos_r[1] - sc.bodies[j].pos_r[1]).powi(2)
-                    + (sc.bodies[i].pos_r[2] - sc.bodies[j].pos_r[2]).powi(2))
-                .sqrt();
-                worst = worst.max(d);
-            }
-        }
-        worst
-    };
-    let gpu = run(sc, 600, 12, &shaders);
-    let spread1 = gpu.spread;
-    eprintln!(
-        "разрушение: разброс {spread0:.2} -> {spread1:.2} м, масса {mass:.1}, pen={:.4}, asleep={}",
-        gpu.pen, gpu.asleep
-    );
-    assert!(
-        spread1 > spread0 * 1.8,
-        "осколки не разлетелись: разброс {spread0:.2} -> {spread1:.2}"
-    );
-    assert!(
-        (mass - 100.0).abs() < 1e-6,
-        "масса осколков изменилась: {mass}"
-    );
-    assert_eq!(gpu.asleep, 9, "не всё успокоилось: спят {}", gpu.asleep);
-    assert!(gpu.pen < 0.02, "осколки провалились друг в друга: {:.4} м", gpu.pen);
-    assert_eq!(gpu.out_of_box, 0, "осколки вылетели из ящика");
 }

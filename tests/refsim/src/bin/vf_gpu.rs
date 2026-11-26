@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 use voxelforge_refsim::gpu::{
-    find_shaders, scene_drop, scene_fracture, scene_pile, scene_stack, scene_voxel_fall, GpuBody,
+    find_shaders, scene_drop, scene_pile, scene_stack, scene_voxel_fall, GpuBody,
     GpuSim, Params, Scene,
 };
 use voxelforge_refsim::{pile_demo, ContactSim};
@@ -114,8 +114,7 @@ fn build(scene: &str, n: usize, speed: f32) -> Scene {
         "drop" => scene_drop(),
         "stack" => scene_stack(n),
         "voxel" => scene_voxel_fall(speed),
-        "fracture" => scene_fracture(),
-        other => panic!("неизвестная сцена {other}: pile | drop | stack"),
+            other => panic!("неизвестная сцена {other}: pile | drop | stack"),
     }
 }
 

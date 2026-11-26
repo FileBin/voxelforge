@@ -161,53 +161,6 @@ pub fn scene_drop() -> Scene {
     }
 }
 
-/// Разрушение: воксельное тело пре-фрактурировано на 8 октантов. Осколки
-/// спят в исходной упаковке, пока в них не врежется тяжёлый шар; после удара
-/// они просыпаются и разлетаются.
-pub fn scene_fracture() -> Scene {
-    let center = [0.0f32, 0.5, 0.0];
-    let half = [0.5f32, 0.5, 0.5];
-    let vox = crate::VoxelBody::cube(center, half, 24, 0.05);
-    // Плотность 100 кг/м³: осколок 12.5 кг против снаряда 20 кг — удар
-    // пробивает тело, а не подбрасывает его целиком.
-    let chunks = vox.fracture_octants(center, half, 100.0);
-
-    let mut cpu = Vec::new();
-    for (c, h, m) in &chunks {
-        let mut b = crate::Body::block(
-            [c[0] as f64, c[1] as f64, c[2] as f64],
-            [h[0] as f64, h[1] as f64, h[2] as f64],
-        );
-        b.mass = *m;
-        cpu.push(b);
-    }
-    /* Снаряд бьёт СБОКУ, а не сверху: удар сверху только прижимает куски
-     * друг к другу и к полу — тело остаётся целым, и это физически верно.
-     * Боковой удар разносит осколки в стороны, как и должно при расколе. */
-    let ball = crate::Body::new([-2.5, 0.75, 0.0], [25.0, 0.0, 0.0], 20.0, 0.25);
-    cpu.push(ball);
-
-    let mut bodies: Vec<GpuBody> = cpu.iter().map(GpuBody::from_cpu).collect();
-    // Осколки стартуют спящими: тело ещё целое, пока в него не попали.
-    for b in bodies.iter_mut().take(8) {
-        b.misc[1] = 1.0;
-        b.vel_m[3] = 0.0;
-        b.ang_i[3] = 0.0;
-    }
-
-    // При мягком выталкивании осколки остаются вложенными друг в друга:
-    // удар сминает упаковку быстрее, чем солвер успевает её развести.
-    let mut params = params_for(&bodies, [-3.0, 0.0, -3.0], [3.0, 5.0, 3.0], 0.5);
-    params.max_push = 1.0;
-    Scene {
-        name: "fracture",
-        voxel: None,
-        cpu,
-        bodies,
-        params,
-    }
-}
-
 /// Тело падает на воксельное тело: поле SDF как статический коллайдер.
 pub fn scene_voxel_fall(speed: f32) -> Scene {
     let center = [0.0f32, 0.6, 0.0];

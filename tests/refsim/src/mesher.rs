@@ -225,7 +225,7 @@ pub fn lattice_wireframe(body: &VoxelBody, max_lines: usize) -> (Vec<[f32; 3]>, 
     let origin = body.base.origin;
     let mut verts: Vec<[f32; 3]> = Vec::new();
     let mut idx: Vec<u32> = Vec::new();
-    let mut push_edge = |a: [f32; 3], b: [f32; 3], verts: &mut Vec<[f32; 3]>, idx: &mut Vec<u32>| {
+    let push_edge = |a: [f32; 3], b: [f32; 3], verts: &mut Vec<[f32; 3]>, idx: &mut Vec<u32>| {
         if idx.len() / 2 >= max_lines {
             return;
         }

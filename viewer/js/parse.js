@@ -17,6 +17,7 @@ export function detectFormat(buf) {
   const m = magicOf(buf);
   if (m === "VFR1" || m === "VFR2") return "vfr";
   if (m === "VFM1") return "vfm";
+  if (m === "VFX1") return "vfx";
   return null;
 }
 
@@ -103,4 +104,60 @@ export function parseMesh(buf) {
     }
   }
   return { nv, ni, nl, verts, idx, lines, lo, hi };
+}
+
+/** Раскол воксельного тела:
+ *  `"VFX1" | u32 shards | u32 frames | u32 total_cells | f32 cell |
+ *   по осколку: u32 n, n × (f32 xyz) | кадры: shards × (f32 xyz)`. */
+export function parseFracture(buf) {
+  const dv = new DataView(buf);
+  const magic = magicOf(buf);
+  if (magic !== "VFX1") throw new Error("не VFX1: " + magic);
+  const nShards = dv.getUint32(4, true);
+  const nf = dv.getUint32(8, true);
+  const total = dv.getUint32(12, true);
+  const cell = dv.getFloat32(16, true);
+  let off = 20;
+
+  const offsets = new Float32Array(total * 3);
+  const startIndex = new Uint32Array(nShards);
+  let cursor = 0;
+  for (let s2 = 0; s2 < nShards; s2++) {
+    const n = dv.getUint32(off, true);
+    off += 4;
+    startIndex[s2] = cursor;
+    for (let i = 0; i < n * 3; i++) {
+      offsets[cursor * 3 + i] = dv.getFloat32(off, true);
+      off += 4;
+    }
+    cursor += n;
+  }
+
+  const frames = new Float32Array(nf * nShards * 3);
+  for (let i = 0; i < nf * nShards * 3; i++) {
+    frames[i] = dv.getFloat32(off, true);
+    off += 4;
+  }
+
+  // Габарит: мир = центр осколка на нулевом кадре + локальное смещение ячейки.
+  // Считать по каждому вокселю — единственный способ не промахнуться камерой.
+  const lo = [Infinity, Infinity, Infinity];
+  const hi = [-Infinity, -Infinity, -Infinity];
+  for (let s2 = 0; s2 < nShards; s2++) {
+    const from = startIndex[s2];
+    const to = s2 + 1 < nShards ? startIndex[s2 + 1] : total;
+    const base = s2 * 3;
+    for (let c = from; c < to; c++) {
+      for (let k = 0; k < 3; k++) {
+        const v = frames[base + k] + offsets[c * 3 + k];
+        if (v < lo[k]) lo[k] = v;
+        if (v > hi[k]) hi[k] = v;
+      }
+    }
+  }
+  for (let k = 0; k < 3; k++) {
+    lo[k] -= cell * 0.5;
+    hi[k] += cell * 0.5;
+  }
+  return { nShards, nf, total, cell, offsets, startIndex, frames, lo, hi };
 }

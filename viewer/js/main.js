@@ -12,11 +12,12 @@
 
 import { OrbitCamera, attachControls } from "./camera.js";
 import { createGL } from "./gl.js";
-import { detectFormat, parseTrace, parseMesh } from "./parse.js";
+import { detectFormat, parseTrace, parseMesh, parseFracture } from "./parse.js";
 import { persp, lookAt, mul } from "./mat4.js";
 import { GridRenderer } from "./render-grid.js";
 import { SimRenderer } from "./render-sim.js";
 import { MeshRenderer } from "./render-mesh.js";
+import { FractureRenderer } from "./render-fracture.js";
 import { UI } from "./ui.js";
 
 const canvas = document.getElementById("cv");
@@ -27,6 +28,8 @@ let gl = null;
 let grid = null;
 let simRenderer = null;
 let meshRenderer = null;
+let fractureRenderer = null;
+let fracture = null;
 let trace = null;
 let mesh = null;
 
@@ -56,7 +59,9 @@ function render() {
 
   const { vp, eye } = viewProj();
   grid.draw(vp, eye);
-  if (mesh) {
+  if (fracture) {
+    fractureRenderer.draw(vp, eye, ui.frame);
+  } else if (mesh) {
     meshRenderer.draw(vp, eye);
   } else if (trace) {
     simRenderer.prepare(trace, ui.frame);
@@ -69,8 +74,24 @@ function loadFile(file) {
     const format = detectFormat(buf);
     if (!format) throw new Error("неизвестный формат (ожидался .vfr или .vfm)");
 
+    if (format === "vfx") {
+      trace = null;
+      mesh = null;
+      fracture = parseFracture(buf);
+      fractureRenderer.setData(fracture);
+      cam.fit(fracture.lo, fracture.hi);
+      ui.setTrace(fracture.nf);
+      ui.setMeta(
+        `${file.name} · раскол: ${fracture.nShards} осколков, ${fracture.total} вокселей, кадров ${fracture.nf}`,
+      );
+      ui.hideMessage();
+      render();
+      return;
+    }
+
     if (format === "vfm") {
       trace = null;
+      fracture = null;
       mesh = parseMesh(buf);
       meshRenderer.setMesh(mesh);
       cam.fit(mesh.lo, mesh.hi);
@@ -79,6 +100,7 @@ function loadFile(file) {
       );
     } else {
       mesh = null;
+      fracture = null;
       trace = parseTrace(buf);
       cam.fit(trace.lo, trace.hi);
       ui.setTrace(trace.nf);
@@ -103,6 +125,7 @@ try {
   grid = new GridRenderer(gl);
   simRenderer = new SimRenderer(gl);
   meshRenderer = new MeshRenderer(gl);
+  fractureRenderer = new FractureRenderer(gl);
   attachControls(canvas, cam);
 
   document.getElementById("lattice").addEventListener("change", (e) => {
