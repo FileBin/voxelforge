@@ -133,7 +133,7 @@ impl Live {
             hi: [8.0, 10.0, 8.0],
             cell: 0.30,
             friction: 0.45,
-            max_push: 0.35,
+            max_push: 0.22,
             ..Params::default()
         };
 
@@ -345,6 +345,10 @@ impl Live {
             }
             for a in 0..3 {
                 self.mirror[i].pos_r[a] += delta[i][a];
+                // Якорь сна сдвигаем вместе с телом: иначе GPU видит «прыжок»
+                // каждый кадр, таймер покоя сбрасывается и осколки дрожат
+                // вечно вместо того, чтобы уснуть.
+                self.mirror[i].anchor[a] += delta[i][a];
             }
         }
         self.gpu.write_bodies(&self.mirror);
