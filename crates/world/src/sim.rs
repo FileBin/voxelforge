@@ -440,6 +440,99 @@ impl GpuSim {
         }
     }
 
+    /// Такт целиком на GPU: контакты считает `sat.comp` по парам, которые CPU
+    /// залил один раз. Всё уходит ОДНИМ командным буфером, CPU читает тела
+    /// один раз в конце — это и есть «убрать синхронизации».
+    pub fn frame_gpu_contacts(&mut self, dt: f32, substeps: u32, iterations: u32) {
+        let h = dt / substeps as f32;
+        let g_body = ((self.n as u32) + WG - 1) / WG;
+        let g_pairs = ((self.n_pairs as u32) + WG - 1) / WG;
+        let g_cnt = ((self.n as u32) + WG - 1) / WG;
+        let push = self.push(h, g_cnt);
+
+        let mut steps: Vec<Step> = Vec::new();
+        let (a, b) = (self.bodies[0], self.bodies[1]);
+
+        for _ in 0..substeps {
+            steps.push(Step {
+                pipe: P_INTEGRATE,
+                bufs: vec![a],
+                push,
+                groups: [g_body, 1, 1],
+            });
+            // счётчики контактов обнуляем на устройстве, без заливки с CPU
+            steps.push(Step {
+                pipe: P_CLEAR,
+                bufs: vec![self.lcount, self.cellcnt],
+                push,
+                groups: [g_cnt, 1, 1],
+            });
+            steps.push(Step {
+                pipe: P_STATIC,
+                bufs: vec![a, self.list, self.lcount],
+                push,
+                groups: [g_body, 1, 1],
+            });
+            steps.push(Step {
+                pipe: P_SAT,
+                bufs: vec![a, self.tets, self.span, self.pairs, self.list, self.lcount],
+                push,
+                groups: [g_pairs.max(1), 1, 1],
+            });
+            for it in 0..iterations {
+                let (src, dst) = if it % 2 == 0 { (a, b) } else { (b, a) };
+                steps.push(Step {
+                    pipe: P_SOLVE_CONTACTS,
+                    bufs: vec![src, self.list, self.lcount, self.imp],
+                    push,
+                    groups: [((self.n * CAP) as u32 + WG - 1) / WG, 1, 1],
+                });
+                steps.push(Step {
+                    pipe: P_SOLVE_APPLY,
+                    bufs: vec![src, self.lcount, self.imp, dst],
+                    push,
+                    groups: [g_body, 1, 1],
+                });
+            }
+            steps.push(Step {
+                pipe: P_POS,
+                bufs: vec![a],
+                push,
+                groups: [g_body, 1, 1],
+            });
+        }
+        if !self.skip_sleep {
+            steps.push(Step {
+                pipe: P_SLEEP,
+                bufs: vec![a],
+                push,
+                groups: [g_body, 1, 1],
+            });
+        }
+
+        let mut keep: Vec<Vec<*mut c_void>> = steps.iter().map(|s| s.bufs.clone()).collect();
+        let push_keep: Vec<Push> = steps.iter().map(|s| s.push).collect();
+        let pipes = self.pipes.clone();
+        let mut ds: Vec<VfDispatch> = steps
+            .iter()
+            .enumerate()
+            .map(|(i, s)| VfDispatch {
+                pipeline: pipes[s.pipe],
+                buffers: keep[i].as_mut_ptr(),
+                n_buffers: s.bufs.len() as u32,
+                push: &push_keep[i] as *const Push as *const c_void,
+                push_bytes: 80,
+                groups: s.groups,
+            })
+            .collect();
+        unsafe {
+            check_status(
+                vf_run(self.ctx, ds.as_mut_ptr(), ds.len() as u32),
+                "frame_gpu_contacts",
+            );
+        }
+    }
+
     fn frame_ex(&mut self, dt: f32, substeps: u32, iterations: u32, external_contacts: bool) {
         let h = dt / substeps as f32;
         let g_body = ((self.n as u32) + WG - 1) / WG;

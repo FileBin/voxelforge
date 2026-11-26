@@ -129,6 +129,11 @@ pub struct Live {
     frames: u64,
     /// Живые снаряды в порядке выстрела: их слоты переиспользуются.
     pub bullets: std::collections::VecDeque<usize>,
+    /// Контакты считает GPU (VF_COLLIDE=gpu). Пока сверка SAT не сошлась с
+    /// CPU, по умолчанию выключено: включается флагом окружения.
+    pub gpu_collide: bool,
+    /// Геометрия изменилась (спавн/раскол/сброс) — нужно перезалить пул.
+    geom_dirty: bool,
     /// Сон включён. Выключается флагом --no-sleep для отладки: если тела
     /// никогда не засыпают, сразу видно, кто не может разъехаться.
     pub sleep_enabled: bool,
@@ -204,6 +209,8 @@ impl Live {
             next_id: 1 + (MAX_BODIES as u64),
             frames: 0,
             bullets: std::collections::VecDeque::new(),
+            gpu_collide: std::env::var("VF_COLLIDE").map(|v| v == "gpu").unwrap_or(false),
+            geom_dirty: true,
             sleep_enabled: true,
             bodies: vec![body],
             gpu,
@@ -301,6 +308,49 @@ impl Live {
             self.mirror[s].anchor[1] = p[1] as f32;
             self.mirror[s].anchor[2] = p[2] as f32;
         }
+    }
+
+    /// Такт полностью на GPU: CPU один раз строит пары и заливает их, дальше
+    /// всё считает устройство, а тела читаются один раз в конце.
+    fn step_gpu(&mut self, dt: f32, substeps: u32, iterations: u32) {
+        let shapes: Vec<Vec<[[f32; 3]; 4]>> = self.bodies.iter().map(|b| b.rotated_tets()).collect();
+        let pos: Vec<[f32; 3]> = self
+            .mirror
+            .iter()
+            .map(|b| [b.pos_r[0], b.pos_r[1], b.pos_r[2]])
+            .collect();
+        let pairs = collide::build_pairs(
+            &shapes,
+            &pos,
+            (self.params.lo, self.params.hi),
+            self.params.cell * 0.5,
+        );
+        let packed: Vec<(u32, u32)> = pairs
+            .iter()
+            .take(crate::sim::MAX_PAIRS)
+            .map(|(b1, t1, b2, t2)| ((b1 << 20) | t1, (b2 << 20) | t2))
+            .collect();
+        self.gpu.set_pairs(&packed);
+        if self.geom_dirty {
+            let local: Vec<Vec<[[f32; 3]; 4]>> = self.bodies.iter().map(|b| b.local_tets().clone()).collect();
+            self.gpu.upload_geometry(&local);
+            self.geom_dirty = false;
+        }
+        let chunks = ((substeps as f32) * 0.6).round().max(2.0) as u32;
+        self.gpu.frame_gpu_contacts(dt, chunks, iterations);
+        let snap = self.gpu.read_bodies();
+        for i in 0..self.bodies.len() {
+            if !self.bodies[i].alive {
+                continue;
+            }
+            let g = &snap[i];
+            self.bodies[i].pos = [g.pos_r[0] as f64, g.pos_r[1] as f64, g.pos_r[2] as f64];
+            self.bodies[i].quat = [g.quat[0] as f64, g.quat[1] as f64, g.quat[2] as f64, g.quat[3] as f64];
+            self.bodies[i].vel = [g.vel_m[0] as f64, g.vel_m[1] as f64, g.vel_m[2] as f64];
+        }
+        let n = self.bodies.len();
+        self.mirror[..n].copy_from_slice(&snap[..n]);
+        self.frames += 1;
     }
 
     /// Будит уснувшее тело: возвращает обратную массу и инерцию, которые
@@ -422,6 +472,10 @@ impl Live {
         let per = (substeps / chunks).max(1);
         let sdt = dt / chunks as f32;
 
+        if self.gpu_collide {
+            self.step_gpu(dt, substeps, iterations);
+            return;
+        }
         let timing = std::env::var("VF_TIME").is_ok();
         let (mut t_collide, mut t_dep, mut t_solve, mut t_frac) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
         for _ in 0..chunks {
@@ -841,6 +895,7 @@ impl Live {
             self.settle_new_shards(&new_slots);
             self.gpu.write_bodies(&self.mirror);
             self.bodies[ti].crack_after = self.frames + 30;
+        self.geom_dirty = true;
         }
         if created >= 2 {
             self.cracks += 1;
@@ -922,6 +977,7 @@ impl Live {
             self.bodies.push(body);
         }
         self.gpu.write_bodies(&self.mirror);
+        self.geom_dirty = true;
         // слот мог остаться в очереди от прошлого снаряда — иначе появляются
         // дубликаты и часть снарядов выпадает из пула навсегда
         self.bullets.retain(|&s| s != slot);
