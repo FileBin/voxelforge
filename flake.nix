@@ -26,11 +26,6 @@
         vulkan-loader
         vulkan-tools
         sdl3
-        # виртуальный композитор для headless-прогона живого окна
-        sway
-        grim
-        util-linux
-        gdb
         # CPU-Vulkan (lavapipe) — headless-прогоны и CI, без касания GPU
         mesa
         wayland
@@ -230,6 +225,17 @@
       });
 
       devShells = forAll (system: pkgs: {
+        # Инструменты виртуального композитора — только там, где реально
+        # запускается scripts/headless-run.sh: они тянут GTK и sway, а в CI
+        # это лишние сотни мегабайт.
+        headless = pkgs.mkShell {
+          name = "voxelforge-headless";
+          packages = (toolchain pkgs) ++ [ pkgs.sway pkgs.grim pkgs.util-linux pkgs.gdb ];
+          shellHook = ''
+            echo "voxelforge · headless: скрипт scripts/headless-run.sh, снимок HEADLESS_SHOT=..., отладка HEADLESS_GDB=1"
+          '';
+        };
+
         default = pkgs.mkShell {
           name = "voxelforge";
           packages = toolchain pkgs;

@@ -6,33 +6,61 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Новый пуш в ту же ветку отменяет прошлый прогон — иначе на каждый коммит
+# копится очередь и письма о падении приходят пачкой.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
       # CI идёт через тот же flake.lock, что и локально: версии rustc, glslc
       # и mesa не могут разъехаться между машиной и раннером.
       - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
 
-      - name: unit tests
-        run: nix develop --command cargo test --locked
+      # SPIR-V собирается один раз и переиспользуется всеми шагами: без него
+      # тесты живого раскола и демо мира просто пропускаются.
+      - name: шейдеры
+        run: nix build .#spirv -o /tmp/spv
 
-      - name: "demo gate: D0 орбиты"
+      # --bins обязателен: раньше дальше по шагам ждали target/release/voxelforge,
+      # а предыдущий шаг собирал только vf-ref — отсюда падение «файла нет».
+      - name: сборка (release, все бинари)
         run: |
-          mkdir -p demos/out
-          nix develop --command cargo run --release --locked \
-            -p voxelforge-refsim --bin vf-ref -- \
-            --scenario orbit --frames 1500 --periods 2 --substeps 4 \
-            --json demos/out/orbit.json --out demos/out/orbit.vfr
-
-      - name: "gate: мир на lavapipe"
-        run: |
-          mkdir -p demos/out
           nix develop --command bash -c '
-            nix build .#spirv -o /tmp/spv
-            ./target/release/voxelforge --shaders /tmp/spv \
-              --frames 60 --out demos/out/world.vfw
+            export VF_SHADERS=/tmp/spv
+            cargo build --release --locked --bins
           '
-          test -s demos/out/world.vfw
+
+      - name: тесты
+        run: |
+          nix develop --command bash -c '
+            export VF_SHADERS=/tmp/spv
+            cargo test --release --locked
+          '
+
+      - name: "демо-гейты: орбита и мир на lavapipe"
+        run: |
+          mkdir -p demos/out
+          nix develop --command bash -euo pipefail -c '
+            export VF_SHADERS=/tmp/spv
+            ./target/release/vf-ref --scenario orbit --frames 1500 --periods 2 \
+              --substeps 4 --json demos/out/orbit.json --out demos/out/orbit.vfr
+            ./target/release/voxelforge --shaders /tmp/spv --frames 60 \
+              --out demos/out/world.vfw | tee demos/out/world.log
+            test -s demos/out/world.vfw
+            test -s demos/out/orbit.vfr
+            grep -q "раскалывается на" demos/out/world.log
+          '
+
+      # Живое окно: SDL3-слой и графические конвейеры должны собираться.
+      # Сам прогон под виртуальным композитором (sway + lavapipe) слишком
+      # тяжёл для раннера — он проверяется локально: nix build .#checks...live-headless
+      - name: сборка живого окна
+        run: nix build .#live --no-link
