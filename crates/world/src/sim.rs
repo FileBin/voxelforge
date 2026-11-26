@@ -230,6 +230,8 @@ pub struct GpuSim {
     pub params: Params,
     pub bytes_up: u64,
     pub bytes_down: u64,
+    /// Отключить сон (для отладки: видно всё, что не может разъехаться).
+    pub skip_sleep: bool,
     bodies: [*mut c_void; 2],
     list: *mut c_void,
     imp: *mut c_void,
@@ -362,6 +364,7 @@ impl GpuSim {
             params,
             bytes_up: 0,
             bytes_down: 0,
+            skip_sleep: false,
             bodies: [bodies_a, bodies_b],
             list,
             imp,
@@ -410,8 +413,21 @@ impl GpuSim {
         let mut lc = vec![0u32; self.n];
         let mut list = vec![0u8; self.n * cap * 48];
         for (i, cs) in contacts.iter().enumerate().take(self.n) {
+            /* В плотной куче у тела сотни пересечений, а мест 24. Берём САМЫЕ
+             * ГЛУБОКИЕ, а не первые попавшиеся: иначе разъезжаются случайные
+             * пары, а самые застрявшие места кучу и держат. */
+            let mut idx: Vec<usize> = (0..cs.len()).collect();
+            if cs.len() > cap {
+                idx.sort_unstable_by(|&a, &b| {
+                    cs[b]
+                        .pen
+                        .partial_cmp(&cs[a].pen)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
             lc[i] = cs.len().min(cap) as u32;
-            for (k, c) in cs.iter().take(cap).enumerate() {
+            for (k, &sidx) in idx.iter().take(cap).enumerate() {
+                let c = &cs[sidx];
                 let off = (i * cap + k) * 48;
                 list[off..off + 4].copy_from_slice(&c.other.to_le_bytes());
                 list[off + 4..off + 8].copy_from_slice(&0i32.to_le_bytes());
@@ -536,12 +552,14 @@ impl GpuSim {
                     });
                 }
             }
-            steps.push(Step {
-                pipe: P_SLEEP,
-                bufs: vec![a],
-                push,
-                groups: [g_body, 1, 1],
-            });
+            if !self.skip_sleep {
+                steps.push(Step {
+                    pipe: P_SLEEP,
+                    bufs: vec![a],
+                    push,
+                    groups: [g_body, 1, 1],
+                });
+            }
             steps.push(Step {
                 pipe: P_POS,
                 bufs: vec![a],

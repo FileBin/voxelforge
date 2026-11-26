@@ -312,13 +312,19 @@ fn snap_of(live: &Live, prev: &[([f64; 3], [f64; 4])]) -> Vec<BSnap> {
 }
 
 impl Sim {
-    fn direct(live: Live, lines_on: bool) -> Self {
+    fn direct(live: Live, lines_on: bool, sleep_on: bool) -> Self {
         let mut live = live;
         live.lines_on = lines_on;
+        live.set_sleep(sleep_on);
         Sim::Direct(Box::new(live))
     }
 
-    fn threaded(shaders: &std::path::Path, tick: f32, lines_on: bool) -> Result<Self, String> {
+    fn threaded(
+        shaders: &std::path::Path,
+        tick: f32,
+        lines_on: bool,
+        sleep_on: bool,
+    ) -> Result<Self, String> {
         let shared = std::sync::Arc::new(std::sync::Mutex::new(Shared {
             bodies: Vec::new(),
             pending: Vec::new(),
@@ -338,6 +344,7 @@ impl Sim {
         std::thread::spawn(move || {
             let mut live = Live::new(&shaders);
             live.lines_on = lines_on;
+            live.set_sleep(sleep_on);
             let start = std::time::Instant::now();
             let mut last = std::time::Instant::now();
             let mut acc = 0.0f32;
@@ -510,6 +517,7 @@ fn main() {
     let mut explicit: Option<std::path::PathBuf> = None;
     let mut max_frames: u64 = 0; // 0 — без ограничения
     let mut tick_arg: Option<f32> = None;
+    let mut sleep_on = true;
     let mut shots: Vec<u64> = Vec::new();
     let mut tets_at_start = false;
     let mut it = std::env::args().skip(1);
@@ -518,6 +526,7 @@ fn main() {
             "--shaders" => explicit = it.next().map(Into::into),
             "--frames" => max_frames = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
             "--tick" => tick_arg = it.next().and_then(|v| v.parse::<f32>().ok()),
+            "--no-sleep" => sleep_on = false,
             "--tets" => tets_at_start = true,
             "--shots" => {
                 shots = it
@@ -528,7 +537,7 @@ fn main() {
                     .collect()
             }
             other => {
-                eprintln!("неизвестный аргумент {other}\n  --shaders DIR --frames N --shots 10,40");
+                eprintln!("неизвестный аргумент {other}\n  --shaders DIR --frames N --shots 10,40 [--no-sleep]");
                 std::process::exit(2);
             }
         }
@@ -559,9 +568,9 @@ fn main() {
     // В интерактивном режиме физика уходит в свой поток; в скриптовом
     // (--frames) она остаётся здесь, чтобы прогон был воспроизводимым.
     let mut sim = if max_frames > 0 {
-        Sim::direct(Live::new(&shaders), tets_at_start)
+        Sim::direct(Live::new(&shaders), tets_at_start, sleep_on)
     } else {
-        match Sim::threaded(&shaders, tick, tets_at_start) {
+        match Sim::threaded(&shaders, tick, tets_at_start, sleep_on) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("физика не запустилась: {e}");

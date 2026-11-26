@@ -129,6 +129,9 @@ pub struct Live {
     frames: u64,
     /// Живые снаряды в порядке выстрела: их слоты переиспользуются.
     pub bullets: std::collections::VecDeque<usize>,
+    /// Сон включён. Выключается флагом --no-sleep для отладки: если тела
+    /// никогда не засыпают, сразу видно, кто не может разъехаться.
+    pub sleep_enabled: bool,
     pub params: Params,
     pub cracks: usize,
     pub shards_made: usize,
@@ -152,7 +155,7 @@ impl Live {
             hi: [8.0, 10.0, 8.0],
             cell: 0.30,
             friction: 0.45,
-            max_push: 0.22,
+            max_push: 0.55,
             ..Params::default()
         };
 
@@ -201,6 +204,7 @@ impl Live {
             next_id: 1 + (MAX_BODIES as u64),
             frames: 0,
             bullets: std::collections::VecDeque::new(),
+            sleep_enabled: true,
             bodies: vec![body],
             gpu,
             mirror: gpu_bodies,
@@ -346,6 +350,20 @@ impl Live {
         }
     }
 
+    /// Включить или выключить сон тел.
+    pub fn set_sleep(&mut self, on: bool) {
+        self.sleep_enabled = on;
+        self.gpu.skip_sleep = !on;
+        if !on {
+            for i in 0..self.bodies.len() {
+                if self.bodies[i].alive {
+                    self.wake(i);
+                }
+            }
+            self.gpu.write_bodies(&self.mirror);
+        }
+    }
+
     /// Новый устойчивый id. Слот переиспользуется, id — никогда.
     fn new_id(&mut self) -> u64 {
         let id = self.next_id;
@@ -431,7 +449,15 @@ impl Live {
                 contacts[i].clear();
             }
 
-            if timing { t_collide += t0.elapsed().as_secs_f64(); }
+            if !self.sleep_enabled {
+            // страховка на случай, если проход сна уже успел кого-то усыпить
+            for i in 0..self.bodies.len() {
+                if self.bodies[i].alive && self.mirror[i].misc[1] > 0.5 {
+                    self.wake(i);
+                }
+            }
+        }
+        if timing { t_collide += t0.elapsed().as_secs_f64(); }
             let t1 = std::time::Instant::now();
             self.wake_on_contact(&contacts);
             self.depenetrate(&contacts);
@@ -545,13 +571,22 @@ impl Live {
             if delta[i] == [0.0; 3] {
                 continue;
             }
-            let n = cnt[i].max(1) as f32;
+            /* Раньше деление на число контактов (cnt) давало телу с 24
+             * контактами 1/24 коррекции — в плотной куче разъезд практически
+             * останавливался. Теперь ограничиваем СУММАРНЫЙ сдвиг тела за
+             * кусок: направление сохраняется, шаг не больше 2 см. Так куча
+             * расходится, но тело всё равно не подбрасывает. */
+            let (d0, d1, d2) = (delta[i][0], delta[i][1], delta[i][2]);
+            let len = (d0 * d0 + d1 * d1 + d2 * d2).sqrt();
+            let k = if len > 0.05 { 0.05 / len } else { 1.0 };
+            let n = 1.0f32;
+            let _ = &cnt;
             for a in 0..3 {
-                self.mirror[i].pos_r[a] += delta[i][a] / n;
+                self.mirror[i].pos_r[a] += delta[i][a] * k;
                 // Якорь сна сдвигаем вместе с телом: иначе GPU видит «прыжок»
                 // каждый кадр, таймер покоя сбрасывается и осколки дрожат
                 // вечно вместо того, чтобы уснуть.
-                self.mirror[i].anchor[a] += delta[i][a] / n;
+                self.mirror[i].anchor[a] += delta[i][a] * k;
             }
         }
         self.gpu.write_bodies(&self.mirror);
