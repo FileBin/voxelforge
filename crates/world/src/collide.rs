@@ -145,7 +145,7 @@ pub fn tet_tet(a: &[[f32; 3]; 4], b: &[[f32; 3]; 4]) -> Option<([f32; 3], f32, [
             let eb = sub(b[l], b[k]);
             let c = cross(ea, eb);
             let len2 = dot(c, c);
-            if len2 > 1e-8 {
+            if len2 > 1e-6 {
                 let inv = 1.0 / len2.sqrt();
                 axes[n_axes] = [c[0] * inv, c[1] * inv, c[2] * inv];
                 n_axes += 1;
@@ -243,7 +243,7 @@ pub fn tet_tet_shader_style(a: &[[f32; 3]; 4], b: &[[f32; 3]; 4]) -> Option<([f3
             let eb = sub(b[l], b[k]);
             let c = cross(ea, eb);
             let len2 = dot(c, c);
-            if len2 > 1e-8 {
+            if len2 > 1e-6 {
                 let inv = 1.0 / len2.sqrt();
                 axes[na] = [c[0] * inv, c[1] * inv, c[2] * inv];
                 na += 1;
@@ -292,6 +292,19 @@ pub fn build_pairs(
     walls: ([f32; 3], [f32; 3]),
     cell: f32,
 ) -> Vec<(u32, u32, u32, u32)> {
+    build_pairs_swept(shapes, pos, walls, cell, &vec![[0.0f32; 3]; shapes.len()])
+}
+
+/// То же, но AABB каждого тела растянут на `inflate[i]` (обычно |v|*dt).
+/// Без этого быстрый снаряд за такт пролетает 1.3 м, пары для него не
+/// рождаются вовсе — контакта нет, и он проходит сквозь цель.
+pub fn build_pairs_swept(
+    shapes: &[Vec<[[f32; 3]; 4]>],
+    pos: &[[f32; 3]],
+    walls: ([f32; 3], [f32; 3]),
+    cell: f32,
+    inflate: &[[f32; 3]],
+) -> Vec<(u32, u32, u32, u32)> {
     let pad = 2.0 * cell;
     let origin = [walls.0[0] - pad, walls.0[1] - pad, walls.0[2] - pad];
     let extent = [
@@ -328,6 +341,11 @@ pub fn build_pairs(
                     lo[k] = lo[k].min(w[k]);
                     hi[k] = hi[k].max(w[k]);
                 }
+            }
+            let inf = inflate.get(bi).copied().unwrap_or([0.0; 3]);
+            for k in 0..3 {
+                lo[k] -= inf[k];
+                hi[k] += inf[k];
             }
             for k in 0..3 {
                 blo[bi][k] = blo[bi][k].min(lo[k]);

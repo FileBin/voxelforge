@@ -319,11 +319,25 @@ impl Live {
             .iter()
             .map(|b| [b.pos_r[0], b.pos_r[1], b.pos_r[2]])
             .collect();
-        let pairs = collide::build_pairs(
+        // растягиваем AABB на путь за такт: иначе быстрый снаряд проскакивает
+        let inflate: Vec<[f32; 3]> = self
+            .bodies
+            .iter()
+            .map(|b| {
+                let r = (dt.abs() * 0.5) as f64;
+                [
+                    (b.vel[0].abs() * r) as f32,
+                    (b.vel[1].abs() * r) as f32,
+                    (b.vel[2].abs() * r) as f32,
+                ]
+            })
+            .collect();
+        let pairs = collide::build_pairs_swept(
             &shapes,
             &pos,
             (self.params.lo, self.params.hi),
             self.params.cell * 0.5,
+            &inflate,
         );
         let packed: Vec<(u32, u32)> = pairs
             .iter()
@@ -338,6 +352,11 @@ impl Live {
         }
         let chunks = ((substeps as f32) * 0.6).round().max(2.0) as u32;
         self.gpu.frame_gpu_contacts(dt, chunks, iterations);
+        // Контакты нужны и геймплею: раскол и пробуждение по контакту решаются
+        // на CPU, поэтому читаем их один раз за такт (73 КБ при 64 телах).
+        let contacts = self.gpu.read_contacts();
+        self.wake_on_contact(&contacts);
+        self.fracture(&contacts);
         let snap = self.gpu.read_bodies();
         for i in 0..self.bodies.len() {
             if !self.bodies[i].alive {
