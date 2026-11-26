@@ -9,6 +9,8 @@ use crate::vfw::Shape;
 pub const MAX_BODIES: usize = 64;
 pub const DENSITY: f64 = 420.0;
 pub const MIN_TETS: usize = 20;
+/// Сколько снарядов живёт одновременно; дальше самый старый уходит из мира.
+pub const MAX_BULLETS: usize = 12;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Kind {
@@ -120,6 +122,8 @@ pub struct Live {
     next_id: u64,
     /// Номер текущего кадра.
     frames: u64,
+    /// Живые снаряды в порядке выстрела: их слоты переиспользуются.
+    pub bullets: std::collections::VecDeque<usize>,
     pub params: Params,
     pub cracks: usize,
     pub shards_made: usize,
@@ -191,6 +195,7 @@ impl Live {
         Live {
             next_id: 1 + (MAX_BODIES as u64),
             frames: 0,
+            bullets: std::collections::VecDeque::new(),
             bodies: vec![body],
             gpu,
             mirror: gpu_bodies,
@@ -743,8 +748,40 @@ impl Live {
         }
     }
 
+    /// Убирает тело из мира: паркует его далеко внизу и помечает спящим.
+    /// Слот после этого свободен и его забирает следующий снаряд.
+    fn despawn(&mut self, slot: usize) {
+        if slot >= self.bodies.len() || !self.bodies[slot].alive {
+            return;
+        }
+        self.bodies[slot].alive = false;
+        let parked = Body::new([0.0, -400.0, 0.0], [0.0; 3], 1.0, 0.05);
+        let mut g = GpuBody::from_cpu(&parked);
+        g.misc[1] = 1.0;
+        self.mirror[slot] = g;
+        self.gpu.write_bodies(&self.mirror);
+    }
+
     /// Выстрел из точки from в направлении dir.
     pub fn shoot(&mut self, from: [f64; 3], dir: [f64; 3], speed: f64) -> bool {
+        // Пул снарядов: мёртвые записи выбрасываем, а когда живых набралось
+        // MAX_BULLETS — убираем самый старый из мира и забираем его слот.
+        while let Some(&old) = self.bullets.front() {
+            let stale = old >= self.bodies.len()
+                || !self.bodies[old].alive
+                || self.bodies[old].kind != Kind::Bullet;
+            if stale {
+                self.bullets.pop_front();
+            } else {
+                break;
+            }
+        }
+        while self.bullets.len() >= MAX_BULLETS {
+            match self.bullets.pop_front() {
+                Some(old) => self.despawn(old),
+                None => break,
+            }
+        }
         let Some(slot) = self.free_slot() else { return false };
         // снаряд — гранёный кусок, а не шар
         let ball = TetBody::cube([0.0, 0.0, 0.0], 2, 1);
@@ -779,6 +816,10 @@ impl Live {
             self.bodies.push(body);
         }
         self.gpu.write_bodies(&self.mirror);
+        // слот мог остаться в очереди от прошлого снаряда — иначе появляются
+        // дубликаты и часть снарядов выпадает из пула навсегда
+        self.bullets.retain(|&s| s != slot);
+        self.bullets.push_back(slot);
         self.shots += 1;
         true
     }
