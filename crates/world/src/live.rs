@@ -644,8 +644,16 @@ impl Live {
         // даёт всего ~4 м/с.
         let mut net = [0.0f64; 3];
         for fr in frags.iter() {
-            let c = fr.world_centroid();
-            let d = [c[0] - point[0], c[1] - point[1], c[2] - point[2]];
+            // центроид осколка в координатах РЕШЁТКИ; c — центроид родителя
+            // в тех же координатах, поэтому смещение = разность
+            let fc = fr.world_centroid();
+            let off = rot(tq, [
+                (fc[0] - c[0]) as f64,
+                (fc[1] - c[1]) as f64,
+                (fc[2] - c[2]) as f64,
+            ]);
+            let w = [off[0] + tpos[0], off[1] + tpos[1], off[2] + tpos[2]];
+            let d = [w[0] - point[0] as f64, w[1] - point[1] as f64, w[2] - point[2] as f64];
             let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-3);
             let m = DENSITY * fr.volume();
             for k in 0..3 {
@@ -660,8 +668,15 @@ impl Live {
 
         for (k, fr) in frags.iter().enumerate() {
             let lc = fr.world_centroid();
-            // мировой центр осколка (учитывая поворот тела)
-            let wp = rot(tq, [lc[0] as f64, lc[1] as f64, lc[2] as f64]);
+            // Мировой центр осколка: `lc` — в координатах решётки, `c` — центроид
+            // РОДИТЕЛЯ в тех же координатах (он же и есть tpos). Без вычитания
+            // `c` позиция родителя прибавлялась дважды, и осколки рождались
+            // выше на высоту исходного куба.
+            let wp = rot(tq, [
+                (lc[0] - c[0]) as f64,
+                (lc[1] - c[1]) as f64,
+                (lc[2] - c[2]) as f64,
+            ]);
             let wp = [wp[0] + tpos[0], wp[1] + tpos[1], wp[2] + tpos[2]];
             let d = [wp[0] - point[0] as f64, wp[1] - point[1] as f64, wp[2] - point[2] as f64];
             let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-3);
