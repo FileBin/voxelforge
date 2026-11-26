@@ -675,6 +675,101 @@ impl GpuSim {
     }
 }
 
+/// Мешер на GPU: тот же марширующий тетраэдр, что в CPU-версии, но одним
+/// потоком на ячейку. Возвращает число треугольников и вершины (без сварки —
+/// для отрисовки она не нужна).
+pub fn gpu_mesh(body: &crate::VoxelBody, shader_dir: &Path) -> (usize, Vec<[f32; 3]>) {
+    let mut ctx: *mut c_void = std::ptr::null_mut();
+    unsafe { check_status(vf_init(&mut ctx), "vf_init") };
+
+    let dim = body.base.dim as usize;
+    let cells = (dim - 1) * (dim - 1) * (dim - 1);
+    let cap = cells * 36;
+
+    let mk = |bytes: usize| {
+        let mut b: *mut c_void = std::ptr::null_mut();
+        unsafe { check_status(vf_buffer_new(ctx, bytes, 1, &mut b), "buffer_new") };
+        b
+    };
+    let sdf = mk(body.data.len() * 4);
+    let verts = mk((cap * 16).max(16));
+    let cnt = mk(4);
+    unsafe {
+        check_status(
+            vf_buffer_write(ctx, sdf, 0, body.data.as_ptr() as *const c_void, body.data.len() * 4),
+            "upload sdf",
+        );
+        let zero = [0u8; 4];
+        check_status(vf_buffer_write(ctx, cnt, 0, zero.as_ptr() as *const c_void, 4), "zero cnt");
+    }
+
+    let bytes = std::fs::read(shader_dir.join("mesh.spv")).expect("mesh.spv (соберите glslc)");
+    let mut pipe: *mut c_void = std::ptr::null_mut();
+    let cname = std::ffi::CString::new("mesh").unwrap();
+    unsafe {
+        check_status(
+            vf_pipeline_new(
+                ctx,
+                bytes.as_ptr() as *const u32,
+                bytes.len(),
+                3,
+                80,
+                cname.as_ptr(),
+                &mut pipe,
+            ),
+            "mesh pipeline",
+        )
+    };
+
+    let mut push = [0u8; 80];
+    let put = |buf: &mut [u8], off: usize, v: f32| {
+        buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    };
+    put(&mut push, 0, body.base.cell);
+    put(&mut push, 4, dim as f32);
+    put(&mut push, 8, body.base.offset as f32);
+    put(&mut push, 16, body.base.origin[0]);
+    put(&mut push, 20, body.base.origin[1]);
+    put(&mut push, 24, body.base.origin[2]);
+
+    let mut bufs = [sdf, verts, cnt];
+    let mut d = VfDispatch {
+        pipeline: pipe,
+        buffers: bufs.as_mut_ptr(),
+        n_buffers: 3,
+        push: push.as_ptr() as *const c_void,
+        push_bytes: 80,
+        groups: [((cells as u32) + 63) / 64, 1, 1],
+    };
+    unsafe { check_status(vf_run(ctx, &mut d, 1), "mesh run") };
+
+    let mut count = [0u8; 4];
+    unsafe {
+        check_status(vf_buffer_read(ctx, cnt, 0, count.as_mut_ptr() as *mut c_void, 4), "read cnt")
+    };
+    let n_verts = u32::from_le_bytes(count) as usize;
+    let mut flat = vec![0f32; n_verts * 4];
+    unsafe {
+        check_status(
+            vf_buffer_read(ctx, verts, 0, flat.as_mut_ptr() as *mut c_void, n_verts * 16),
+            "read verts",
+        )
+    };
+    let mut out = Vec::with_capacity(n_verts);
+    for i in 0..n_verts {
+        out.push([flat[i * 4], flat[i * 4 + 1], flat[i * 4 + 2]]);
+    }
+
+    unsafe {
+        vf_pipeline_free(ctx, pipe);
+        for b in bufs {
+            vf_buffer_free(ctx, b);
+        }
+        vf_shutdown(ctx);
+    }
+    (n_verts / 3, out)
+}
+
 impl Drop for GpuSim {
     fn drop(&mut self) {
         unsafe {

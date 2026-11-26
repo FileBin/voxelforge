@@ -1,0 +1,71 @@
+#version 450
+#include "common.glsl"
+
+/* BCC-мешер на GPU: те же марширующие тетраэдры, что в CPU-версии, но по
+ * одному потоку на ячейку и с выдачей вершин в буфер через атомарный счётчик.
+ * Сварка вершин не делается: для отрисовки дубликаты не мешают, а тест
+ * сравнивает меш по габаритам и числу треугольников. */
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) buffer Sdf { float sdf[]; };
+layout(std430, set = 0, binding = 1) buffer Verts { vec4 verts[]; };
+layout(std430, set = 0, binding = 2) buffer Counter { uint tri_count; };
+
+/* push.prm0: ячейка, размер сетки, смещение данных, 0
+ * push.prm1: origin.xyz, 0 */
+
+const int TETS[6][4] = {
+    {0, 1, 3, 7}, {0, 1, 5, 7}, {0, 2, 3, 7},
+    {0, 2, 6, 7}, {0, 4, 5, 7}, {0, 4, 6, 7}
+};
+const int EDGES[6][2] = {{0,1},{0,2},{0,3},{1,2},{1,3},{2,3}};
+
+void emit(vec3 a, vec3 b, vec3 c) {
+    uint base = atomicAdd(tri_count, 3u);
+    verts[base + 0u] = vec4(a, 1.0);
+    verts[base + 1u] = vec4(b, 1.0);
+    verts[base + 2u] = vec4(c, 1.0);
+}
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    int dim = int(pc.prm0.y);
+    int cells = (dim - 1) * (dim - 1) * (dim - 1);
+    if (int(id) >= cells) return;
+
+    int cx = int(id) % (dim - 1);
+    int cy = (int(id) / (dim - 1)) % (dim - 1);
+    int cz = int(id) / ((dim - 1) * (dim - 1));
+
+    float cell = pc.prm0.x;
+    int off = int(pc.prm0.z);
+    vec3 origin = pc.prm1.xyz;
+
+    vec3 corner[8];
+    float val[8];
+    for (int i = 0; i < 8; i++) {
+        int dx = i & 1, dy = (i >> 1) & 1, dz = (i >> 2) & 1;
+        ivec3 g = ivec3(cx + dx, cy + dy, cz + dz);
+        corner[i] = origin + vec3(g) * cell;
+        val[i] = sdf[off + (g.z * dim + g.y) * dim + g.x];
+    }
+
+    for (int t = 0; t < 6; t++) {
+        vec3 pts[4];
+        int n = 0;
+        for (int e = 0; e < 6; e++) {
+            int a = TETS[t][EDGES[e][0]];
+            int b = TETS[t][EDGES[e][1]];
+            if ((val[a] < 0.0) == (val[b] < 0.0)) continue;
+            float k = val[a] / (val[a] - val[b]);
+            pts[n] = mix(corner[a], corner[b], k);
+            n++;
+        }
+        if (n < 3) continue;
+        if (n == 3) {
+            emit(pts[0], pts[1], pts[2]);
+        } else {
+            emit(pts[0], pts[1], pts[2]);
+            emit(pts[0], pts[2], pts[3]);
+        }
+    }
+}

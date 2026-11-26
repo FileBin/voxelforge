@@ -65,3 +65,48 @@ fn refinement_makes_mesh_more_accurate() {
     );
     assert!(ef < ec * 0.75, "уточнение не улучшило меш: {ec:.4} -> {ef:.4}");
 }
+
+/// Мешер на GPU обязан давать ту же поверхность, что CPU-версия: тот же
+/// алгоритм, та же сетка — значит совпадать должны и число треугольников,
+/// и габариты.
+#[test]
+fn gpu_mesher_matches_cpu() {
+    use voxelforge_refsim::gpu::{find_shaders, gpu_mesh};
+    let Some(shaders) = find_shaders(None) else {
+        eprintln!("пропуск: нет SPIR-V");
+        return;
+    };
+    let body = VoxelBody::sphere([0.0, 0.0, 0.0], 0.5, 24, 0.05);
+    let cpu = mesh_isosurface(&body, 0.05);
+    let (tris, verts) = gpu_mesh(&body, &shaders);
+
+    let bb = |it: &mut dyn Iterator<Item = &[f32; 3]>| {
+        let mut lo = [f32::MAX; 3];
+        let mut hi = [f32::MIN; 3];
+        for v in it {
+            for k in 0..3 {
+                lo[k] = lo[k].min(v[k]);
+                hi[k] = hi[k].max(v[k]);
+            }
+        }
+        (lo, hi)
+    };
+    let (clo, chi) = bb(&mut cpu.vertices.iter());
+    let (glo, ghi) = bb(&mut verts.iter());
+    eprintln!(
+        "мешер: CPU {} треуг. {:.2}..{:.2}, GPU {} треуг. {:.2}..{:.2}",
+        cpu.indices.len() / 3,
+        clo[1],
+        chi[1],
+        tris,
+        glo[1],
+        ghi[1]
+    );
+    assert!(tris > 100, "GPU выдал слишком мало треугольников: {tris}");
+    let diff = (tris as f64 - (cpu.indices.len() / 3) as f64).abs() / (cpu.indices.len() as f64 / 3.0);
+    assert!(diff < 0.02, "число треугольников разошлось на {:.1}%", 100.0 * diff);
+    for k in 0..3 {
+        assert!((clo[k] - glo[k]).abs() < 1e-3, "низ габарита {k} разошёлся");
+        assert!((chi[k] - ghi[k]).abs() < 1e-3, "верх габарита {k} разошёлся");
+    }
+}
