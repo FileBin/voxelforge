@@ -20,6 +20,9 @@ pub struct Contact {
     /// Нормаль смотрит ОТ тела К партнёру (как ждёт солвер).
     pub n: [f32; 3],
     pub pen: f32,
+    /// Точка приложения импульса в мире. Без неё солвер берёт плечо как
+    /// `n * half_shape`, и любое тело ведёт себя как сфера в ориджине.
+    pub p: [f32; 3],
 }
 
 fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
@@ -88,7 +91,7 @@ fn project(pts: &[[f32; 3]; 4], axis: [f32; 3]) -> (f32, f32) {
 }
 
 /// SAT двух тетраэдров. Возвращает (нормаль от a к b, глубина) или None.
-pub fn tet_tet(a: &[[f32; 3]; 4], b: &[[f32; 3]; 4]) -> Option<([f32; 3], f32)> {
+pub fn tet_tet(a: &[[f32; 3]; 4], b: &[[f32; 3]; 4]) -> Option<([f32; 3], f32, [f32; 3])> {
     let mut best_axis = [0.0f32; 3];
     let mut best_overlap = f32::MAX;
 
@@ -143,7 +146,31 @@ pub fn tet_tet(a: &[[f32; 3]; 4], b: &[[f32; 3]; 4]) -> Option<([f32; 3], f32)> 
     if best_overlap == f32::MAX {
         return None;
     }
-    Some((best_axis, best_overlap))
+    // Точка контакта: середина между самыми глубокими вершинами обоих
+    // тетраэдров вдоль найденной оси.
+    let n = best_axis;
+    let mut va = a[0];
+    let mut best = dot(a[0], n);
+    for v in a.iter() {
+        if dot(*v, n) > best {
+            best = dot(*v, n);
+            va = *v;
+        }
+    }
+    let mut vb = b[0];
+    let mut worst = dot(b[0], n);
+    for v in b.iter() {
+        if dot(*v, n) < worst {
+            worst = dot(*v, n);
+            vb = *v;
+        }
+    }
+    let p = [
+        0.5 * (va[0] + vb[0]),
+        0.5 * (va[1] + vb[1]),
+        0.5 * (va[2] + vb[2]),
+    ];
+    Some((best_axis, best_overlap, p))
 }
 
 /// Все контакты мира: тетраэдры против тетраэдров других тел, пола и стенок.
@@ -205,7 +232,8 @@ pub fn build(
         world.push(w);
     }
 
-    // пол и стенки: самый глубокий тетраэдр тела задаёт контакт
+    // пол и стенки: пол — до четырёх точек опоры (иначе коробка балансирует
+    // на одной точке и «катится»), стенки — по одной на стенку
     for (bi, w) in world.iter().enumerate() {
         let mut floor_pen = 0.0f32;
         let mut wall_pen = [0.0f32; 4];
@@ -237,12 +265,52 @@ pub fn build(
             }
             println!("    [collide] тело 0: pos y {:.2}, низ тетраэдров {:.2}, floor_pen {:.3}", pos[bi][1], lowest, floor_pen);
         }
-        if floor_pen > 0.0 {
-            out[bi].push(Contact {
-                other: -1,
-                n: [0.0, 1.0, 0.0],
-                pen: floor_pen,
-            });
+        let _ = floor_pen;
+        if std::env::var("VF_DEBUG").is_ok() {
+            let mut lowest = f32::MAX;
+            for t in w { for v in t { lowest = lowest.min(v[1]); } }
+            println!("    [collide] би {bi}: floor_y {floor_y}, низ {lowest:.4}, floor_pen {floor_pen:.4}");
+        }
+        let mut cand: Vec<([f32; 3], f32)> = Vec::new();
+        for t in w {
+            for v in t {
+                if v[1] < floor_y {
+                    cand.push((*v, floor_y - v[1]));
+                }
+            }
+        }
+        if !cand.is_empty() {
+            cand.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let mut chosen: Vec<([f32; 3], f32)> = vec![cand[0]];
+            while chosen.len() < 4 {
+                let mut best: Option<([f32; 3], f32)> = None;
+                let mut best_d = 0.0f32;
+                for (p, d) in &cand {
+                    let mut m = f32::MAX;
+                    for (q, _) in &chosen {
+                        let dx = p[0] - q[0];
+                        let dz = p[2] - q[2];
+                        m = m.min((dx * dx + dz * dz).sqrt());
+                    }
+                    if m > best_d {
+                        best_d = m;
+                        best = Some((*p, *d));
+                    }
+                }
+                // новая опора должна быть заметно в стороне, иначе это та же точка
+                match best {
+                    Some(b) if best_d > 0.03 => chosen.push(b),
+                    _ => break,
+                }
+            }
+            for (p, d) in chosen {
+                out[bi].push(Contact {
+                    other: -1,
+                    n: [0.0, 1.0, 0.0],
+                    pen: d,
+                    p,
+                });
+            }
         }
         let wall_dirs = [
             ([1.0, 0.0, 0.0], 0usize),
@@ -252,10 +320,27 @@ pub fn build(
         ];
         for (n, idx) in wall_dirs {
             if wall_pen[idx] > 0.0 {
+                let mut at = pos[bi];
+                let mut deepest = 0.0f32;
+                for t in w {
+                    for v in t {
+                        let d = match idx {
+                            0 => walls.0[0] - v[0],
+                            1 => v[0] - walls.1[0],
+                            2 => walls.0[2] - v[2],
+                            _ => v[2] - walls.1[2],
+                        };
+                        if d > deepest {
+                            deepest = d;
+                            at = *v;
+                        }
+                    }
+                }
                 out[bi].push(Contact {
                     other: -1,
                     n,
                     pen: wall_pen[idx],
+                    p: at,
                 });
             }
         }
@@ -295,16 +380,18 @@ pub fn build(
                         continue;
                     }
                     pair_checks += 1;
-                if let Some((n, pen)) = tet_tet(&world[b1][t1], &world[b2][t2]) {
+                if let Some((n, pen, pt)) = tet_tet(&world[b1][t1], &world[b2][t2]) {
                         out[b1].push(Contact {
                             other: b2 as i32,
                             n,
                             pen,
+                            p: pt,
                         });
                         out[b2].push(Contact {
                             other: b1 as i32,
                             n: [-n[0], -n[1], -n[2]],
                             pen,
+                            p: pt,
                         });
                     }
                 }
@@ -322,22 +409,49 @@ pub fn build(
     // Агрегация по паре тел: десять тетраэдров одного осколка, вошедших в
     // другой, — это ОДИН контакт, а не десять. Иначе солвер складывает
     // одинаковые импульсы и разносит мир (проверено: скорости до 1e17).
+    if std::env::var("VF_DEBUG").is_ok() {
+        for (bi, list) in out.iter().enumerate() {
+            if list.is_empty() {
+                continue;
+            }
+            println!("    [collide] тело {bi}: сырых контактов {}", list.len());
+            for c in list.iter().take(6) {
+                println!("      other {} pen {:.4} n {:?} p {:?}", c.other, c.pen, c.n, c.p);
+            }
+        }
+    }
     let mut merged: Vec<Vec<Contact>> = vec![Vec::new(); shapes.len()];
     for (bi, list) in out.iter().enumerate() {
-        let mut best: HashMap<i32, Contact> = HashMap::new();
+        let mut by: HashMap<i32, Vec<Contact>> = HashMap::new();
         let mut normal_sum: HashMap<i32, [f32; 3]> = HashMap::new();
         for c in list {
-            let e = best.entry(c.other).or_insert(*c);
-            if c.pen > e.pen {
-                *e = *c;
-            }
+            by.entry(c.other).or_default().push(*c);
             let ns = normal_sum.entry(c.other).or_insert([0.0; 3]);
             for k in 0..3 {
                 ns[k] += c.n[k] * c.pen.max(1e-6);
             }
         }
-        for (other, c) in best {
-            let mut n = c.n;
+        for (other, mut cs) in by {
+            cs.sort_by(|a, b| b.pen.partial_cmp(&a.pen).unwrap_or(std::cmp::Ordering::Equal));
+            // Несколько точек опоры на пару: с одной точкой куб, стоящий на
+            // кубе, опрокидывается, а не лежит. Берём самые глубокие и
+            // разнесённые в пространстве.
+            let mut keep: Vec<Contact> = Vec::new();
+            for c in cs {
+                if keep.len() >= 4 {
+                    break;
+                }
+                let far = keep.iter().all(|k| {
+                    let dx = k.p[0] - c.p[0];
+                    let dy = k.p[1] - c.p[1];
+                    let dz = k.p[2] - c.p[2];
+                    (dx * dx + dy * dy + dz * dz).sqrt() > 0.06
+                });
+                if keep.is_empty() || far {
+                    keep.push(c);
+                }
+            }
+            let mut n = keep.first().map(|c| c.n).unwrap_or([0.0, 1.0, 0.0]);
             if other >= 0 {
                 if let Some(ns) = normal_sum.get(&other) {
                     let l = (ns[0] * ns[0] + ns[1] * ns[1] + ns[2] * ns[2]).sqrt();
@@ -346,7 +460,14 @@ pub fn build(
                     }
                 }
             }
-            merged[bi].push(Contact { other, n, pen: c.pen });
+            for c in keep {
+                merged[bi].push(Contact {
+                    other,
+                    n,
+                    pen: c.pen,
+                    p: c.p,
+                });
+            }
         }
         merged[bi].sort_by(|a, b| b.pen.partial_cmp(&a.pen).unwrap_or(std::cmp::Ordering::Equal));
     }

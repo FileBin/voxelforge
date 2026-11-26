@@ -268,7 +268,7 @@ impl GpuSim {
         let bodies_a = mk(n * BODY_BYTES, true);
         let bodies_b = mk(n * BODY_BYTES, true);
         // host-visible: контакты может заливать и CPU (столкновения по тетраэдрам)
-        let list = mk(n * CAP * 32, true);
+        let list = mk(n * CAP * 48, true);
         let lcount = mk(n * 4, true);
         let cellcnt = mk(ncells as usize * 4, false);
         let starts = mk((ncells as usize + 1) * 4, false);
@@ -373,17 +373,20 @@ impl GpuSim {
     pub fn write_contacts(&mut self, contacts: &[Vec<crate::collide::Contact>]) {
         let cap = 24usize;
         let mut lc = vec![0u32; self.n];
-        let mut list = vec![0u8; self.n * cap * 32];
+        let mut list = vec![0u8; self.n * cap * 48];
         for (i, cs) in contacts.iter().enumerate().take(self.n) {
             lc[i] = cs.len().min(cap) as u32;
             for (k, c) in cs.iter().take(cap).enumerate() {
-                let off = (i * cap + k) * 32;
+                let off = (i * cap + k) * 48;
                 list[off..off + 4].copy_from_slice(&c.other.to_le_bytes());
                 list[off + 4..off + 8].copy_from_slice(&0i32.to_le_bytes());
                 list[off + 8..off + 12].copy_from_slice(&0i32.to_le_bytes());
                 list[off + 12..off + 16].copy_from_slice(&0i32.to_le_bytes());
                 for (j, v) in [c.n[0], c.n[1], c.n[2], c.pen].iter().enumerate() {
                     list[off + 16 + j * 4..off + 20 + j * 4].copy_from_slice(&v.to_le_bytes());
+                }
+                for (j, v) in [c.p[0], c.p[1], c.p[2], 1.0f32].iter().enumerate() {
+                    list[off + 32 + j * 4..off + 36 + j * 4].copy_from_slice(&v.to_le_bytes());
                 }
             }
         }

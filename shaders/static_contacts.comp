@@ -9,12 +9,13 @@ layout(std430, set = 0, binding = 0) buffer Bodies { Body b[]; };
 layout(std430, set = 0, binding = 1) buffer Lists { C list[]; };
 layout(std430, set = 0, binding = 2) buffer ListCount { uint lc[]; };
 
-void push(uint self, vec3 n, float pen) {
+void push(uint self, vec3 n, float pen, vec3 at) {
     uint slot = atomicAdd(lc[self], 1u);
     if (int(slot) >= CAP) return;
     C c;
     c.meta = ivec4(GROUND, 0, 0, 0);
     c.n_pen = vec4(n, pen);
+    c.point = vec4(at, 1.0);
     list[self * CAP + slot] = c;
 }
 
@@ -26,14 +27,14 @@ void main() {
     float m = pc.prm1.z;
 
     float floor_pen = h.y - x.pos_r.y;
-    if (floor_pen > -m) push(i, vec3(0.0, 1.0, 0.0), floor_pen);
+    if (floor_pen > -m) push(i, vec3(0.0, 1.0, 0.0), floor_pen, x.pos_r.xyz - vec3(0.0, h.y, 0.0));
 
     float left = pc.lo.x - (x.pos_r.x - h.x);
-    if (left > -m) push(i, vec3(1.0, 0.0, 0.0), left);
+    if (left > -m) push(i, vec3(1.0, 0.0, 0.0), left, x.pos_r.xyz - vec3(h.x, 0.0, 0.0));
     float right = (x.pos_r.x + h.x) - pc.hi.x;
-    if (right > -m) push(i, vec3(-1.0, 0.0, 0.0), right);
+    if (right > -m) push(i, vec3(-1.0, 0.0, 0.0), right, x.pos_r.xyz + vec3(h.x, 0.0, 0.0));
     float back = pc.lo.z - (x.pos_r.z - h.z);
-    if (back > -m) push(i, vec3(0.0, 0.0, 1.0), back);
+    if (back > -m) push(i, vec3(0.0, 0.0, 1.0), back, x.pos_r.xyz - vec3(0.0, 0.0, h.z));
     float front = (x.pos_r.z + h.z) - pc.hi.z;
-    if (front > -m) push(i, vec3(0.0, 0.0, -1.0), front);
+    if (front > -m) push(i, vec3(0.0, 0.0, -1.0), front, x.pos_r.xyz + vec3(0.0, 0.0, h.z));
 }

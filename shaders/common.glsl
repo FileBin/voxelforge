@@ -32,6 +32,7 @@ struct Body {
 struct C {
     ivec4 meta;   /* x — индекс партнёра, yzw — зарезервировано */
     vec4 n_pen;   /* xyz — нормаль, w — проникновение           */
+    vec4 point;   /* xyz — точка приложения импульса в мире     */
 };
 
 layout(push_constant) uniform Push {

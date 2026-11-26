@@ -53,8 +53,10 @@ void main() {
         float oim = 0.0;
         vec3 o_half = vec3(0.0);
         float oii = 0.0;
+        vec3 opos = vec3(0.0);
         if (j >= 0) {
             Body o = bin[j];
+            opos = o.pos_r.xyz;
             ov = o.vel_m.xyz;
             ow = o.ang_i.xyz;
             oim = o.vel_m.w;
@@ -62,11 +64,13 @@ void main() {
             oii = o.ang_i.w;
         }
 
-        /* Плечо — полуразмер вдоль нормали: у сферы это радиус, у коробки
-         * расстояние до грани. Для оси-выровненных нормалей оно параллельно
-         * нормали, поэтому нормальный импульс вращение не создаёт. */
-        vec3 rself = nrm * half_along(nrm, my_half);
-        vec3 rother = -nrm * half_along(nrm, o_half);
+        /* Плечо — от центра тела до НАСТОЯЩЕЙ точки контакта из SAT.
+         * Раньше здесь стояло n * half_shape, и тело вело себя как сфера
+         * в ориджине: квадратный осколок катился по полу, а снаряд проходил
+         * сквозь края. Точка приходит от CPU, где считается пересечение
+         * тетраэдров. */
+        vec3 rself = c.point.xyz - me.pos_r.xyz;
+        vec3 rother = c.point.xyz - opos;
         bool is_static = (j < 0);
         vec3 vrel = is_static
             ? (v + cross(w, rself))
@@ -108,6 +112,10 @@ void main() {
     v += dv * RELAX;
     w += dw * RELAX;
 
+    if (any(isnan(v)) || any(isnan(w))) {
+        /* отладка: помечаем тело, а не разносим мир молча */
+        me.misc.z = -999.0;
+    }
     me.vel_m = vec4(v, im);
     me.ang_i = vec4(w, ii);
     bout[i] = me;

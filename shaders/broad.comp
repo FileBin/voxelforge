@@ -10,12 +10,13 @@ layout(std430, set = 0, binding = 2) buffer CellBodies { int ids[]; };
 layout(std430, set = 0, binding = 3) buffer Lists { C list[]; };
 layout(std430, set = 0, binding = 4) buffer ListCount { uint lc[]; };
 
-void push(int self, int other, vec3 n, float pen) {
+void push(int self, int other, vec3 n, float pen, vec3 at) {
     uint slot = atomicAdd(lc[self], 1u);
     if (int(slot) >= CAP) return;
     C c;
     c.meta = ivec4(other, 0, 0, 0);
     c.n_pen = vec4(n, pen);
+    c.point = vec4(at, 1.0);
     list[self * CAP + slot] = c;
 }
 
@@ -70,8 +71,8 @@ void main() {
                 o = b[j];
             }
 
-            push(int(i), j, n, pen);
-            push(j, int(i), -n, pen);
+            push(int(i), j, n, pen, b[j].pos_r.xyz + n * half_along(n, b[j].half_shape.xyz));
+            push(j, int(i), -n, pen, b[j].pos_r.xyz + n * half_along(n, b[j].half_shape.xyz));
         }
     }
 }

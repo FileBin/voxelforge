@@ -55,12 +55,13 @@ float field(vec3 p) {
     return sample_grid(vox.base.xyz, vox.base.w, vox.base_h.x, vox.base_h.y, p);
 }
 
-void push(uint self, vec3 n, float pen) {
+void push(uint self, vec3 n, float pen, vec3 at) {
     uint slot = atomicAdd(lc[self], 1u);
     if (int(slot) >= CAP) return;
     C c;
     c.meta = ivec4(GROUND, 0, 0, 0);
     c.n_pen = vec4(n, pen);
+    c.point = vec4(at, 1.0);
     list[self * CAP + slot] = c;
 }
 
@@ -88,5 +89,5 @@ void main() {
     );
     float gl2 = dot(g, g);
     if (gl2 < 1e-12) return;
-    push(i, normalize(g), pen);
+    push(i, normalize(g), pen, p);
 }

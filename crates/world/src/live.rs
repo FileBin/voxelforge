@@ -643,7 +643,27 @@ fn gpu_body(b: &LiveBody) -> GpuBody {
     let mut cpu = Body::new(b.pos, b.vel, b.mass, b.radius);
     cpu.rot = b.quat;
     let mut g = GpuBody::from_cpu(&cpu);
-    // коробка по радиусу: точная форма всё равно считается по тетраэдрам
-    g.half_shape = [b.radius, b.radius, b.radius, 1.0];
+    // Настоящие полуразмеры, а не радиус: солвер берёт по ним плечо для
+    // контактов, которые считает сам GPU. Точка контакта из SAT теперь
+    // приходит отдельно, но габариты всё равно должны быть честными.
+    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+    for t in &b.local {
+        for p in t {
+            for k in 0..3 {
+                lo[k] = lo[k].min(p[k]);
+                hi[k] = hi[k].max(p[k]);
+            }
+        }
+    }
+    let half = if b.local.is_empty() {
+        [b.radius, b.radius, b.radius]
+    } else {
+        [
+            0.5 * (hi[0] - lo[0]),
+            0.5 * (hi[1] - lo[1]),
+            0.5 * (hi[2] - lo[2]),
+        ]
+    };
+    g.half_shape = [half[0], half[1], half[2], 1.0];
     g
 }
