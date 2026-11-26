@@ -212,6 +212,135 @@ pub fn tet_tet(a: &[[f32; 3]; 4], b: &[[f32; 3]; 4]) -> Option<([f32; 3], f32, [
     Some((best_axis, best_overlap, p))
 }
 
+/// Пары тетраэдров, которые вообще стоит проверять SAT.
+///
+/// Та же сетка и та же дедупликация, что в `build`, только без SAT: на GPU
+/// эти пары уходят буфером, и шейдер считает пересечение сам. Если брать пары
+/// иначе (например, полный перебор тел), набор контактов разъедется с CPU.
+pub fn build_pairs(
+    shapes: &[Vec<[[f32; 3]; 4]>],
+    pos: &[[f32; 3]],
+    walls: ([f32; 3], [f32; 3]),
+    cell: f32,
+) -> Vec<(u32, u32, u32, u32)> {
+    let pad = 2.0 * cell;
+    let origin = [walls.0[0] - pad, walls.0[1] - pad, walls.0[2] - pad];
+    let extent = [
+        (walls.1[0] - walls.0[0] + 2.0 * pad).max(cell),
+        (walls.1[1] - walls.0[1] + 2.0 * pad).max(cell),
+        (walls.1[2] - walls.0[2] + 2.0 * pad).max(cell),
+    ];
+    let dim = [
+        ((extent[0] / cell).ceil() as i32 + 1).max(1),
+        ((extent[1] / cell).ceil() as i32 + 1).max(1),
+        ((extent[2] / cell).ceil() as i32 + 1).max(1),
+    ];
+    let n_cells = (dim[0] * dim[1] * dim[2]) as usize;
+    let cell_of = |p: [f32; 3]| -> [i32; 3] {
+        [
+            (((p[0] - origin[0]) / cell).floor() as i32).clamp(0, dim[0] - 1),
+            (((p[1] - origin[1]) / cell).floor() as i32).clamp(0, dim[1] - 1),
+            (((p[2] - origin[2]) / cell).floor() as i32).clamp(0, dim[2] - 1),
+        ]
+    };
+    let idx_of = |c: [i32; 3]| -> usize { ((c[2] * dim[1] + c[1]) * dim[0] + c[0]) as usize };
+
+    let mut counts = vec![0u32; n_cells + 1];
+    let mut ranges: Vec<([i32; 3], [i32; 3], u32, u32)> = Vec::new();
+    let mut blo = vec![[f32::MAX; 3]; shapes.len()];
+    let mut bhi = vec![[f32::MIN; 3]; shapes.len()];
+    for (bi, tets) in shapes.iter().enumerate() {
+        let p = pos[bi];
+        for (ti, t) in tets.iter().enumerate() {
+            let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+            for v in t {
+                let w = [v[0] + p[0], v[1] + p[1], v[2] + p[2]];
+                for k in 0..3 {
+                    lo[k] = lo[k].min(w[k]);
+                    hi[k] = hi[k].max(w[k]);
+                }
+            }
+            for k in 0..3 {
+                blo[bi][k] = blo[bi][k].min(lo[k]);
+                bhi[bi][k] = bhi[bi][k].max(hi[k]);
+            }
+            let (a, b) = (cell_of(lo), cell_of(hi));
+            ranges.push((a, b, bi as u32, ti as u32));
+            for x in a[0]..=b[0] {
+                for y in a[1]..=b[1] {
+                    for z in a[2]..=b[2] {
+                        counts[idx_of([x, y, z]) + 1] += 1;
+                    }
+                }
+            }
+        }
+    }
+    for i in 0..n_cells {
+        counts[i + 1] += counts[i];
+    }
+    let mut slots: Vec<(u32, u32)> = vec![(0, 0); counts[n_cells] as usize];
+    let mut fill = counts.clone();
+    for (a, b, bi, ti) in &ranges {
+        for x in a[0]..=b[0] {
+            for y in a[1]..=b[1] {
+                for z in a[2]..=b[2] {
+                    let c = idx_of([x, y, z]);
+                    slots[fill[c] as usize] = (*bi, *ti);
+                    fill[c] += 1;
+                }
+            }
+        }
+    }
+
+    let mut allow = vec![0u64; shapes.len()];
+    for i in 0..shapes.len() {
+        if blo[i][0] > bhi[i][0] {
+            continue;
+        }
+        for j in (i + 1)..shapes.len() {
+            if blo[j][0] > bhi[j][0] {
+                continue;
+            }
+            let mut hit = true;
+            for k in 0..3 {
+                if blo[i][k] > bhi[j][k] || blo[j][k] > bhi[i][k] {
+                    hit = false;
+                    break;
+                }
+            }
+            if hit {
+                allow[i] |= 1u64 << j;
+                allow[j] |= 1u64 << i;
+            }
+        }
+    }
+
+    let mut pairs: Vec<(u32, u32, u32, u32)> = Vec::new();
+    for c in 0..n_cells {
+        let (a, b) = (counts[c] as usize, counts[c + 1] as usize);
+        if b - a < 2 {
+            continue;
+        }
+        for i in a..b {
+            for j in (i + 1)..b {
+                let (b1, t1) = slots[i];
+                let (b2, t2) = slots[j];
+                if b1 == b2 || allow[b1 as usize] & (1u64 << b2) == 0 {
+                    continue;
+                }
+                if (b1, t1) < (b2, t2) {
+                    pairs.push((b1, t1, b2, t2));
+                } else {
+                    pairs.push((b2, t2, b1, t1));
+                }
+            }
+        }
+    }
+    pairs.sort_unstable();
+    pairs.dedup();
+    pairs
+}
+
 /// Все контакты мира: тетраэдры против тетраэдров других тел, пола и стенок.
 ///
 /// `shapes[i]` — тетраэдры тела `i` в локальных координатах, `pos[i]` — его
