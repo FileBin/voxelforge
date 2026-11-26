@@ -98,7 +98,11 @@ void main() {
         vec3 rb_xt = cross(rother, t);
         float wt = im + oim + dot(ra_xt, ra_xt) * ii + dot(rb_xt, rb_xt) * oii;
         if (wt > 0.0) {
-            float cap = mu * max(dl, 0.0);
+            /* Нижняя граница у трения: у лежащего тела нормальный импульс
+             * почти нулевой, и cap = mu*dl обнулял трение — куб на полу
+             * крутился, не получая сопротивления вращению. Даём трению
+             * минимум, пропорциональный эффективной массе пары. */
+            float cap = mu * max(dl, wn * 0.02);
             float dlt = clamp(-vt / wt, -cap, cap);
             vec3 Pt = t * dlt;
             dv += Pt * (im * sgn);
