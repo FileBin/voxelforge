@@ -18,6 +18,12 @@ pub enum Kind {
 }
 
 pub struct LiveBody {
+    /// Устойчивый идентификатор: слоты переиспользуются, id — нет.
+    pub id: u64,
+    /// До какого кадра тело нельзя раскалывать: свежие осколки толкаются
+    /// друг с другом ещё до того, как улеглись, и раньше это дробило их
+    /// дальше по кругу — плита рассыпалась сама себя.
+    pub crack_after: u64,
     pub pos: [f64; 3],
     pub quat: [f64; 4],
     pub vel: [f64; 3],
@@ -110,6 +116,10 @@ pub struct Live {
     pub bodies: Vec<LiveBody>,
     pub gpu: GpuSim,
     pub mirror: Vec<GpuBody>,
+    /// Следующий свободный идентификатор тела.
+    next_id: u64,
+    /// Номер текущего кадра.
+    frames: u64,
     pub params: Params,
     pub cracks: usize,
     pub shards_made: usize,
@@ -138,6 +148,8 @@ impl Live {
         };
 
         let mut body = LiveBody {
+            id: 1,
+            crack_after: 0,
             pos: [0.0, rest_y as f64, 0.0],
             quat: [1.0, 0.0, 0.0, 0.0],
             vel: [0.0; 3],
@@ -177,6 +189,8 @@ impl Live {
         let gpu = GpuSim::new(gpu_bodies.clone(), shader_dir, params);
 
         Live {
+            next_id: 1 + (MAX_BODIES as u64),
+            frames: 0,
             bodies: vec![body],
             gpu,
             mirror: gpu_bodies,
@@ -191,6 +205,13 @@ impl Live {
         }
     }
 
+    /// Новый устойчивый id. Слот переиспользуется, id — никогда.
+    fn new_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
     pub fn alive_count(&self) -> usize {
         self.bodies.iter().filter(|b| b.alive).count()
     }
@@ -202,6 +223,8 @@ impl Live {
         if self.bodies.len() < MAX_BODIES {
             let _ = Body::new([0.0, -400.0, 0.0], [0.0; 3], 1.0, 0.05);
             self.bodies.push(LiveBody {
+                id: 0,
+                crack_after: 0,
                 pos: [0.0, -400.0, 0.0],
                 quat: [1.0, 0.0, 0.0, 0.0],
                 vel: [0.0; 3],
@@ -222,6 +245,7 @@ impl Live {
     }
 
     pub fn step(&mut self, dt: f32, substeps: u32, iterations: u32) {
+        self.frames += 1;
         // Контакты нельзя снимать один раз на кадр: за 1/60 с снаряд на 26 м/с
         // пролетает 0.43 м — больше тетраэдра, и просто проходит сквозь тело.
         // Дробим кадр так, чтобы самое быстрое тело смещалось не больше
@@ -430,7 +454,7 @@ impl Live {
                 let d = [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
                 let n = [c.n[0] as f64, c.n[1] as f64, c.n[2] as f64];
                 let vrel = (d[0] * n[0] + d[1] * n[1] + d[2] * n[2]).abs();
-                if vrel < 2.0 {
+                if vrel < 8.0 {
                     continue;
                 }
                 // цель — не снаряд: снаряд мелкий и колется только он сам,
@@ -450,9 +474,12 @@ impl Live {
                 if self.bodies[ti].tets.len() < MIN_TETS || self.bodies[ti].kind == Kind::Bullet {
                     continue;
                 }
+                if self.frames < self.bodies[ti].crack_after {
+                    continue;
+                }
                 let mu = 1.0 / (1.0 / self.bodies[ti].mass + 1.0 / self.bodies[oi].mass);
                 let e = 0.5 * mu * vrel * vrel;
-                if e < 250.0 {
+                if e < 1500.0 {
                     continue;
                 }
                 let pi = self.bodies[ti].pos;
@@ -558,7 +585,10 @@ impl Live {
             let slot = if k == 0 { Some(ti) } else { self.free_slot() };
             let Some(slot) = slot else { break };
 
+            let id = self.new_id();
             let mut body = LiveBody {
+                id,
+                crack_after: self.frames + 30,
                 pos: wp,
                 quat: tq,
                 vel: [
@@ -589,8 +619,15 @@ impl Live {
             created += 1;
         }
 
-        if created >= 2 {
+        // Слоты осколков ОБЯЗАНЫ уехать на GPU в этом же кадре: иначе снимок
+        // вернёт в этот слот старое тело, и новый осколок «телепортируется»
+        // на его место (выглядит как пинг). Раньше запись делалась только при
+        // created >= 2, а при нехватке слотов выходило ровно один.
+        if created > 0 {
             self.gpu.write_bodies(&self.mirror);
+            self.bodies[ti].crack_after = self.frames + 30;
+        }
+        if created >= 2 {
             self.cracks += 1;
             self.shards_made += created;
             self.last_log = format!(
@@ -607,7 +644,10 @@ impl Live {
         let Some(slot) = self.free_slot() else { return false };
         // снаряд — гранёный кусок, а не шар
         let ball = TetBody::cube([0.0, 0.0, 0.0], 2, 1);
+        let id = self.new_id();
         let mut body = LiveBody {
+            id,
+            crack_after: 0,
             pos: from,
             quat: [1.0, 0.0, 0.0, 0.0],
             vel: [dir[0] * speed, dir[1] * speed, dir[2] * speed],
