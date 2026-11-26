@@ -244,9 +244,18 @@ fn main() {
     let mut frames = 0u64;
     let mut frame_no = 0u64;
     let mut t0 = std::time::Instant::now();
+    let mut last_frame = std::time::Instant::now();
     let mut last_upload: Vec<usize> = Vec::new();
 
     loop {
+        // Реальная дельта кадра: камера должна идти по времени, а не по
+        // фиксированному 1/60 — иначе на просевшем FPS она двигается медленнее.
+        let frame_dt = {
+            let now = std::time::Instant::now();
+            let d = now.duration_since(last_frame).as_secs_f32();
+            last_frame = now;
+            d.clamp(0.0005, 0.1)
+        };
         let mut input = VfInput::default();
         let alive = unsafe { vf_view_poll(view, &mut input) };
         if alive == 0 {
@@ -281,7 +290,7 @@ fn main() {
         if dirs != [0.0, 0.0, 0.0] {
             let save = cam.speed;
             cam.speed *= boost;
-            cam.move_by(dirs, 1.0 / 60.0);
+            cam.move_by(dirs, frame_dt);
             cam.speed = save;
         }
         if input.lmb_pressed != 0 {
