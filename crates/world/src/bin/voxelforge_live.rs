@@ -193,6 +193,7 @@ fn slerp(a: [f64; 4], b: [f64; 4], t: f64) -> [f64; 4] {
 fn main() {
     let mut explicit: Option<std::path::PathBuf> = None;
     let mut max_frames: u64 = 0; // 0 — без ограничения
+    let mut tick_arg: Option<f32> = None;
     let mut shots: Vec<u64> = Vec::new();
     let mut tets_at_start = false;
     let mut it = std::env::args().skip(1);
@@ -200,6 +201,7 @@ fn main() {
         match a.as_str() {
             "--shaders" => explicit = it.next().map(Into::into),
             "--frames" => max_frames = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+            "--tick" => tick_arg = it.next().and_then(|v| v.parse::<f32>().ok()),
             "--tets" => tets_at_start = true,
             "--shots" => {
                 shots = it
@@ -269,7 +271,10 @@ fn main() {
     let mut last_frame = std::time::Instant::now();
     // Физика идёт своим фиксированным тактом, кадры — своим: рендер
     // интерполирует между двумя последними состояниями симуляции.
-    const TICK: f32 = 1.0 / 60.0;
+    // Такт физики: 20 Гц. Рендер интерполирует между тактами, поэтому
+    // гладкость от этого не страдает, а нагрузка падает втрое.
+    let tick_hz: f32 = tick_arg.unwrap_or(20.0).clamp(5.0, 240.0);
+    let tick: f32 = 1.0 / tick_hz;
     let mut acc = 0.0f32;
     let mut prev_state: Vec<([f64; 3], [f64; 4])> = Vec::new();
     let mut alpha = 1.0f32;
@@ -371,24 +376,31 @@ fn main() {
         // скриптовом режиме (--frames) шаг строго один на кадр — иначе прогон
         // зависел бы от скорости машины и перестал быть воспроизводимым.
         let mut stepped = 0;
-        if max_frames > 0 {
+        // Всё спит — симуляцию не крутим вовсе. Иначе покоящаяся куча
+        // продолжала стоить полный такт каждый кадр, хотя в ней ничего
+        // не меняется (метка сна стоит в misc.y).
+        let any_awake = world.mirror.iter().any(|g| g.misc[1] <= 0.5);
+        if !any_awake {
+            acc = 0.0;
+            alpha = 1.0;
+        } else if max_frames > 0 {
             prev_state.clear();
             prev_state.extend(world.bodies.iter().map(|b| (b.pos, b.quat)));
-            world.step(TICK, 4, 10);
+            world.step(tick, 6, 10);
             stepped = 1;
             acc = 0.0;
         } else {
             acc += frame_dt;
         }
-        while max_frames == 0 && acc >= TICK && stepped < 4 {
+        while max_frames == 0 && acc >= tick && stepped < 4 {
             prev_state.clear();
             prev_state.extend(world.bodies.iter().map(|b| (b.pos, b.quat)));
-            world.step(TICK, 4, 10);
-            acc -= TICK;
+            world.step(tick, 6, 10);
+            acc -= tick;
             stepped += 1;
         }
         // доля между последним и следующим тактом — по ней и рисуем
-        alpha = if stepped > 0 { (acc / TICK).clamp(0.0, 1.0) } else { 1.0 };
+        alpha = if stepped > 0 { (acc / tick).clamp(0.0, 1.0) } else { 1.0 };
         if std::env::var("VF_DEBUG").is_ok() && frame_no < 40 && frame_no % 4 == 0 {
             for (i, b) in world.bodies.iter().enumerate() {
                 if b.alive && i > 0 {

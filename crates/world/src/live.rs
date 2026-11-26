@@ -393,7 +393,9 @@ impl Live {
             .map(|b| (b.vel[0] * b.vel[0] + b.vel[1] * b.vel[1] + b.vel[2] * b.vel[2]).sqrt())
             .fold(0.0f64, f64::max);
         let cell = (self.params.cell * 0.5) as f64;
-        let chunks = ((vmax * dt as f64 / (cell * 0.35)).ceil() as u32).clamp(2, 6);
+        // Потолок кусков выше: на такте 20 Гц быстрый снаряд проходит 1.3 м за
+        // шаг, и при шести кусках он перескакивал мелкие осколки целиком.
+        let chunks = ((vmax * dt as f64 / (cell * 0.35)).ceil() as u32).clamp(2, 12);
         let per = (substeps / chunks).max(1);
         let sdt = dt / chunks as f32;
 
