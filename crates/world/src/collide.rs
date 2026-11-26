@@ -92,6 +92,31 @@ fn project(pts: &[[f32; 3]; 4], axis: [f32; 3]) -> (f32, f32) {
 
 /// SAT двух тетраэдров. Возвращает (нормаль от a к b, глубина) или None.
 pub fn tet_tet(a: &[[f32; 3]; 4], b: &[[f32; 3]; 4]) -> Option<([f32; 3], f32, [f32; 3])> {
+    // Быстрый отсев по AABB: он отбрасывает почти все пары соседей из одной
+    // клетки, тогда как полный SAT — это 44 оси и Vec-аллокация на каждую пару
+    // (57 тысяч пар на чанк стоили 28 мс).
+    let mut alo = [f32::MAX; 3];
+    let mut ahi = [f32::MIN; 3];
+    for v in a {
+        for k in 0..3 {
+            alo[k] = alo[k].min(v[k]);
+            ahi[k] = ahi[k].max(v[k]);
+        }
+    }
+    let mut blo = [f32::MAX; 3];
+    let mut bhi = [f32::MIN; 3];
+    for v in b {
+        for k in 0..3 {
+            blo[k] = blo[k].min(v[k]);
+            bhi[k] = bhi[k].max(v[k]);
+        }
+    }
+    for k in 0..3 {
+        if alo[k] > bhi[k] || blo[k] > ahi[k] {
+            return None;
+        }
+    }
+
     let mut best_axis = [0.0f32; 3];
     let mut best_overlap = f32::MAX;
 
@@ -99,24 +124,48 @@ pub fn tet_tet(a: &[[f32; 3]; 4], b: &[[f32; 3]; 4]) -> Option<([f32; 3], f32, [
     // произведения рёбер. Без последних SAT пропускает разделяющую ось и
     // выдаёт фантомное проникновение (наблюдалось 0.07 м у стоящих рядом
     // осколков).
-    let mut axes: Vec<[f32; 3]> = Vec::with_capacity(8 + 36);
+    // 8 нормалей граней + 36 рёберных осей = 44. Массив на стеке, без Vec:
+    // аллокация на каждую пару обходилась дороже самого SAT.
+    let mut axes = [[0.0f32; 3]; 44];
+    let mut n_axes = 0usize;
     for n in face_normals(a).iter().chain(face_normals(b).iter()) {
-        axes.push(*n);
+        if n_axes == 44 {
+            break;
+        }
+        axes[n_axes] = *n;
+        n_axes += 1;
     }
     const EDGES: [(usize, usize); 6] = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)];
     for (i, j) in EDGES {
         let ea = sub(a[j], a[i]);
         for (k, l) in EDGES {
+            if n_axes == 44 {
+                break;
+            }
             let eb = sub(b[l], b[k]);
             let c = cross(ea, eb);
-            let len = dot(c, c).sqrt();
-            if len > 1e-4 {
-                axes.push([c[0] / len, c[1] / len, c[2] / len]);
+            let len2 = dot(c, c);
+            if len2 > 1e-8 {
+                let inv = 1.0 / len2.sqrt();
+                axes[n_axes] = [c[0] * inv, c[1] * inv, c[2] * inv];
+                n_axes += 1;
             }
         }
     }
 
-    for n in axes.iter() {
+    // центроиды считаем один раз, а не на каждом кандидате оси
+    let ca = [
+        (a[0][0] + a[1][0] + a[2][0] + a[3][0]) * 0.25,
+        (a[0][1] + a[1][1] + a[2][1] + a[3][1]) * 0.25,
+        (a[0][2] + a[1][2] + a[2][2] + a[3][2]) * 0.25,
+    ];
+    let cb = [
+        (b[0][0] + b[1][0] + b[2][0] + b[3][0]) * 0.25,
+        (b[0][1] + b[1][1] + b[2][1] + b[3][1]) * 0.25,
+        (b[0][2] + b[1][2] + b[2][2] + b[3][2]) * 0.25,
+    ];
+
+    for n in axes[..n_axes].iter() {
         let (alo, ahi) = project(a, *n);
         let (blo, bhi) = project(b, *n);
         let overlap = ahi.min(bhi) - alo.max(blo);
@@ -126,16 +175,6 @@ pub fn tet_tet(a: &[[f32; 3]; 4], b: &[[f32; 3]; 4]) -> Option<([f32; 3], f32, [
         if overlap < best_overlap {
             best_overlap = overlap;
             // ось должна смотреть от a к b
-            let ca = [
-                (a[0][0] + a[1][0] + a[2][0] + a[3][0]) * 0.25,
-                (a[0][1] + a[1][1] + a[2][1] + a[3][1]) * 0.25,
-                (a[0][2] + a[1][2] + a[2][2] + a[3][2]) * 0.25,
-            ];
-            let cb = [
-                (b[0][0] + b[1][0] + b[2][0] + b[3][0]) * 0.25,
-                (b[0][1] + b[1][1] + b[2][1] + b[3][1]) * 0.25,
-                (b[0][2] + b[1][2] + b[2][2] + b[3][2]) * 0.25,
-            ];
             best_axis = if dot(sub(cb, ca), *n) < 0.0 {
                 [-n[0], -n[1], -n[2]]
             } else {
@@ -189,14 +228,40 @@ pub fn build(
 
     // мировые тетраэдры и их AABB
     let mut world: Vec<Vec<[[f32; 3]; 4]>> = Vec::with_capacity(shapes.len());
-    let mut grid: HashMap<(i32, i32, i32), Vec<(usize, usize)>> = HashMap::new();
-    let key_of = |p: [f32; 3]| -> (i32, i32, i32) {
-        (
-            (p[0] / cell).floor() as i32,
-            (p[1] / cell).floor() as i32,
-            (p[2] / cell).floor() as i32,
-        )
+
+    // Плоская сетка вместо HashMap: счёт, префиксные суммы, раскладка.
+    // HashMap на каждом тетраэдре (хэш ключа + аллокация Vec на клетку) стоил
+    // дороже самого SAT: на сцене из 22 тел фаза контактов занимала 209 мс.
+    let pad = 2.0 * cell;
+    let origin = [walls.0[0] - pad, walls.0[1] - pad, walls.0[2] - pad];
+    let extent = [
+        (walls.1[0] - walls.0[0] + 2.0 * pad).max(cell),
+        (walls.1[1] - walls.0[1] + 2.0 * pad).max(cell),
+        (walls.1[2] - walls.0[2] + 2.0 * pad).max(cell),
+    ];
+    let dim = [
+        ((extent[0] / cell).ceil() as i32 + 1).max(1),
+        ((extent[1] / cell).ceil() as i32 + 1).max(1),
+        ((extent[2] / cell).ceil() as i32 + 1).max(1),
+    ];
+    let n_cells = (dim[0] * dim[1] * dim[2]) as usize;
+    let cell_of = |p: [f32; 3]| -> [i32; 3] {
+        [
+            (((p[0] - origin[0]) / cell).floor() as i32).clamp(0, dim[0] - 1),
+            (((p[1] - origin[1]) / cell).floor() as i32).clamp(0, dim[1] - 1),
+            (((p[2] - origin[2]) / cell).floor() as i32).clamp(0, dim[2] - 1),
+        ]
     };
+    let idx_of = |c: [i32; 3]| -> usize {
+        ((c[2] * dim[1] + c[1]) * dim[0] + c[0]) as usize
+    };
+
+    let n_bodies = shapes.len();
+    let mut blo = vec![[f32::MAX; 3]; n_bodies];
+    let mut bhi = vec![[f32::MIN; 3]; n_bodies];
+    let mut counts = vec![0u32; n_cells + 1];
+    let mut world: Vec<Vec<[[f32; 3]; 4]>> = Vec::with_capacity(shapes.len());
+    let mut ranges: Vec<([i32; 3], [i32; 3], usize, usize)> = Vec::new();
 
     for (bi, tets) in shapes.iter().enumerate() {
         let p = pos[bi];
@@ -211,25 +276,79 @@ pub fn build(
             })
             .collect();
         for (ti, t) in w.iter().enumerate() {
-            // тетраэдр попадает в клетки своего AABB
-            let mut lo = [f32::MAX; 3];
-            let mut hi = [f32::MIN; 3];
+            let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
             for v in t {
                 for k in 0..3 {
                     lo[k] = lo[k].min(v[k]);
                     hi[k] = hi[k].max(v[k]);
                 }
             }
-            let (a, b) = (key_of(lo), key_of(hi));
-            for x in a.0..=b.0 {
-                for y in a.1..=b.1 {
-                    for z in a.2..=b.2 {
-                        grid.entry((x, y, z)).or_default().push((bi, ti));
+            for k in 0..3 {
+                blo[bi][k] = blo[bi][k].min(lo[k]);
+                bhi[bi][k] = bhi[bi][k].max(hi[k]);
+            }
+            let (a, b) = (cell_of(lo), cell_of(hi));
+            ranges.push((a, b, bi, ti));
+            for x in a[0]..=b[0] {
+                for y in a[1]..=b[1] {
+                    for z in a[2]..=b[2] {
+                        counts[idx_of([x, y, z]) + 1] += 1;
                     }
                 }
             }
         }
         world.push(w);
+    }
+
+    for i in 0..n_cells {
+        counts[i + 1] += counts[i];
+    }
+    let total_entries = counts[n_cells] as usize;
+    let mut slots: Vec<(u32, u32)> = vec![(0, 0); total_entries];
+    let mut fill = counts.clone();
+    for (a, b, bi, ti) in &ranges {
+        for x in a[0]..=b[0] {
+            for y in a[1]..=b[1] {
+                for z in a[2]..=b[2] {
+                    let c = idx_of([x, y, z]);
+                    let at = fill[c] as usize;
+                    slots[at] = (*bi as u32, *ti as u32);
+                    fill[c] += 1;
+                }
+            }
+        }
+    }
+    // Грубый проход по телам: тетраэдры сравниваем только у тел, чьи AABB
+    // вообще перекрываются. Без этого на 22 тела набиралось 57 тысяч пар
+    // тетраэдров, и SAT по ним занимал 28 мс на чанк.
+    let mut allow = vec![0u64; n_bodies];
+    for i in 0..n_bodies {
+        if blo[i][0] > bhi[i][0] {
+            continue;
+        }
+        for j in (i + 1)..n_bodies {
+            if blo[j][0] > bhi[j][0] {
+                continue;
+            }
+            let mut hit = true;
+            for k in 0..3 {
+                if blo[i][k] > bhi[j][k] || blo[j][k] > bhi[i][k] {
+                    hit = false;
+                    break;
+                }
+            }
+            if hit {
+                allow[i] |= 1u64 << j;
+                allow[j] |= 1u64 << i;
+            }
+        }
+    }
+
+    if std::env::var("VF_TIME").is_ok() {
+        println!(
+            "    [collide] сетка {}x{}x{}, записей {}",
+            dim[0], dim[1], dim[2], total_entries
+        );
     }
 
     // пол и стенки: пол — до четырёх точек опоры (иначе коробка балансирует
@@ -348,55 +467,60 @@ pub fn build(
 
     if std::env::var("VF_TIME").is_ok() {
         let total: usize = world.iter().map(|w| w.len()).sum();
-        println!("    [collide] тетраэдров {total}, клеток {}, пар-кандидатов считается", grid.len());
+        println!("    [collide] тетраэдров {total}, записей в сетке {total_entries}");
     }
     let t_pairs = std::time::Instant::now();
     let mut pair_checks = 0usize;
-    // пары тетраэдров из соседних клеток
-    let mut seen: std::collections::HashSet<(usize, usize, usize, usize)> =
-        std::collections::HashSet::new();
-    for list in grid.values() {
-        // сортировка по телу: пары внутри одного тела пропускаются пачкой,
-        // а не перебором
-        let mut l = list.clone();
-        l.sort_by_key(|(b, _)| *b);
-        let mut start = 0;
-        while start < l.len() {
-            let mut end = start;
-            while end < l.len() && l[end].0 == l[start].0 {
-                end += 1;
-            }
-            // тело l[start].0 против всех следующих тел в клетке
-            for i in start..end {
-                for j in (end)..l.len() {
-                    let (ba, ta) = l[i];
-                    let (bb, tb) = l[j];
-                    let (b1, t1, b2, t2) = if ba < bb {
-                        (ba, ta, bb, tb)
-                    } else {
-                        (bb, tb, ba, ta)
-                    };
-                    if !seen.insert((b1, t1, b2, t2)) {
-                        continue;
-                    }
-                    pair_checks += 1;
-                if let Some((n, pen, pt)) = tet_tet(&world[b1][t1], &world[b2][t2]) {
-                        out[b1].push(Contact {
-                            other: b2 as i32,
-                            n,
-                            pen,
-                            p: pt,
-                        });
-                        out[b2].push(Contact {
-                            other: b1 as i32,
-                            n: [-n[0], -n[1], -n[2]],
-                            pen,
-                            p: pt,
-                        });
-                    }
+
+    // Пары тетраэдров из клеток. Раньше каждая пара проверялась HashSet-ом,
+    // и это стоило дороже SAT: вставка с хэшированием на каждую пару-кандидата.
+    // Теперь пары собираются, сортируются и дедуплицируются одним проходом.
+    let mut pairs: Vec<(u32, u32, u32, u32)> = Vec::new();
+    for c in 0..n_cells {
+        let (a, b) = (counts[c] as usize, counts[c + 1] as usize);
+        if b - a < 2 {
+            continue;
+        }
+        for i in a..b {
+            for j in (i + 1)..b {
+                let (b1, t1) = slots[i];
+                let (b2, t2) = slots[j];
+                if b1 == b2 {
+                    continue;
+                }
+                if allow[b1 as usize] & (1u64 << b2) == 0 {
+                    continue;
+                }
+                if (b1, t1) < (b2, t2) {
+                    pairs.push((b1, t1, b2, t2));
+                } else {
+                    pairs.push((b2, t2, b1, t1));
                 }
             }
-            start = end;
+        }
+    }
+    pairs.sort_unstable();
+    pairs.dedup();
+
+    for &(b1, t1, b2, t2) in pairs.iter() {
+        let (b1, t1, b2, t2) = (b1 as usize, t1 as usize, b2 as usize, t2 as usize);
+        if t1 >= world[b1].len() || t2 >= world[b2].len() {
+            continue;
+        }
+        pair_checks += 1;
+        if let Some((n, pen, pt)) = tet_tet(&world[b1][t1], &world[b2][t2]) {
+            out[b1].push(Contact {
+                other: b2 as i32,
+                n,
+                pen,
+                p: pt,
+            });
+            out[b2].push(Contact {
+                other: b1 as i32,
+                n: [-n[0], -n[1], -n[2]],
+                pen,
+                p: pt,
+            });
         }
     }
 
