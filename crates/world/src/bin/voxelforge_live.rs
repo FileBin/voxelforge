@@ -238,6 +238,7 @@ fn main() {
     println!("voxelforge live · WASD полёт (Shift быстрее, Ctrl медленнее, Q/E вниз/вверх), мышь обзор, клик/пробел выстрел, T каркас, R сброс");
 
     let mut prev_lmb = 0;
+    let mut pressed = false;
     let mut press_x = 0.0f32;
     let mut press_y = 0.0f32;
     let mut frames = 0u64;
@@ -250,6 +251,14 @@ fn main() {
         let alive = unsafe { vf_view_poll(view, &mut input) };
         if alive == 0 {
             break;
+        }
+        // Первые кадры окно ещё мапится, и SDL успевает отдать мусорные
+        // события: на первом запуске это читалось как нажатие и давало
+        // выстрел прямо в плиту — она и «улетала вверх». После R всё было
+        // нормально, потому что окно уже отрисовано. Гасим ввод двух первых
+        // кадров целиком.
+        if frames < 2 {
+            input = VfInput::default();
         }
 
         // обзор: любая зажатая кнопка мыши
@@ -278,15 +287,19 @@ fn main() {
         if input.lmb_pressed != 0 {
             press_x = input.mx;
             press_y = input.my;
+            pressed = true;
         }
 
         let mut shoot = false;
+        // Выстрел кликом — только после НАСТОЯЩЕГО нажатия: без этого флага
+        // отпускениe кнопки, которую никто не нажимал, тоже давало выстрел.
         if prev_lmb != 0 && input.lmb == 0 {
             let moved = (input.mx - press_x).abs() + (input.my - press_y).abs();
-            if moved < 6.0 {
+            if pressed && moved < 6.0 {
                 shoot = true;
             }
         }
+        pressed = false;
         prev_lmb = input.lmb;
         if input.key_space != 0 || input.key_f != 0 {
             shoot = true;
