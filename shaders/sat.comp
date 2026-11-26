@@ -109,6 +109,7 @@ void main() {
 
     vec3 best_axis = vec3(0.0);
     float best_overlap = 3.4e38;
+    int best_k = -1;
     for (int k = 0; k < na; k++) {
         vec3 n = axes[k];
         float al, ah, bl, bh;
@@ -119,6 +120,7 @@ void main() {
         if (overlap < best_overlap) {
             best_overlap = overlap;
             best_axis = (dot(cb - ca, n) < 0.0) ? -n : n;
+            best_k = k;
         }
     }
     if (best_overlap == 3.4e38) return;
@@ -140,7 +142,9 @@ void main() {
     vec3 point = 0.5 * (va + vb);
 
     C ca_c;
-    ca_c.meta = ivec4(int(bb), 0, 0, 0);
+    /* y — тетраэдр A в пуле, z — тетраэдр B, w — номер выбранной оси
+     * (для отладки: видно, что именно читает шейдер). */
+    ca_c.meta = ivec4(int(bb), int(ia), int(ib), best_k);
     ca_c.n_pen = vec4(n, best_overlap);
     ca_c.point = vec4(point, 1.0);
     uint sa = atomicAdd(lc[ba], 1u);

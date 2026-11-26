@@ -60,8 +60,12 @@ fn main() {
                 sn[0], sn[1], sn[2], sp, spp[0], spp[1], spp[2]),
             None => println!("ШЕЙДЕР-В-RUST: нет контакта"),
         }
-        println!("GPU: n=[{:.3},{:.3},{:.3}] pen={:.4} p=[{:.3},{:.3},{:.3}]",
-            gc.n[0], gc.n[1], gc.n[2], gc.pen, gc.p[0], gc.p[1], gc.p[2]);
+        let meta = w.gpu.read_contacts_meta();
+        println!("GPU: n=[{:.3},{:.3},{:.3}] pen={:.4} p=[{:.3},{:.3},{:.3}]  meta(ia,ib,ось)={:?}",
+            gc.n[0], gc.n[1], gc.n[2], gc.pen, gc.p[0], gc.p[1], gc.p[2],
+            meta[b1].first().map(|m| (m[1], m[2], m[3])));
+        println!("   ожидалось: ia={} ib={}", (0..b1).map(|x| local[x].len()).sum::<usize>() + t1,
+            (0..b2).map(|x| local[x].len()).sum::<usize>() + t2);
         shown += 1;
         if shown >= 3 { break; }
     }

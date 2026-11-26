@@ -820,6 +820,36 @@ impl GpuSim {
         }
     }
 
+    /// Отладочные поля контакта: (партнёр, ia, ib, номер оси).
+    pub fn read_contacts_meta(&self) -> Vec<Vec<[i32; 4]>> {
+        let mut counts = vec![0u32; self.n];
+        unsafe {
+            check_status(
+                vf_buffer_read(self.ctx, self.lcount, 0, counts.as_mut_ptr() as *mut c_void, self.n * 4),
+                "read_counts",
+            );
+        }
+        let mut raw = vec![0u8; self.n * CAP * 48];
+        unsafe {
+            check_status(
+                vf_buffer_read(self.ctx, self.list, 0, raw.as_mut_ptr() as *mut c_void, raw.len()),
+                "read_list",
+            );
+        }
+        let mut out: Vec<Vec<[i32; 4]>> = vec![Vec::new(); self.n];
+        for b in 0..self.n {
+            for k in 0..(counts[b] as usize).min(CAP) {
+                let off = (b * CAP + k) * 48;
+                let mut m = [0i32; 4];
+                for j in 0..4 {
+                    m[j] = i32::from_le_bytes(raw[off + j * 4..off + j * 4 + 4].try_into().unwrap());
+                }
+                out[b].push(m);
+            }
+        }
+        out
+    }
+
     /// Обратное чтение списков контактов (для сверки).
     pub fn read_contacts(&self) -> Vec<Vec<crate::collide::Contact>> {
         let mut counts = vec![0u32; self.n];
