@@ -27,7 +27,8 @@ fn first_shot_breaks_the_whole_plate() {
     assert_eq!(w.alive_count(), 1, "в начале должен быть один цельный объект");
     assert!(w.bodies[0].tets.len() > 500, "плита — один кусок, а не набор осколков");
 
-    assert!(w.shoot([-4.0, 1.2, 0.0], [1.0, 0.0, 0.0], 26.0));
+    let p = w.bodies[0].pos;
+    assert!(w.shoot([p[0] - 4.0, p[1], p[2]], [1.0, 0.0, 0.0], 26.0));
     for _ in 0..90 {
         w.step(1.0 / 60.0, 4, 10);
     }
@@ -48,7 +49,8 @@ fn first_shot_breaks_the_whole_plate() {
 #[test]
 fn second_shot_breaks_a_shard_again() {
     let Some(mut w) = world() else { return };
-    assert!(w.shoot([-4.0, 1.2, 0.0], [1.0, 0.0, 0.0], 26.0));
+    let p0 = w.bodies[0].pos;
+    assert!(w.shoot([p0[0] - 4.0, p0[1], p0[2]], [1.0, 0.0, 0.0], 26.0));
     for _ in 0..80 {
         w.step(1.0 / 60.0, 4, 10);
     }
