@@ -73,6 +73,7 @@
               echo "  nix run .#pile        D3: куча из 2000 сфер ложится и засыпает"
               echo "  nix run .#gpu         то же на видеокарте (Vulkan compute)"
               echo "  nix run .#mesh        BCC-меш поверхности → demos/out/voxel-*.vfm"
+              echo "  nix run .#viewer      локальный сервер вьюера (http://localhost:8080)"
               echo "  nix run .#vf-ref -- --scenario stack --bodies 20   прямой доступ к CLI"
               echo "  nix run .#help        эта справка"
               echo ""
@@ -107,6 +108,25 @@
             program = "${demo "pile" "pile" "--bodies 2000 --frames 420 --substeps 8 --iterations 8"}/bin/voxelforge-pile";
           };
           vf-ref = { type = "app"; program = "${vfref}/bin/vf-ref"; };
+          viewer = {
+            type = "app";
+            program = "${pkgs.writeShellApplication {
+              name = "voxelforge-viewer";
+              runtimeInputs = [ pkgs.python3 ];
+              text = ''
+                if [ -f viewer/index.html ]; then
+                  root="$(pwd)"
+                  echo "вьюер: http://localhost:8080/viewer/index.html"
+                  echo "меш:   http://localhost:8080/viewer/index.html?file=../demos/out/voxel-sphere.vfm"
+                else
+                  root="${self}"
+                  echo "вьюер (из репозитория): http://localhost:8080/viewer/index.html"
+                fi
+                echo "Ctrl+C — остановить"
+                exec python3 -m http.server 8080 --directory "$root"
+              '';
+            }}/bin/voxelforge-viewer";
+          };
           mesh = {
             type = "app";
             program = "${pkgs.writeShellApplication {
