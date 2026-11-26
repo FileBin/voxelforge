@@ -190,6 +190,322 @@ fn slerp(a: [f64; 4], b: [f64; 4], t: f64) -> [f64; 4] {
     [q[0] / l, q[1] / l, q[2] / l, q[3] / l]
 }
 
+
+// ───────────────────────── фоновая физика ─────────────────────────
+//
+// Симуляция живёт в своём потоке и публикует снимки, а главный поток только
+// рисует: кадр больше не ждёт такт физики. Между двумя последними тактами
+// рендер интерполирует, поэтому картинка остаётся гладкой, даже когда такт
+// стоит десятки миллисекунд.
+
+#[derive(Clone, Copy)]
+struct BSnap {
+    id: u64,
+    kind: u8,
+    alive: bool,
+    pos: [f64; 3],
+    prev: [f64; 3],
+    quat: [f64; 4],
+    prevq: [f64; 4],
+}
+
+struct MeshData {
+    pos: Vec<f32>,
+    nrm: Vec<f32>,
+    idx: Vec<u32>,
+    edges: Vec<f32>,
+}
+
+struct Shared {
+    bodies: Vec<BSnap>,
+    pending: Vec<(u64, MeshData)>,
+    tick: f32,
+    t_pub: f64,
+    t_pub_at: std::time::Instant,
+    shots: usize,
+    cracks: usize,
+    shards: usize,
+    alive: usize,
+    lines_on: bool,
+    log: String,
+}
+
+enum Cmd {
+    Shoot([f64; 3], [f64; 3], f64),
+    Reset,
+    SetLines(bool),
+}
+
+struct SnapOut {
+    bodies: Vec<BSnap>,
+    pending: Vec<(u64, MeshData)>,
+    tick: f32,
+    alpha: f32,
+    shots: usize,
+    cracks: usize,
+    shards: usize,
+    alive: usize,
+    lines_on: bool,
+    log: String,
+    near: f32,
+    far: f32,
+}
+
+enum Sim {
+    Direct(Box<Live>),
+    Thread {
+        shared: std::sync::Arc<std::sync::Mutex<Shared>>,
+        tx: std::sync::mpsc::Sender<Cmd>,
+    },
+}
+
+/// `Live` держит указатели на Vulkan-объекты C-ядра. Они принадлежат только
+/// физическому потоку, поэтому передача владения потоком безопасна.
+struct LiveSend(Live);
+unsafe impl Send for LiveSend {}
+
+fn kind_code(k: voxelforge_world::live::Kind) -> u8 {
+    match k {
+        voxelforge_world::live::Kind::Bullet => 2,
+        voxelforge_world::live::Kind::Target => 0,
+        _ => 1,
+    }
+}
+
+fn mesh_of(live: &Live, i: usize) -> Option<MeshData> {
+    let shape = live.shape_for(i)?;
+    let mut pos = Vec::with_capacity(shape.mesh.positions.len() * 3);
+    let mut nrm = Vec::with_capacity(shape.mesh.normals.len() * 3);
+    for (p, n) in shape.mesh.positions.iter().zip(shape.mesh.normals.iter()) {
+        pos.extend_from_slice(p);
+        nrm.extend_from_slice(n);
+    }
+    let mut edges = Vec::with_capacity(shape.edges.len() * 3);
+    for p in &shape.edges {
+        edges.extend_from_slice(p);
+    }
+    Some(MeshData {
+        pos,
+        nrm,
+        idx: shape.mesh.indices.clone(),
+        edges,
+    })
+}
+
+fn snap_of(live: &Live, prev: &[([f64; 3], [f64; 4])]) -> Vec<BSnap> {
+    live.bodies
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let (pp, pq) = prev.get(i).copied().unwrap_or((b.pos, b.quat));
+            BSnap {
+                id: b.id,
+                kind: kind_code(b.kind),
+                alive: b.alive,
+                pos: b.pos,
+                prev: pp,
+                quat: b.quat,
+                prevq: pq,
+            }
+        })
+        .collect()
+}
+
+impl Sim {
+    fn direct(live: Live, lines_on: bool) -> Self {
+        let mut live = live;
+        live.lines_on = lines_on;
+        Sim::Direct(Box::new(live))
+    }
+
+    fn threaded(shaders: &std::path::Path, tick: f32, lines_on: bool) -> Result<Self, String> {
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(Shared {
+            bodies: Vec::new(),
+            pending: Vec::new(),
+            tick,
+            t_pub: 0.0,
+            t_pub_at: std::time::Instant::now(),
+            shots: 0,
+            cracks: 0,
+            shards: 0,
+            alive: 0,
+            lines_on,
+            log: String::new(),
+        }));
+        let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
+        let shaders = shaders.to_path_buf();
+        let sh = shared.clone();
+        std::thread::spawn(move || {
+            let mut live = Live::new(&shaders);
+            live.lines_on = lines_on;
+            let start = std::time::Instant::now();
+            let mut last = std::time::Instant::now();
+            let mut acc = 0.0f32;
+                    loop {
+                while let Ok(cmd) = rx.try_recv() {
+                    match cmd {
+                        Cmd::Shoot(from, dir, speed) => {
+                            live.shoot(from, dir, speed);
+                        }
+                        Cmd::Reset => live.reset(),
+                        Cmd::SetLines(on) => live.lines_on = on,
+                    }
+                }
+                let now = std::time::Instant::now();
+                let dt = now.duration_since(last).as_secs_f32().clamp(0.0005, 0.25);
+                last = now;
+                let awake = live.mirror.iter().any(|g| g.misc[1] <= 0.5);
+                let mut fresh: Vec<(u64, MeshData)> = Vec::new();
+                if awake {
+                    acc += dt;
+                    let mut steps = 0;
+                    while acc >= tick && steps < 2 {
+                        let prev: Vec<([f64; 3], [f64; 4])> =
+                            live.bodies.iter().map(|b| (b.pos, b.quat)).collect();
+                        live.step(tick, 6, 10);
+                        // геометрия новых тел — сразу, чтобы главный поток успел
+                        for i in 0..live.bodies.len() {
+                            if !live.bodies[i].alive || live.bodies[i].mesh >= 0 {
+                                continue;
+                            }
+                            if let Some(m) = mesh_of(&live, i) {
+                                fresh.push((live.bodies[i].id, m));
+                                live.bodies[i].mesh = 0;
+                            }
+                        }
+                        let bodies = snap_of(&live, &prev);
+                        let mut g = sh.lock().unwrap();
+                        g.bodies = bodies;
+                        g.pending.append(&mut fresh);
+                        g.t_pub = start.elapsed().as_secs_f64();
+                        g.t_pub_at = std::time::Instant::now();
+                        g.shots = live.shots;
+                        g.cracks = live.cracks;
+                        g.shards = live.shards_made;
+                        g.alive = live.alive_count();
+                        g.lines_on = live.lines_on;
+                        if !live.last_log.is_empty() {
+                            g.log = std::mem::take(&mut live.last_log);
+                        }
+                        acc -= tick;
+                        steps += 1;
+                    }
+                } else {
+                    acc = 0.0;
+                }
+                if !fresh.is_empty() {
+                    let mut g = sh.lock().unwrap();
+                    g.pending.append(&mut fresh);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        });
+        Ok(Sim::Thread { shared, tx })
+    }
+
+    fn shoot(&mut self, from: [f64; 3], dir: [f64; 3], speed: f64) {
+        match self {
+            Sim::Direct(l) => {
+                let _ = l.shoot(from, dir, speed);
+            }
+            Sim::Thread { tx, .. } => {
+                let _ = tx.send(Cmd::Shoot(from, dir, speed));
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        match self {
+            Sim::Direct(l) => l.reset(),
+            Sim::Thread { tx, .. } => {
+                let _ = tx.send(Cmd::Reset);
+            }
+        }
+    }
+
+    fn set_lines(&mut self, on: bool) {
+        match self {
+            Sim::Direct(l) => l.lines_on = on,
+            Sim::Thread { tx, .. } => {
+                let _ = tx.send(Cmd::SetLines(on));
+            }
+        }
+    }
+
+    fn first_pos(&self) -> [f64; 3] {
+        match self {
+            Sim::Direct(l) => l.bodies.first().map(|b| b.pos).unwrap_or([0.0; 3]),
+            Sim::Thread { shared, .. } => shared
+                .lock()
+                .unwrap()
+                .bodies
+                .first()
+                .map(|b| b.pos)
+                .unwrap_or([0.0; 3]),
+        }
+    }
+
+    /// Снимок для рисования. В скриптовом режиме (Direct) шагает физику сам
+    /// и отдаёт alpha = 1: прогон должен быть воспроизводимым.
+    fn frame(&mut self, tick: f32, scripted: bool) -> SnapOut {
+        match self {
+            Sim::Direct(l) => {
+                if scripted {
+                    l.step(tick, 6, 10);
+                }
+                let prev: Vec<([f64; 3], [f64; 4])> = l.bodies.iter().map(|b| (b.pos, b.quat)).collect();
+                let mut pending = Vec::new();
+                for i in 0..l.bodies.len() {
+                    if !l.bodies[i].alive || l.bodies[i].mesh >= 0 {
+                        continue;
+                    }
+                    if let Some(m) = mesh_of(l, i) {
+                        pending.push((l.bodies[i].id, m));
+                        l.bodies[i].mesh = 0;
+                    }
+                }
+                SnapOut {
+                    bodies: snap_of(l, &prev),
+                    pending,
+                    tick,
+                    alpha: 1.0,
+                    shots: l.shots,
+                    cracks: l.cracks,
+                    shards: l.shards_made,
+                    alive: l.alive_count(),
+                    lines_on: l.lines_on,
+                    log: String::new(),
+                    near: l.near,
+                    far: l.far,
+                }
+            }
+            Sim::Thread { shared, .. } => {
+                let mut g = shared.lock().unwrap();
+                // Рисуем на такт позади: от опубликованного снимка к следующему.
+                let alpha = if g.tick > 0.0 {
+                    (g.t_pub_at.elapsed().as_secs_f32() / g.tick).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                SnapOut {
+                    bodies: g.bodies.clone(),
+                    pending: std::mem::take(&mut g.pending),
+                    tick: g.tick,
+                    alpha,
+                    shots: g.shots,
+                    cracks: g.cracks,
+                    shards: g.shards,
+                    alive: g.alive,
+                    lines_on: g.lines_on,
+                    log: std::mem::take(&mut g.log),
+                    near: 0.0,
+                    far: 60.0,
+                }
+            }
+        }
+    }
+}
+
 fn main() {
     let mut explicit: Option<std::path::PathBuf> = None;
     let mut max_frames: u64 = 0; // 0 — без ограничения
@@ -235,18 +551,34 @@ fn main() {
         }
     }
 
-    let mut world = Live::new(&shaders);
-    world.lines_on = tets_at_start;
+    // Такт физики (по умолчанию 20 Гц): рендер интерполирует между тактами.
+    let tick_hz: f32 = tick_arg.unwrap_or(20.0).clamp(5.0, 240.0);
+    let tick: f32 = 1.0 / tick_hz;
+    let mut lines_on = tets_at_start;
+
+    // В интерактивном режиме физика уходит в свой поток; в скриптовом
+    // (--frames) она остаётся здесь, чтобы прогон был воспроизводимым.
+    let mut sim = if max_frames > 0 {
+        Sim::direct(Live::new(&shaders), tets_at_start)
+    } else {
+        match Sim::threaded(&shaders, tick, tets_at_start) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("физика не запустилась: {e}");
+                std::process::exit(1);
+            }
+        }
+    };
     let mut cam = Fly {
         pos: [3.0, 2.0, 3.6],
         yaw: 0.0,
         pitch: 0.0,
         speed: 4.0,
     };
-    cam.look_at(world.bodies[0].pos.map(|v| v as f32));
+    cam.look_at(sim.first_pos().map(|v| v as f32));
     let mut near = 0.05f32;
     let mut far = 60.0f32;
-    let mut uploaded: Vec<(usize, i32)> = Vec::new();
+    let mut meshes: std::collections::HashMap<u64, (i32, i32)> = std::collections::HashMap::new();
 
     // сетка пола
     let mut grid: Vec<f32> = Vec::new();
@@ -271,14 +603,7 @@ fn main() {
     let mut last_frame = std::time::Instant::now();
     // Физика идёт своим фиксированным тактом, кадры — своим: рендер
     // интерполирует между двумя последними состояниями симуляции.
-    // Такт физики: 20 Гц. Рендер интерполирует между тактами, поэтому
-    // гладкость от этого не страдает, а нагрузка падает втрое.
-    let tick_hz: f32 = tick_arg.unwrap_or(20.0).clamp(5.0, 240.0);
-    let tick: f32 = 1.0 / tick_hz;
     let mut acc = 0.0f32;
-    let mut prev_state: Vec<([f64; 3], [f64; 4])> = Vec::new();
-    let mut alpha = 1.0f32;
-    let mut last_upload: Vec<usize> = Vec::new();
 
     loop {
         // Реальная дельта кадра: камера должна идти по времени, а не по
@@ -347,12 +672,13 @@ fn main() {
             shoot = true;
         }
         if input.key_t != 0 {
-            world.lines_on = !world.lines_on;
+            lines_on = !lines_on;
+            sim.set_lines(lines_on);
         }
         if input.key_r != 0 {
-            world.reset();
-            uploaded.clear();
-            cam.look_at(world.bodies[0].pos.map(|v| v as f32));
+            sim.reset();
+            meshes.clear();
+            cam.look_at(sim.first_pos().map(|v| v as f32));
             println!("сброс: снова один цельный объект");
         }
 
@@ -367,87 +693,34 @@ fn main() {
                 eye[1] as f64 + dir[1] as f64 * 0.6,
                 eye[2] as f64 + dir[2] as f64 * 0.6,
             ];
-            if world.shoot(from, [dir[0] as f64, dir[1] as f64, dir[2] as f64], 26.0) {
-                println!("выстрел #{}", world.shots);
-            }
+            sim.shoot(from, [dir[0] as f64, dir[1] as f64, dir[2] as f64], 26.0);
         }
 
-        // Физика: столько тактов, сколько прошло реального времени. В
-        // скриптовом режиме (--frames) шаг строго один на кадр — иначе прогон
-        // зависел бы от скорости машины и перестал быть воспроизводимым.
-        let mut stepped = 0;
-        // Всё спит — симуляцию не крутим вовсе. Иначе покоящаяся куча
-        // продолжала стоить полный такт каждый кадр, хотя в ней ничего
-        // не меняется (метка сна стоит в misc.y).
-        let any_awake = world.mirror.iter().any(|g| g.misc[1] <= 0.5);
-        if !any_awake {
-            acc = 0.0;
-            alpha = 1.0;
-        } else if max_frames > 0 {
-            prev_state.clear();
-            prev_state.extend(world.bodies.iter().map(|b| (b.pos, b.quat)));
-            world.step(tick, 6, 10);
-            stepped = 1;
-            acc = 0.0;
-        } else {
-            acc += frame_dt;
-        }
-        while max_frames == 0 && acc >= tick && stepped < 4 {
-            prev_state.clear();
-            prev_state.extend(world.bodies.iter().map(|b| (b.pos, b.quat)));
-            world.step(tick, 6, 10);
-            acc -= tick;
-            stepped += 1;
-        }
-        // доля между последним и следующим тактом — по ней и рисуем
-        alpha = if stepped > 0 { (acc / tick).clamp(0.0, 1.0) } else { 1.0 };
-        if std::env::var("VF_DEBUG").is_ok() && frame_no < 40 && frame_no % 4 == 0 {
-            for (i, b) in world.bodies.iter().enumerate() {
-                if b.alive && i > 0 {
-                    println!("  кадр {frame_no}: тело {i} {:?} v={:?}", b.pos.map(|v| (v * 100.0).round() / 100.0), b.vel.map(|v| (v * 10.0).round() / 10.0));
-                }
-            }
-        }
+        // Кадр: физика к этому моменту уже посчитана в своём потоке
+        // (или шагнула здесь, если режим скриптовый).
+        let out = sim.frame(tick, max_frames > 0);
 
         // новые формы (появились осколки) — залить в окно
-        for i in 0..world.bodies.len() {
-            if !world.bodies[i].alive || (world.bodies[i].mesh >= 0 && world.bodies[i].lines >= 0) {
-                continue;
-            }
-            let Some(shape) = world.shape_for(i) else { continue };
-            let mut pos = Vec::with_capacity(shape.mesh.positions.len() * 3);
-            let mut nrm = Vec::with_capacity(shape.mesh.normals.len() * 3);
-            for (p, n) in shape.mesh.positions.iter().zip(shape.mesh.normals.iter()) {
-                pos.extend_from_slice(p);
-                nrm.extend_from_slice(n);
-            }
+        for (id, m) in out.pending.iter() {
             let mesh_id = unsafe {
                 vf_view_add_mesh(
                     view,
-                    pos.as_ptr(),
-                    nrm.as_ptr(),
-                    shape.mesh.positions.len() as u32,
-                    shape.mesh.indices.as_ptr(),
-                    shape.mesh.indices.len() as u32,
+                    m.pos.as_ptr(),
+                    m.nrm.as_ptr(),
+                    (m.pos.len() / 3) as u32,
+                    m.idx.as_ptr(),
+                    m.idx.len() as u32,
                 )
             };
-            let line_id = if shape.edges.is_empty() {
+            let line_id = if m.edges.is_empty() {
                 -1
             } else {
-                let mut e = Vec::with_capacity(shape.edges.len() * 3);
-                for p in &shape.edges {
-                    e.extend_from_slice(p);
-                }
-                unsafe { vf_view_add_lines(view, e.as_ptr(), (shape.edges.len() / 2) as u32) }
+                unsafe { vf_view_add_lines(view, m.edges.as_ptr(), (m.edges.len() / 6) as u32) }
             };
-            world.bodies[i].mesh = mesh_id;
-            world.bodies[i].lines = line_id;
-            uploaded.push((i, mesh_id));
-            last_upload.push(i);
+            meshes.insert(*id, (mesh_id, line_id));
         }
-        if !world.last_log.is_empty() {
-            println!("{}", world.last_log);
-            world.last_log.clear();
+        if !out.log.is_empty() {
+            println!("{}", out.log);
         }
 
         // кадр
@@ -464,8 +737,8 @@ fn main() {
         ];
         let viewm = look_at(eye, target, [0.0, 1.0, 0.0]);
         let vp = mul(proj, viewm);
-        near = world.near.max(0.02);
-        far = world.far.max(2.0);
+        near = out.near.max(0.02);
+        far = out.far.max(2.0);
         unsafe {
             vf_view_camera(view, vp.as_ptr(), [eye[0], eye[1], eye[2], near].as_ptr(), near, far);
             vf_view_begin(view, 0.055, 0.07, 0.10);
@@ -476,36 +749,38 @@ fn main() {
                     .as_ptr(),
                 [0.18, 0.22, 0.28, 0.0].as_ptr(),
             );
-            for i in 0..world.bodies.len() {
-                let b = &world.bodies[i];
-                if !b.alive || b.mesh < 0 {
+            for (i, b) in out.bodies.iter().enumerate() {
+                if !b.alive {
                     continue;
                 }
-                let (rpos, rquat) = match prev_state.get(i) {
-                    Some((pp, pq)) if alpha < 0.999 => (
+                let Some(&(mesh_id, line_id)) = meshes.get(&b.id) else {
+                    continue;
+                };
+                let (rpos, rquat) = if out.alpha < 0.999 {
+                    (
                         [
-                            pp[0] + (b.pos[0] - pp[0]) * alpha as f64,
-                            pp[1] + (b.pos[1] - pp[1]) * alpha as f64,
-                            pp[2] + (b.pos[2] - pp[2]) * alpha as f64,
+                            b.prev[0] + (b.pos[0] - b.prev[0]) * out.alpha as f64,
+                            b.prev[1] + (b.pos[1] - b.prev[1]) * out.alpha as f64,
+                            b.prev[2] + (b.pos[2] - b.prev[2]) * out.alpha as f64,
                         ],
-                        slerp(*pq, b.quat, alpha as f64),
-                    ),
-                    _ => (b.pos, b.quat),
+                        slerp(b.prevq, b.quat, out.alpha as f64),
+                    )
+                } else {
+                    (b.pos, b.quat)
                 };
                 let m = model_matrix(rpos, rquat);
                 let tint = match b.kind {
-                    voxelforge_world::live::Kind::Bullet => [0.95, 0.62, 0.28, 1.0],
-                    voxelforge_world::live::Kind::Target => [0.74, 0.70, 0.62, 1.0],
+                    2 => [0.95, 0.62, 0.28, 1.0],
+                    0 => [0.74, 0.70, 0.62, 1.0],
                     _ => {
                         // камень: светлые и тёмные осколки, без кислотных оттенков
                         let k = 0.56 + 0.05 * ((i % 4) as f32);
                         [k + 0.06, k + 0.035, k, 1.0]
                     }
                 };
-                vf_view_draw(view, b.mesh, m.as_ptr(), tint.as_ptr());
-                if world.lines_on && b.lines >= 0 {
-                    let lt = [0.55, 0.85, 1.0, 1.0];
-                    vf_view_draw_lines(view, b.lines, m.as_ptr(), lt.as_ptr());
+                vf_view_draw(view, mesh_id, m.as_ptr(), tint.as_ptr());
+                if lines_on && line_id >= 0 {
+                    vf_view_draw_lines(view, line_id, m.as_ptr(), [0.35, 0.42, 0.5, 0.0].as_ptr());
                 }
             }
             vf_view_end(view);
@@ -516,9 +791,9 @@ fn main() {
         if max_frames > 0 && frame_no >= max_frames {
             println!(
                 "[live] конец: кадров {frame_no} · тел {} · трещин {} · осколков {}",
-                world.alive_count(),
-                world.cracks,
-                world.shards_made
+                out.alive,
+                out.cracks,
+                out.shards
             );
             break;
         }
@@ -527,9 +802,9 @@ fn main() {
             println!(
                 "кадров {frames} · {:.0} fps · тел {} · трещин {} · осколков {}",
                 frames as f32 / dt,
-                world.alive_count(),
-                world.cracks,
-                world.shards_made
+                out.alive,
+                out.cracks,
+                out.shards
             );
             t0 = std::time::Instant::now();
             frames = 0;
