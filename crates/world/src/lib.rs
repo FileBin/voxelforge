@@ -10,6 +10,7 @@
 
 pub mod bcc;
 pub mod collide;
+pub mod live;
 pub mod sim;
 pub mod tet;
 pub mod types;

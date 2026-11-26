@@ -5,3 +5,11 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+
+[features]
+live = []
+
+[[bin]]
+name = "voxelforge-live"
+path = "src/bin/voxelforge_live.rs"
+required-features = ["live"]

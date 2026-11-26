@@ -25,6 +25,7 @@
         vulkan-headers
         vulkan-loader
         vulkan-tools
+        sdl3
         # CPU-Vulkan (lavapipe) — headless-прогоны и CI, без касания GPU
         mesa
         wayland
@@ -68,6 +69,18 @@
             '';
           };
 
+          # Живое окно: настоящая видеокарта, мышь и стрельба. Никакого
+          # lavapipe — он не умеет показать окно.
+          live = pkgs.writeShellApplication {
+            name = "voxelforge-live";
+            runtimeInputs = [ pkgs.vulkan-loader pkgs.sdl3 ];
+            text = ''
+              exec ${self.packages.${system}.live}/bin/voxelforge-live \
+                --shaders ${self.packages.${system}.spirv} "$@"
+            '' + ''
+            '';
+          };
+
           # Мир: движок считает на видеокарте. В CI остаётся lavapipe.
           world = pkgs.writeShellApplication {
             name = "voxelforge-world";
@@ -92,6 +105,7 @@
           help = { type = "app"; program = "${help}/bin/voxelforge"; };
           world = { type = "app"; program = "${world}/bin/voxelforge-world"; };
           viewer = { type = "app"; program = "${viewer}/bin/voxelforge-viewer"; };
+          live = { type = "app"; program = "${live}/bin/voxelforge-live"; };
           ref = { type = "app"; program = "${engine}/bin/vf-ref"; };
         });
 
@@ -104,6 +118,9 @@
           cd ${./shaders}
           for f in *.comp; do
             glslc -I. "$f" -o "$out/''${f%.comp}.spv"
+          done
+          for f in view_*.vert view_*.frag; do
+            glslc -O -o "$out/''${f%.*}.''${f##*.}.spv" "$f"
           done
         '';
 
@@ -123,12 +140,36 @@
           buildInputs = [ pkgs.vulkan-headers pkgs.vulkan-loader ];
           meta.mainProgram = "voxelforge";
         };
+
+        # Живое окно: тот же движок плюс SDL3-слой и графические конвейеры.
+        live = pkgs.rustPlatform.buildRustPackage {
+          pname = "voxelforge-live";
+          version = "0.0.0";
+          src = pkgs.lib.cleanSourceWith {
+            src = ./.; 
+            filter = path: type:
+              let base = baseNameOf (toString path);
+              in !(builtins.elem base [ "target" "result" "demos" ".direnv" ]);
+          };
+          cargoLock.lockFile = ./Cargo.lock;
+          cargoBuildFlags = [ "--features" "live" ];
+          doCheck = false;
+          nativeBuildInputs = [ pkgs.gcc pkgs.pkg-config ];
+          buildInputs = [ pkgs.vulkan-headers pkgs.vulkan-loader pkgs.sdl3 ];
+          meta.mainProgram = "voxelforge-live";
+        };
       });
 
       checks = forAll (system: pkgs: {
         # Юнит- и интеграционные тесты: BCC-решётка, раскол, подразбиение,
         # физика эталона, сверка CPU и GPU, вода.
-        tests = self.packages.${system}.default.overrideAttrs (_: { doCheck = true; });
+        tests = self.packages.${system}.default.overrideAttrs (_: {
+          doCheck = true;
+          # тестам раскола нужны SPIR-V: без них проверка пропускается
+          preCheck = ''
+            export VF_SHADERS=${self.packages.${system}.spirv}
+          '';
+        });
 
         # Мир целиком на lavapipe: движок обязан отработать headless и выдать
         # запись, в которой осколки действительно раздробились (форм > тел).

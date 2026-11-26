@@ -1,0 +1,374 @@
+// Живая демка: окно Vulkan, орбита мышью, стрельба, повторный раскол.
+//
+//   nix run .#live
+//
+// ЛКМ — орбита (клик без движения = выстрел), ПКМ/Shift — пан, колесо — зум,
+// ПРОБЕЛ/F — выстрел в центр, T — каркас тетраэдров, R — сброс.
+use std::ffi::{c_char, c_void, CString};
+
+use voxelforge_world::live::{model_matrix, Live, MAX_BODIES};
+use voxelforge_world::sim::find_shaders;
+
+#[repr(C)]
+struct VfStatus {
+    code: i32,
+    msg: *const c_char,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct VfInput {
+    alive: i32,
+    resized: i32,
+    width: u32,
+    height: u32,
+    mx: f32,
+    my: f32,
+    dx: f32,
+    dy: f32,
+    wheel: f32,
+    lmb: i32,
+    rmb: i32,
+    lmb_pressed: i32,
+    key_space: i32,
+    key_r: i32,
+    key_t: i32,
+    key_f: i32,
+}
+
+unsafe extern "C" {
+    fn vf_view_new(
+        w: i32,
+        h: i32,
+        title: *const c_char,
+        shader_dir: *const c_char,
+        out: *mut *mut c_void,
+    ) -> VfStatus;
+    fn vf_view_free(v: *mut c_void);
+    fn vf_view_poll(v: *mut c_void, input: *mut VfInput) -> i32;
+    fn vf_view_camera(v: *mut c_void, vp: *const f32, eye: *const f32, near_m: f32, far_m: f32);
+    fn vf_view_add_mesh(
+        v: *mut c_void,
+        pos: *const f32,
+        nrm: *const f32,
+        nv: u32,
+        idx: *const u32,
+        ni: u32,
+    ) -> i32;
+    fn vf_view_add_lines(v: *mut c_void, pts: *const f32, n_lines: u32) -> i32;
+    fn vf_view_begin(v: *mut c_void, r: f32, g: f32, b: f32);
+    fn vf_view_draw(v: *mut c_void, mesh: i32, model: *const f32, tint: *const f32);
+    fn vf_view_draw_lines(v: *mut c_void, lines: i32, model: *const f32, tint: *const f32);
+    fn vf_view_end(v: *mut c_void);
+}
+
+// ---------------------------------------------------------------- матрицы
+
+fn persp(fovy: f32, aspect: f32, near: f32, far: f32) -> [f32; 16] {
+    let f = 1.0 / (fovy * 0.5).tan();
+    [
+        f / aspect, 0.0, 0.0, 0.0,
+        0.0, f, 0.0, 0.0,
+        0.0, 0.0, far / (near - far), -1.0,
+        0.0, 0.0, (near * far) / (near - far), 0.0,
+    ]
+}
+
+fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+fn norm(a: [f32; 3]) -> [f32; 3] {
+    let l = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt().max(1e-8);
+    [a[0] / l, a[1] / l, a[2] / l]
+}
+fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn look_at(eye: [f32; 3], center: [f32; 3], up: [f32; 3]) -> [f32; 16] {
+    let f = norm(sub(center, eye));
+    let s = norm(cross(f, up));
+    let u = cross(s, f);
+    [
+        s[0], u[0], -f[0], 0.0,
+        s[1], u[1], -f[1], 0.0,
+        s[2], u[2], -f[2], 0.0,
+        -dot(s, eye), -dot(u, eye), dot(f, eye), 1.0,
+    ]
+}
+
+fn mul(a: [f32; 16], b: [f32; 16]) -> [f32; 16] {
+    let mut o = [0.0f32; 16];
+    for c in 0..4 {
+        for r in 0..4 {
+            let mut s = 0.0;
+            for k in 0..4 {
+                s += a[k * 4 + r] * b[c * 4 + k];
+            }
+            o[c * 4 + r] = s;
+        }
+    }
+    o
+}
+
+// ---------------------------------------------------------------- камера
+
+struct Orbit {
+    yaw: f32,
+    pitch: f32,
+    dist: f32,
+    target: [f32; 3],
+}
+
+impl Orbit {
+    fn eye(&self) -> [f32; 3] {
+        let cp = self.pitch.cos();
+        [
+            self.target[0] + self.dist * cp * self.yaw.sin(),
+            self.target[1] + self.dist * self.pitch.sin(),
+            self.target[2] + self.dist * cp * self.yaw.cos(),
+        ]
+    }
+}
+
+fn main() {
+    let mut explicit: Option<std::path::PathBuf> = None;
+    let mut it = std::env::args().skip(1);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--shaders" => explicit = it.next().map(Into::into),
+            other => {
+                eprintln!("неизвестный аргумент {other}\n  --shaders DIR");
+                std::process::exit(2);
+            }
+        }
+    }
+    let shaders = find_shaders(explicit.as_deref())
+        .expect("нет SPIR-V: nix build .#spirv или --shaders DIR");
+    let shaders_c = CString::new(shaders.display().to_string()).unwrap();
+    let title = CString::new("voxelforge — стреляйте в плиту: ЛКМ орбита, клик/пробел выстрел").unwrap();
+
+    let mut view: *mut c_void = std::ptr::null_mut();
+    unsafe {
+        let st = vf_view_new(1280, 800, title.as_ptr(), shaders_c.as_ptr(), &mut view);
+        if st.code != 0 {
+            eprintln!("окно не открылось: код {} {}", st.code, if st.msg.is_null() {
+                "".into()
+            } else {
+                std::ffi::CStr::from_ptr(st.msg).to_string_lossy().into_owned()
+            });
+            std::process::exit(1);
+        }
+    }
+
+    let mut world = Live::new(&shaders);
+    let mut orbit = Orbit {
+        yaw: 0.75,
+        pitch: 0.32,
+        dist: 7.5,
+        target: [0.0, 1.1, 0.0],
+    };
+    let mut near = 0.05f32;
+    let mut far = 60.0f32;
+    let mut uploaded: Vec<(usize, i32)> = Vec::new();
+
+    // сетка пола
+    let mut grid: Vec<f32> = Vec::new();
+    let ext = 8.0f32;
+    let mut t = -ext;
+    while t <= ext + 1e-4 {
+        grid.extend_from_slice(&[-ext, 0.0, t, ext, 0.0, t]);
+        grid.extend_from_slice(&[t, 0.0, -ext, t, 0.0, ext]);
+        t += 1.0;
+    }
+    let grid_id = unsafe { vf_view_add_lines(view, grid.as_ptr(), (grid.len() / 6) as u32) };
+
+    println!("voxelforge live · тел до {MAX_BODIES} · ЛКМ/ПКМ орбита, клик = выстрел, T каркас, R сброс");
+
+    let mut prev_lmb = 0;
+    let mut press_x = 0.0f32;
+    let mut press_y = 0.0f32;
+    let mut drag = 0.0f32;
+    let mut frames = 0u64;
+    let mut t0 = std::time::Instant::now();
+    let mut last_upload: Vec<usize> = Vec::new();
+
+    loop {
+        let mut input = VfInput::default();
+        let alive = unsafe { vf_view_poll(view, &mut input) };
+        if alive == 0 {
+            break;
+        }
+
+        drag += input.dx.abs() + input.dy.abs();
+        if input.lmb != 0 {
+            orbit.yaw -= input.dx * 0.008;
+            orbit.pitch = (orbit.pitch + input.dy * 0.006).clamp(-1.3, 1.35);
+        }
+        if input.rmb != 0 {
+            // пан в плоскости экрана
+            let e = orbit.eye();
+            let f = norm(sub(orbit.target, e));
+            let r = norm(cross(f, [0.0, 1.0, 0.0]));
+            let u = cross(r, f);
+            let k = orbit.dist * 0.0016;
+            for i in 0..3 {
+                orbit.target[i] += (-input.dx * r[i] + input.dy * u[i]) * k;
+            }
+        }
+        if input.wheel != 0.0 {
+            orbit.dist = (orbit.dist * (1.0 - input.wheel * 0.10)).clamp(1.2, 40.0);
+        }
+        if input.lmb_pressed != 0 {
+            press_x = input.mx;
+            press_y = input.my;
+            drag = 0.0;
+        }
+
+        let mut shoot = false;
+        if prev_lmb != 0 && input.lmb == 0 {
+            let moved = (input.mx - press_x).abs() + (input.my - press_y).abs();
+            if moved < 6.0 {
+                shoot = true;
+            }
+        }
+        prev_lmb = input.lmb;
+        if input.key_space != 0 || input.key_f != 0 {
+            shoot = true;
+        }
+        if input.key_t != 0 {
+            world.lines_on = !world.lines_on;
+        }
+        if input.key_r != 0 {
+            world.reset();
+            uploaded.clear();
+            println!("сброс: снова один цельный объект");
+        }
+
+        let eye = orbit.eye();
+        if shoot {
+            let dir = norm(sub(orbit.target, eye));
+            let from = [
+                eye[0] as f64 + dir[0] as f64 * 0.6,
+                eye[1] as f64 + dir[1] as f64 * 0.6,
+                eye[2] as f64 + dir[2] as f64 * 0.6,
+            ];
+            if world.shoot(from, [dir[0] as f64, dir[1] as f64, dir[2] as f64], 26.0) {
+                println!("выстрел #{}", world.shots);
+            }
+        }
+
+        // физика
+        world.step(1.0 / 60.0, 4, 10);
+
+        // новые формы (появились осколки) — залить в окно
+        for i in 0..world.bodies.len() {
+            if !world.bodies[i].alive || (world.bodies[i].mesh >= 0 && world.bodies[i].lines >= 0) {
+                continue;
+            }
+            let Some(shape) = world.shape_for(i) else { continue };
+            let mut pos = Vec::with_capacity(shape.mesh.positions.len() * 3);
+            let mut nrm = Vec::with_capacity(shape.mesh.normals.len() * 3);
+            for (p, n) in shape.mesh.positions.iter().zip(shape.mesh.normals.iter()) {
+                pos.extend_from_slice(p);
+                nrm.extend_from_slice(n);
+            }
+            let mesh_id = unsafe {
+                vf_view_add_mesh(
+                    view,
+                    pos.as_ptr(),
+                    nrm.as_ptr(),
+                    shape.mesh.positions.len() as u32,
+                    shape.mesh.indices.as_ptr(),
+                    shape.mesh.indices.len() as u32,
+                )
+            };
+            let line_id = if shape.edges.is_empty() {
+                -1
+            } else {
+                let mut e = Vec::with_capacity(shape.edges.len() * 3);
+                for p in &shape.edges {
+                    e.extend_from_slice(p);
+                }
+                unsafe { vf_view_add_lines(view, e.as_ptr(), (shape.edges.len() / 2) as u32) }
+            };
+            world.bodies[i].mesh = mesh_id;
+            world.bodies[i].lines = line_id;
+            uploaded.push((i, mesh_id));
+            last_upload.push(i);
+        }
+        if !world.last_log.is_empty() {
+            println!("{}", world.last_log);
+            world.last_log.clear();
+        }
+
+        // кадр
+        let aspect = if input.height > 0 {
+            input.width as f32 / input.height as f32
+        } else {
+            1.6
+        };
+        let proj = persp(1.05, aspect, near, far);
+        let viewm = look_at(eye, orbit.target, [0.0, 1.0, 0.0]);
+        let vp = mul(proj, viewm);
+        near = world.near.max(0.02);
+        far = world.far.max(2.0);
+        unsafe {
+            vf_view_camera(view, vp.as_ptr(), [eye[0], eye[1], eye[2], near].as_ptr(), near, far);
+            vf_view_begin(view, 0.055, 0.07, 0.10);
+            vf_view_draw_lines(
+                view,
+                grid_id,
+                [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+                    .as_ptr(),
+                [0.18, 0.22, 0.28, 0.0].as_ptr(),
+            );
+            for i in 0..world.bodies.len() {
+                let b = &world.bodies[i];
+                if !b.alive || b.mesh < 0 {
+                    continue;
+                }
+                let m = model_matrix(b.pos, b.quat);
+                let tint = match b.kind {
+                    voxelforge_world::live::Kind::Bullet => [0.95, 0.62, 0.28, 1.0],
+                    voxelforge_world::live::Kind::Target => [0.74, 0.70, 0.62, 1.0],
+                    _ => [
+                        0.62 + 0.10 * ((i % 5) as f32),
+                        0.60 + 0.06 * ((i % 3) as f32),
+                        0.54,
+                        1.0,
+                    ],
+                };
+                vf_view_draw(view, b.mesh, m.as_ptr(), tint.as_ptr());
+                if world.lines_on && b.lines >= 0 {
+                    let lt = [0.55, 0.85, 1.0, 1.0];
+                    vf_view_draw_lines(view, b.lines, m.as_ptr(), lt.as_ptr());
+                }
+            }
+            vf_view_end(view);
+        }
+
+        frames += 1;
+        if frames % 120 == 0 {
+            let dt = t0.elapsed().as_secs_f32();
+            println!(
+                "кадров {frames} · {:.0} fps · тел {} · трещин {} · осколков {}",
+                frames as f32 / dt,
+                world.alive_count(),
+                world.cracks,
+                world.shards_made
+            );
+            t0 = std::time::Instant::now();
+            frames = 0;
+        }
+    }
+
+    unsafe { vf_view_free(view) };
+}
