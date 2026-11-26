@@ -264,6 +264,64 @@ impl TetBody {
         (lo, hi)
     }
 
+    /// Раскол с упором на точку удара: часть затравок ставится рядом с ней,
+    /// поэтому близко к попаданию образуется больше мелких отколов, а плита
+    /// раскалывается крупными кусками вдали.
+    pub fn shatter_biased(&self, seeds: usize, seed: u64, focus: [f32; 3]) -> Vec<TetBody> {
+        let (lo, hi) = self.bounds();
+        let lo = [lo[0] - self.origin[0], lo[1] - self.origin[1], lo[2] - self.origin[2]];
+        let hi = [hi[0] - self.origin[0], hi[1] - self.origin[1], hi[2] - self.origin[2]];
+        let f = [focus[0] - self.origin[0], focus[1] - self.origin[1], focus[2] - self.origin[2]];
+        let mut rng = Lcg::new(seed);
+        let n_near = (seeds * 3) / 5; // 60% затравок — у места удара
+        let spread = 0.35 * (hi[0] - lo[0]).max(hi[2] - lo[2]).max(0.1);
+        let pts: Vec<[f64; 3]> = (0..seeds)
+            .map(|i| {
+                if i < n_near {
+                    // вокруг точки удара, ближе к краю — отколы
+                    let jx = (rng.unit() - 0.5) * 2.0 * spread;
+                    let jy = (rng.unit() - 0.5) * 2.0 * spread;
+                    let jz = (rng.unit() - 0.5) * 2.0 * spread;
+                    [
+                        (f[0] as f64 + jx as f64).clamp(lo[0] as f64, hi[0] as f64),
+                        (f[1] as f64 + jy as f64).clamp(lo[1] as f64, hi[1] as f64),
+                        (f[2] as f64 + jz as f64).clamp(lo[2] as f64, hi[2] as f64),
+                    ]
+                } else {
+                    [
+                        lo[0] as f64 + (hi[0] - lo[0]) as f64 * rng.unit() as f64,
+                        lo[1] as f64 + (hi[1] - lo[1]) as f64 * rng.unit() as f64,
+                        lo[2] as f64 + (hi[2] - lo[2]) as f64 * rng.unit() as f64,
+                    ]
+                }
+            })
+            .collect();
+
+        let mut buckets: Vec<Vec<Tet>> = vec![Vec::new(); seeds];
+        for t in &self.tets {
+            let c = t.centroid();
+            let mut best = 0;
+            let mut best_d = f64::MAX;
+            for (i, p) in pts.iter().enumerate() {
+                let d = (c[0] - p[0]).powi(2) + (c[1] - p[1]).powi(2) + (c[2] - p[2]).powi(2);
+                if d < best_d {
+                    best_d = d;
+                    best = i;
+                }
+            }
+            buckets[best].push(*t);
+        }
+        buckets
+            .into_iter()
+            .filter(|v| !v.is_empty())
+            .map(|tets| TetBody {
+                tets,
+                level_cap: self.level_cap,
+                origin: self.origin,
+            })
+            .collect()
+    }
+
     /// Раскол: тетраэдры раздаются ближайшей затравке (Вороной). Осколки
     /// выходят неровными, потому что граница режется по центрам тетраэдров.
     pub fn shatter(&self, seeds: usize, seed: u64) -> Vec<TetBody> {

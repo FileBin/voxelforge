@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use voxelforge_world::bcc::BASE;
 use voxelforge_world::collide;
-use voxelforge_world::tet::TetBody;
+use voxelforge_world::tet::{split_surfaces, Lcg, TetBody};
 use voxelforge_world::sim::{find_shaders, GpuBody, GpuSim, Params};
 use voxelforge_world::types::Body;
 use voxelforge_world::vfw::{self, BodyFrame, Shape};
@@ -170,6 +170,9 @@ fn main() {
 
     for f in 0..args.frames {
         let mut hit_now = false;
+        // снимок на начало кадра: к моменту раскола солвер уже погасил
+        // скорость снаряда, а энергия удара — это скорость ДО столкновения
+        let snap0 = snap.clone();
         // контакты по тетраэдрам живых тел
         let mut positions: Vec<[f32; 3]> = snap
             .iter()
@@ -311,6 +314,106 @@ fn main() {
                 "  кадр {f}: тело-тело {body_pen:.3} м, тело-пол {floor_pen:.3} м (глубже всех: {} -> {} = {:.3})",
                 who.0, who.1, who.2
             );
+        }
+
+        // Удар: снаряд коснулся плиты — только теперь она раскалывается.
+        if !broke && hit_now {
+            broke = true;
+
+            // Энергия удара: скорость снаряда ДО кадра (в кадре он уже успел
+            // передать часть импульса), масса известна.
+            let vpre = [snap0[ball_slot].vel_m[0], snap0[ball_slot].vel_m[1], snap0[ball_slot].vel_m[2]];
+            let v2 = vpre[0] * vpre[0] + vpre[1] * vpre[1] + vpre[2] * vpre[2];
+            let e_kin = 0.5 * masses[ball_slot] * v2 as f64;
+
+            // Жёсткость удара задаёт число осколков: слабый — крупные куски,
+            // сильный — мелкие отколы у места попадания.
+            let n_want = (6.0 + (e_kin / 15000.0)).clamp(6.0, MAX_FRAGS as f64) as usize;
+            let mut frags = plate.shatter_biased(
+                n_want,
+                0xC0FF_EE00_1234,
+                [
+                    snap0[ball_slot].pos_r[0],
+                    snap0[ball_slot].pos_r[1],
+                    snap0[ball_slot].pos_r[2],
+                ],
+            );
+            frags.truncate(MAX_FRAGS);
+            let n = frags.len();
+            log.push(format!(
+                "кадр {f}: удар {:.0} кДж — раскалывается на {n} осколков",
+                e_kin / 1000.0
+            ));
+
+            // формы осколков (меш + каркас тетраэдров)
+            let base = shapes.len() as u32;
+            let mut tets_all = Vec::new();
+            let mut owner = Vec::new();
+            for (i, fr) in frags.iter().enumerate() {
+                tets_all.extend_from_slice(&fr.tets);
+                owner.extend(std::iter::repeat(i).take(fr.tets.len()));
+            }
+            let mut meshes = split_surfaces(plate.origin, &tets_all, &owner, n);
+            for (i, m) in meshes.iter_mut().enumerate() {
+                let c = frags[i].world_centroid();
+                for p in m.positions.iter_mut() {
+                    p[0] -= c[0];
+                    p[1] -= c[1];
+                    p[2] -= c[2];
+                }
+            }
+            for (i, m) in meshes.into_iter().enumerate() {
+                let g = frags[i].surface_grid().1;
+                shapes.push(Shape {
+                    level: m.level,
+                    mesh: m,
+                    grid_lo: g.lo,
+                    grid_hi: g.hi,
+                    grid_step: g.step,
+                    edges: frags[i].edge_lines(),
+                });
+                shape_id[i] = base + i as u32;
+            }
+
+            // Скорости: часть кинетической энергии снаряда уходит в разлёт.
+            // Направление — от точки удара наружу, поэтому отколы у места
+            // попадания летят сильнее всего.
+            let hit = [
+                snap0[ball_slot].pos_r[0],
+                snap0[ball_slot].pos_r[1],
+                snap0[ball_slot].pos_r[2],
+            ];
+            let mass_total: f64 = frags.iter().map(|fr| DENSITY * fr.volume()).sum();
+            let share = 0.35;
+            let v_rms = (2.0 * share * e_kin / mass_total.max(1e-6)).sqrt();
+            let mut rng = Lcg::new(0x1BAD_B002_5EED);
+            let mut p_lost = [0.0f64; 3];
+            let mut bodies_now = snap.clone();
+            for (i, fr) in frags.iter().enumerate() {
+                let b = body_of(fr);
+                let c = fr.world_centroid();
+                let d = [c[0] - hit[0], c[1] - hit[1], c[2] - hit[2]];
+                let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-3);
+                let speed = (v_rms * (0.6 + 0.8 * rng.unit() as f64)) as f32;
+                let mut g = GpuBody::from_cpu(&b);
+                for k in 0..3 {
+                    g.vel_m[k] = d[k] / len * speed;
+                    g.pos_r[k] += d[k] / len * 0.004; // не стартовать вложенными
+                    p_lost[k] += b.mass * (d[k] / len) as f64 * speed as f64;
+                }
+                g.misc[1] = 0.0;
+                g.misc[0] = 0.0;
+                g.anchor = [g.pos_r[0], g.pos_r[1], g.pos_r[2], 0.0];
+                bodies_now[i] = g;
+                tet_shapes[i] = fr.surface_tets();
+                masses[i] = b.mass;
+            }
+            for k in 0..3 {
+                bodies_now[ball_slot].vel_m[k] -= (p_lost[k] / masses[ball_slot]) as f32;
+            }
+            active = n;
+            gpu.write_bodies(&bodies_now);
+            snap = bodies_now;
         }
 
         // запись кадра: живые осколки + снаряд

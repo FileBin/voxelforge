@@ -139,7 +139,7 @@
             --shaders ${self.packages.${system}.spirv} \
             --frames 60 --out "$out/world.vfw" | tee "$out/log.txt"
           test -s "$out/world.vfw"
-          grep -q "детализация" "$out/log.txt"
+          grep -q "раскалывается на" "$out/log.txt"
           echo "мир записан: $(stat -c%s "$out/world.vfw") байт"
         '';
 
