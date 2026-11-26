@@ -45,7 +45,7 @@ layout(push_constant) uniform Push {
 
 /* Ёмкость списка контактов на тело. 24 с запасом: у сферы радиуса r в
  * плотной упаковке 12 соседей, плюс пол и четыре стенки. */
-const int CAP = 24;
+const int CAP = 64;
 const int GROUND = -1;
 
 ivec3 cell_of(vec3 p, vec3 lo, float cell, ivec3 dim) {

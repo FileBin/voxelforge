@@ -158,7 +158,9 @@ const P_DEP: usize = 13;
 /// Потолок пар тетраэдров за такт.
 pub const MAX_PAIRS: usize = 262144;
 
-const CAP: usize = 24;
+/// Контактов на тело. Было 24 — в плотной куче этого мало: часть контактов
+/// просто не попадала в список. Память: 64 тела x 64 контакта x 48 Б ≈ 200 КБ.
+pub const CAP: usize = 64;
 /// Body = 5 × vec4.
 pub const BODY_BYTES: usize = 112;
 const WG: u32 = 64;
@@ -411,7 +413,7 @@ impl GpuSim {
     /// Залить контакты в буферы солвера. Формат C: `ivec4 meta` (x — партнёр),
     /// `vec4 n_pen` (xyz — нормаль к партнёру, w — проникновение).
     pub fn write_contacts(&mut self, contacts: &[Vec<crate::collide::Contact>]) {
-        let cap = 24usize;
+        let cap = CAP;
         let mut lc = vec![0u32; self.n];
         let mut list = vec![0u8; self.n * cap * 48];
         for (i, cs) in contacts.iter().enumerate().take(self.n) {
