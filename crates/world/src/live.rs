@@ -294,6 +294,53 @@ impl Live {
         }
     }
 
+    /// Будит уснувшее тело: возвращает обратную массу и инерцию, которые
+    /// проход сна на GPU обнулил (спящее тело = бесконечная масса), и
+    /// переставляет якорь, чтобы таймер покоя начал считаться заново.
+    fn wake(&mut self, i: usize) {
+        if i >= self.bodies.len() || self.mirror[i].misc[1] <= 0.5 {
+            return;
+        }
+        let b = &self.bodies[i];
+        let im = if b.mass > 0.0 { 1.0 / b.mass } else { 0.0 } as f32;
+        let inertia = solid_inertia(b);
+        let ii = if inertia > 0.0 { (1.0 / inertia) as f32 } else { 0.0 };
+        let g = &mut self.mirror[i];
+        g.misc[1] = 0.0;
+        g.vel_m[3] = im;
+        g.ang_i[3] = ii;
+        g.misc[2] = im;
+        g.misc[3] = ii;
+        g.anchor = [g.pos_r[0], g.pos_r[1], g.pos_r[2], 0.0];
+    }
+
+    /// Спит одно тело пары, а другое — нет: будим спящее. Спящая куча сама
+    /// себя не будит (все её члены спят), а пуля или ползущий осколок будит
+    /// соседа сразу, как только коснулся.
+    fn wake_on_contact(&mut self, contacts: &[Vec<collide::Contact>]) {
+        let mut woke = false;
+        for i in 0..self.bodies.len().min(contacts.len()) {
+            for c in &contacts[i] {
+                if c.other < 0 {
+                    continue;
+                }
+                let j = c.other as usize;
+                if j >= self.bodies.len() {
+                    continue;
+                }
+                let si = self.mirror[i].misc[1] > 0.5;
+                let sj = self.mirror[j].misc[1] > 0.5;
+                if si != sj {
+                    self.wake(if si { i } else { j });
+                    woke = true;
+                }
+            }
+        }
+        if woke {
+            self.gpu.write_bodies(&self.mirror);
+        }
+    }
+
     /// Новый устойчивый id. Слот переиспользуется, id — никогда.
     fn new_id(&mut self) -> u64 {
         let id = self.next_id;
@@ -374,6 +421,7 @@ impl Live {
                 contacts[i].clear();
             }
 
+            self.wake_on_contact(&contacts);
             self.depenetrate(&contacts);
             self.fracture(&contacts);
 
