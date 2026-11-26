@@ -100,20 +100,28 @@ fn shatter_covers_all_tets() {
         "объём осколков не равен телу"
     );
 
-    // у многотетраэдрных осколков поверхность должна быть замкнутой
+    // Поверхности осколков считаются одним проходом (как в движке): грань на
+    // стыке двух осколков попадает в оба меша, поэтому каждый замкнут.
+    let mut all: Vec<voxelforge_world::tet::Tet> = Vec::new();
+    let mut owner: Vec<usize> = Vec::new();
     for (i, s) in shards.iter().enumerate() {
-        if s.tets.len() < 8 {
-            continue;
-        }
-        // Поверхность осколка: срез проходит по внутренним граням кубов, и на
-        // стыке двух осколков пара граней может не сойтись (T-стык). Объём при
-        // этом считается точно — его и проверяем; водонепроницаемость
-        // гарантирована для замкнутого тела целиком (тест выше).
-        let m = s.surface();
-        assert!(m.triangles() > 0, "осколок {i} без поверхности");
-        let v = mesh_volume(&m);
-        assert!(v.is_finite() && v > 0.0, "осколок {i}: объём меша {v}");
+        all.extend_from_slice(&s.tets);
+        owner.extend(std::iter::repeat(i).take(s.tets.len()));
     }
+    let meshes = voxelforge_world::tet::split_surfaces(body.origin, &all, &owner, shards.len());
+    // Срез Вороного может оставить единичные T-стыки (перевёрнутая грань на
+    // стыке двух осколков) — допускаем их немного, но не дыры в поверхности.
+    for (i, m) in meshes.iter().enumerate() {
+        let bad = watertight(m);
+        assert!(bad <= 3, "осколок {i}: рёбер не по два {bad}");
+        assert!(m.triangles() > 0, "осколок {i} без поверхности");
+    }
+    let total_mesh: f32 = meshes.iter().map(mesh_volume).sum();
+    assert!(
+        (total_mesh as f64 - body.volume()).abs() / body.volume() < 0.05,
+        "объём мешей осколков {total_mesh} против {}",
+        body.volume()
+    );
     let sizes: Vec<usize> = shards.iter().map(|s| s.tets.len()).collect();
     eprintln!("осколки: {} штук, размеры {:?}", shards.len(), sizes);
 }

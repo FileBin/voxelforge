@@ -12,6 +12,7 @@
 use std::path::PathBuf;
 
 use voxelforge_world::bcc::BASE;
+use voxelforge_world::collide;
 use voxelforge_world::tet::{split_surfaces, Lcg, TetBody};
 use voxelforge_world::sim::{find_shaders, GpuBody, GpuSim, Params};
 use voxelforge_world::types::Body;
@@ -87,7 +88,7 @@ fn main() {
         // Вершины локальные: кадр прибавит позицию тела, поэтому вычитаем
         // центроид осколка — тот же, что уходит в физику.
         for (k, m) in meshes.iter_mut().enumerate() {
-            let c = shards[k].centroid();
+            let c = shards[k].world_centroid();
             for p in m.positions.iter_mut() {
                 p[0] -= c[0];
                 p[1] -= c[1];
@@ -105,12 +106,17 @@ fn main() {
                     grid_lo: g.lo,
                     grid_hi: g.hi,
                     grid_step: g.step,
+                    edges: shards[k].edge_lines(),
                 }
             })
             .collect()
     }
 
     let mut shapes: Vec<Shape> = rebuild(&shards, plate.origin);
+    // тетраэдры каждого тела в локальных координатах — по ним считаются контакты
+    let mut tet_shapes: Vec<Vec<[[f32; 3]; 4]>> =
+        shards.iter().map(|s| s.surface_tets()).collect();
+    tet_shapes.push(ball.surface_tets());
     let mut shape_id: Vec<u32> = (0..shards.len() as u32).collect();
     let ball_shape = shapes.len() as u32;
     shapes.push(vfw::shape_of(&ball));
@@ -120,8 +126,7 @@ fn main() {
     let mut cpu: Vec<Body> = Vec::new();
     for s in &shards {
         // центроид тетраэдров локальный — возвращаем его в мир через origin
-        let c0 = s.centroid();
-        let c = [c0[0] + plate.origin[0], c0[1] + plate.origin[1], c0[2] + plate.origin[2]];
+        let c = s.world_centroid();
         let (lo, hi) = s.bounds();
         // Коллизионная коробка осколка чуть меньше его габарита: у осколка
         // рваные края, и по полному AABB соседние осколки «склеены» — они бы
@@ -188,9 +193,76 @@ fn main() {
     let mut subdiv_log: Vec<String> = Vec::new();
     let mut broke = false;
 
+    let mut snap = gpu.read_bodies();
     for f in 0..args.frames {
-        gpu.frame(1.0 / 60.0, args.substeps, args.iterations);
-        let snap = gpu.read_bodies();
+        // Контакты считаются по САМИМ тетраэдрам (SAT), а не по AABB: пары
+        // ищутся по сетке, в список тела попадают самые глубокие.
+        let positions: Vec<[f32; 3]> = snap
+            .iter()
+            .map(|b| [b.pos_r[0], b.pos_r[1], b.pos_r[2]])
+            .collect();
+        let t0 = std::time::Instant::now();
+        let contacts = collide::build(
+            &tet_shapes,
+            &positions,
+            0.0,
+            (params.lo, params.hi),
+            BASE * 0.5,
+        );
+        // Пробуждение: спящее тело должен разбудить сосед, который реально
+        // едет — иначе плита проспит удар (солвер спящие не считает).
+        let mut woke = snap.clone();
+        let speed = |b: &GpuBody| {
+            (b.vel_m[0].powi(2) + b.vel_m[1].powi(2) + b.vel_m[2].powi(2)).sqrt()
+        };
+        let mut any_woke = false;
+        for i in 0..n_shards + 1 {
+            if snap[i].misc[1] < 0.5 {
+                continue;
+            }
+            let hit_by_mover = contacts[i].iter().any(|c| {
+                c.other >= 0 && snap[c.other as usize].misc[1] < 0.5 && speed(&snap[c.other as usize]) > 0.4
+            });
+            if !hit_by_mover {
+                continue;
+            }
+            woke[i].misc[1] = 0.0;
+            woke[i].misc[0] = 0.0;
+            woke[i].vel_m[3] = woke[i].misc[2];
+            woke[i].ang_i[3] = woke[i].misc[3];
+            woke[i].anchor = [woke[i].pos_r[0], woke[i].pos_r[1], woke[i].pos_r[2], 0.0];
+            any_woke = true;
+        }
+        if any_woke {
+            gpu.write_bodies(&woke);
+            snap = woke;
+        }
+
+        if std::env::var("VF_DEBUG").is_ok() && f < 6 {
+            let counts: Vec<usize> = contacts.iter().map(|c| c.len()).collect();
+            println!("  кадр {f}: контактов по телам {counts:?}");
+            for (i, c) in contacts.iter().enumerate() {
+                if let Some(first) = c.first() {
+                    println!("    тело {i}: первый контакт other={} n={:?} pen={:.4}", first.other, first.n, first.pen);
+                }
+            }
+        }
+        if std::env::var("VF_TIME").is_ok() {
+            println!("  контакты {:.1} мс", t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        let t1 = std::time::Instant::now();
+        if std::env::var("VF_DEBUG").is_ok() && (f == 5 || f == 30 || f == 60) {
+            println!("  кадр {f}: тело 0 pos {:?} vel {:?} asleep {}", 
+                snap[0].pos_r, snap[0].vel_m, snap[0].misc[1]);
+            println!("    контакты тела 0: {:?}", contacts[0]);
+            println!("    тетраэдров в tet_shapes: {:?}", tet_shapes.iter().map(|t| t.len()).collect::<Vec<_>>());
+        }
+        gpu.write_contacts(&contacts);
+        gpu.frame_with_contacts(1.0 / 60.0, args.substeps, args.iterations);
+        if std::env::var("VF_TIME").is_ok() {
+            println!("  gpu {:.1} мс", t1.elapsed().as_secs_f64() * 1000.0);
+        }
+        snap = gpu.read_bodies();
 
         // Удар: снаряд коснулся плиты. Мгновенный раскол — это не украшение,
         // а модель: упругая энергия, запасённая до разрушения, уходит в разлёт.
@@ -258,6 +330,9 @@ fn main() {
             if refined {
                 let base_len = shapes.len();
                 let new_meshes = rebuild(&shards, plate.origin);
+                for (k, s) in shards.iter().enumerate() {
+                    tet_shapes[k] = s.surface_tets();
+                }
                 shapes.extend(new_meshes);
                 for (k, id) in shape_id.iter_mut().enumerate() {
                     *id = (base_len + k) as u32;

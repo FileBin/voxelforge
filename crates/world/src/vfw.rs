@@ -21,6 +21,8 @@ pub struct Shape {
     pub grid_lo: [f32; 3],
     pub grid_hi: [f32; 3],
     pub grid_step: f32,
+    /// Каркас самих тетраэдров (пары точек) — вьюер показывает его вместо меша.
+    pub edges: Vec<[f32; 3]>,
 }
 
 pub struct BodyFrame {
@@ -33,7 +35,7 @@ pub fn shape_of(body: &TetBody) -> Shape {
     let (mut mesh, grid) = body.surface_grid();
     // Меш строится в мировых координатах (узлы решётки), а кадр задаёт
     // позицию тела — значит вершины должны быть ЛОКАЛЬНЫМИ.
-    let c = body.centroid();
+    let c = body.world_centroid();
     for p in mesh.positions.iter_mut() {
         p[0] -= c[0];
         p[1] -= c[1];
@@ -45,13 +47,14 @@ pub fn shape_of(body: &TetBody) -> Shape {
         grid_lo: grid.lo,
         grid_hi: grid.hi,
         grid_step: grid.step,
+        edges: body.edge_lines(),
     }
 }
 
 pub fn encode(frames: &[Vec<BodyFrame>], shapes: &[Shape]) -> Vec<u8> {
     let total: usize = shapes.iter().map(|s| s.mesh.positions.len()).sum();
     let mut out = Vec::new();
-    out.extend_from_slice(b"VFW3");
+    out.extend_from_slice(b"VFW4");
     out.extend_from_slice(&(frames.len() as u32).to_le_bytes());
     out.extend_from_slice(&(shapes.len() as u32).to_le_bytes());
     out.extend_from_slice(&(total as u32).to_le_bytes());
@@ -76,6 +79,13 @@ pub fn encode(frames: &[Vec<BodyFrame>], shapes: &[Shape]) -> Vec<u8> {
         for i in &s.mesh.indices {
             out.extend_from_slice(&i.to_le_bytes());
         }
+        out.extend_from_slice(&(s.edges.len() as u32).to_le_bytes());
+        for p in &s.edges {
+            for k in 0..3 {
+                out.extend_from_slice(&p[k].to_le_bytes());
+            }
+        }
+
     }
 
     for f in frames {

@@ -53,26 +53,29 @@ export class WorldRenderer {
 
       gl.bindVertexArray(null);
 
-      // линии сетки: контур bbox плюс рёбра через gridStep
-      const lines = [];
-      const lo = sh.gridLo;
-      const hi = sh.gridHi;
-      const st = sh.gridStep > 0 ? sh.gridStep : sh.edge;
-      const pushSeg = (a, b) => lines.push(a[0], a[1], a[2], b[0], b[1], b[2]);
-      for (let axis = 0; axis < 3; axis++) {
-        for (let u = 0; u <= 1; u++) {
-          for (let v = 0; v <= 1; v++) {
-            const p0 = [0, 0, 0];
-            const p1 = [0, 0, 0];
-            const a1 = (axis + 1) % 3;
-            const a2 = (axis + 2) % 3;
-            p0[a1] = u ? hi[a1] : lo[a1];
-            p0[a2] = v ? hi[a2] : lo[a2];
-            p1[a1] = p0[a1];
-            p1[a2] = p0[a2];
-            p0[axis] = lo[axis];
-            p1[axis] = hi[axis];
-            pushSeg(p0, p1);
+      // Каркас тетраэдров: именно сами воксели, а не их меш. Когда включён
+      // режим «показать тетраэдры», меш не рисуется вовсе.
+      const lines = sh.edges ? Array.from(sh.edges) : [];
+      // если рёбер нет (старый файл) — хотя бы контур решётки
+      if (lines.length === 0) {
+        const lo = sh.gridLo;
+        const hi = sh.gridHi;
+        const pushSeg = (a, b) => lines.push(a[0], a[1], a[2], b[0], b[1], b[2]);
+        for (let axis = 0; axis < 3; axis++) {
+          for (let u = 0; u <= 1; u++) {
+            for (let v = 0; v <= 1; v++) {
+              const p0 = [0, 0, 0];
+              const p1 = [0, 0, 0];
+              const a1 = (axis + 1) % 3;
+              const a2 = (axis + 2) % 3;
+              p0[a1] = u ? hi[a1] : lo[a1];
+              p0[a2] = v ? hi[a2] : lo[a2];
+              p1[a1] = p0[a1];
+              p1[a2] = p0[a2];
+              p0[axis] = lo[axis];
+              p1[axis] = hi[axis];
+              pushSeg(p0, p1);
+            }
           }
         }
       }
@@ -103,6 +106,7 @@ export class WorldRenderer {
       0.72 + 0.06 * level,
     ];
     for (const body of row) {
+      if (this.showGrid) continue; // режим «тетраэдры»: меш скрыт
       const sh = this.data.shapes[body.shape];
       const buf = this.buffers[body.shape];
       if (!buf || !buf.count) continue;

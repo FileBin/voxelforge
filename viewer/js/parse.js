@@ -17,7 +17,7 @@ function magicOf(buf) {
 export function detectFormat(buf) {
   const m = magicOf(buf);
   if (m === "VFR1" || m === "VFR2") return "vfr";
-  if (m === "VFW1" || m === "VFW2" || m === "VFW3") return "vfw";
+  if (m === "VFW1" || m === "VFW2" || m === "VFW3" || m === "VFW4") return "vfw";
   return null;
 }
 
@@ -74,7 +74,7 @@ export function parseTrace(buf) {
 export function parseWorld(buf) {
   const dv = new DataView(buf);
   const magic = magicOf(buf);
-  if (magic !== "VFW2" && magic !== "VFW3") throw new Error("не VFW2/VFW3: " + magic);
+  if (magic !== "VFW2" && magic !== "VFW3" && magic !== "VFW4") throw new Error("не VFW2/VFW3/VFW4: " + magic);
   const nf = dv.getUint32(4, true);
   const nShapes = dv.getUint32(8, true);
   const total = dv.getUint32(12, true);
@@ -90,7 +90,7 @@ export function parseWorld(buf) {
     const gridLo = [0, 0, 0];
     const gridHi = [0, 0, 0];
     let gridStep = 0;
-    if (magic === "VFW3") {
+    if (magic !== "VFW2") {
       for (let k = 0; k < 3; k++) gridLo[k] = dv.getFloat32(off + k * 4, true);
       for (let k = 0; k < 3; k++) gridHi[k] = dv.getFloat32(off + 12 + k * 4, true);
       gridStep = dv.getFloat32(off + 24, true);
@@ -105,6 +105,16 @@ export function parseWorld(buf) {
     for (let i = 0; i < ni; i++) {
       indices[i] = dv.getUint32(off, true);
       off += 4;
+    }
+    let edges = null;
+    if (magic === "VFW4") {
+      const nl = dv.getUint32(off, true);
+      off += 4;
+      edges = new Float32Array(nl * 3);
+      for (let i = 0; i < nl * 3; i++) {
+        edges[i] = dv.getFloat32(off, true);
+        off += 4;
+      }
     }
     // габарит формы — по вершинам меша
     const blo = [Infinity, Infinity, Infinity];
@@ -149,6 +159,7 @@ export function parseWorld(buf) {
       gridLo,
       gridHi,
       gridStep,
+      edges,
     });
   }
 

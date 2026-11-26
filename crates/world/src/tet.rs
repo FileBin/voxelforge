@@ -154,7 +154,10 @@ impl TetBody {
         }
         Self {
             tets,
-            level_cap: level + 2,
+            // Предел дробления: ещё один уровень. Два уровня — это 8× тетраэдров,
+            // и столкновения по тетраэдрам на CPU становятся слишком дорогими
+            // (нужен широкий проход на GPU).
+            level_cap: level + 1,
             origin: center,
         }
     }
@@ -236,6 +239,16 @@ impl TetBody {
         ]
     }
 
+    /// Центроид в мировых координатах (с учётом `origin`).
+    pub fn world_centroid(&self) -> [f32; 3] {
+        let c = self.centroid();
+        [
+            c[0] + self.origin[0],
+            c[1] + self.origin[1],
+            c[2] + self.origin[2],
+        ]
+    }
+
     pub fn bounds(&self) -> ([f32; 3], [f32; 3]) {
         let mut lo = [f32::MAX; 3];
         let mut hi = [f32::MIN; 3];
@@ -295,6 +308,77 @@ impl TetBody {
             .collect()
     }
 
+    /// Тетраэдры в локальных координатах (относительно центроида) — для
+    /// столкновений и для показа самих тетраэдров во вьюере.
+    pub fn local_tets(&self) -> Vec<[[f32; 3]; 4]> {
+        let c = self.world_centroid();
+        self.tets
+            .iter()
+            .map(|t| {
+                std::array::from_fn(|i| {
+                    let p = node_pos(t.v[i], t.level, self.origin);
+                    [p[0] - c[0], p[1] - c[1], p[2] - c[2]]
+                })
+            })
+            .collect()
+    }
+
+    /// Только поверхностные тетраэдры (у которых есть грань наружу) — для
+    /// столкновений: внутренние тетраэдры никого не касаются, а их большинство.
+    pub fn surface_tets(&self) -> Vec<[[f32; 3]; 4]> {
+        let c0 = self.world_centroid();
+        let mut count: HashMap<[u64; 3], u32> = HashMap::new();
+        for t in &self.tets {
+            for (i, j, k) in [(0usize, 1usize, 2usize), (0, 1, 3), (0, 2, 3), (1, 2, 3)] {
+                let mut key = [pack(t.v[i]), pack(t.v[j]), pack(t.v[k])];
+                key.sort();
+                *count.entry(key).or_insert(0) += 1;
+            }
+        }
+        let c = c0;
+        self.tets
+            .iter()
+            .filter(|t| {
+                [(0usize, 1usize, 2usize), (0, 1, 3), (0, 2, 3), (1, 2, 3)]
+                    .iter()
+                    .any(|(i, j, k)| {
+                        let mut key = [pack(t.v[*i]), pack(t.v[*j]), pack(t.v[*k])];
+                        key.sort();
+                        count.get(&key).copied().unwrap_or(0) == 1
+                    })
+            })
+            .map(|t| {
+                std::array::from_fn(|i| {
+                    let p = node_pos(t.v[i], t.level, self.origin);
+                    [p[0] - c[0], p[1] - c[1], p[2] - c[2]]
+                })
+            })
+            .collect()
+    }
+
+    /// Рёбра тетраэдров (пары точек) без повторов — каркас для вьюера.
+    pub fn edge_lines(&self) -> Vec<[f32; 3]> {
+        let c = self.world_centroid();
+        let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for t in &self.tets {
+            let p: [[f32; 3]; 4] =
+                std::array::from_fn(|i| node_pos(t.v[i], t.level, self.origin));
+            for (i, j) in [(0usize, 1usize), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)] {
+                let a = pack(t.v[i]);
+                let b = pack(t.v[j]);
+                let key = if a < b { (a, b) } else { (b, a) };
+                if !seen.insert(key) {
+                    continue;
+                }
+                for k in [i, j] {
+                    out.push([p[k][0] - c[0], p[k][1] - c[1], p[k][2] - c[2]]);
+                }
+            }
+        }
+        out
+    }
+
     /// Марчинг по тетраэдрам: граничные грани тетраэдров + сглаживание.
     ///
     /// Поле занятости бинарное, поэтому настоящей дроби `t` на ребре не
@@ -326,7 +410,7 @@ impl TetBody {
     /// Точная поверхность: грани, встречающиеся у одного тетраэдра.
     fn extract_faces(&self) -> Mesh {
         let mut faces: HashMap<[u64; 3], (u32, [Node; 3], u8, [f32; 3])> = HashMap::new();
-        let origin = self.centroid();
+        let origin = self.world_centroid();
         for t in &self.tets {
             let p: [[f32; 3]; 4] = std::array::from_fn(|i| node_pos(t.v[i], t.level, origin));
             for (i, j, k) in [(0usize, 1usize, 2usize), (0, 1, 3), (0, 2, 3), (1, 2, 3)] {

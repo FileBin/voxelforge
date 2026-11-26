@@ -267,7 +267,8 @@ impl GpuSim {
         };
         let bodies_a = mk(n * BODY_BYTES, true);
         let bodies_b = mk(n * BODY_BYTES, true);
-        let list = mk(n * CAP * 32, false);
+        // host-visible: контакты может заливать и CPU (столкновения по тетраэдрам)
+        let list = mk(n * CAP * 32, true);
         let lcount = mk(n * 4, true);
         let cellcnt = mk(ncells as usize * 4, false);
         let starts = mk((ncells as usize + 1) * 4, false);
@@ -357,6 +358,48 @@ impl GpuSim {
     /// Один кадр = substeps × (интегрирование → сетка → пары → итерации →
     /// позиции). Всё уходит одной командой в GPU, CPU ждёт только fence.
     pub fn frame(&mut self, dt: f32, substeps: u32, iterations: u32) {
+        self.frame_ex(dt, substeps, iterations, false)
+    }
+
+    /// Кадр с контактами, посчитанными на CPU по тетраэдрам: проходы
+    /// `static_contacts` и `broad` пропускаются, список контактов уже залит
+    /// через `write_contacts`.
+    pub fn frame_with_contacts(&mut self, dt: f32, substeps: u32, iterations: u32) {
+        self.frame_ex(dt, substeps, iterations, true)
+    }
+
+    /// Залить контакты в буферы солвера. Формат C: `ivec4 meta` (x — партнёр),
+    /// `vec4 n_pen` (xyz — нормаль к партнёру, w — проникновение).
+    pub fn write_contacts(&mut self, contacts: &[Vec<crate::collide::Contact>]) {
+        let cap = 24usize;
+        let mut lc = vec![0u32; self.n];
+        let mut list = vec![0u8; self.n * cap * 32];
+        for (i, cs) in contacts.iter().enumerate().take(self.n) {
+            lc[i] = cs.len().min(cap) as u32;
+            for (k, c) in cs.iter().take(cap).enumerate() {
+                let off = (i * cap + k) * 32;
+                list[off..off + 4].copy_from_slice(&c.other.to_le_bytes());
+                list[off + 4..off + 8].copy_from_slice(&0i32.to_le_bytes());
+                list[off + 8..off + 12].copy_from_slice(&0i32.to_le_bytes());
+                list[off + 12..off + 16].copy_from_slice(&0i32.to_le_bytes());
+                for (j, v) in [c.n[0], c.n[1], c.n[2], c.pen].iter().enumerate() {
+                    list[off + 16 + j * 4..off + 20 + j * 4].copy_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+        unsafe {
+            check_status(
+                vf_buffer_write(self.ctx, self.list, 0, list.as_ptr() as *const c_void, list.len()),
+                "write contacts",
+            );
+            check_status(
+                vf_buffer_write(self.ctx, self.lcount, 0, lc.as_ptr() as *const c_void, lc.len() * 4),
+                "write contact counts",
+            );
+        }
+    }
+
+    fn frame_ex(&mut self, dt: f32, substeps: u32, iterations: u32, external_contacts: bool) {
         let h = dt / substeps as f32;
         let g_body = ((self.n as u32) + WG - 1) / WG;
         let biggest = (self.n as u32).max(self.ncells as u32);
@@ -373,42 +416,54 @@ impl GpuSim {
                 push,
                 groups: [g_body, 1, 1],
             });
+            if !external_contacts {
             steps.push(Step {
                 pipe: P_CLEAR,
                 bufs: vec![self.lcount, self.cellcnt],
                 push,
                 groups: [g_cell, 1, 1],
             });
+            }
+            if !external_contacts {
             steps.push(Step {
                 pipe: P_COUNT,
                 bufs: vec![a, self.cellcnt],
                 push,
                 groups: [g_body, 1, 1],
             });
+            }
+            if !external_contacts {
             steps.push(Step {
                 pipe: P_SCAN,
                 bufs: vec![self.cellcnt, self.starts, self.cursor],
                 push,
                 groups: [1, 1, 1],
             });
+            }
+            if !external_contacts {
             steps.push(Step {
                 pipe: P_FILL,
                 bufs: vec![a, self.cursor, self.starts, self.cbody],
                 push,
                 groups: [g_body, 1, 1],
             });
-            steps.push(Step {
-                pipe: P_STATIC,
-                bufs: vec![a, self.list, self.lcount],
-                push,
-                groups: [g_body, 1, 1],
-            });
-            steps.push(Step {
-                pipe: P_BROAD,
-                bufs: vec![a, self.starts, self.cbody, self.list, self.lcount],
-                push,
-                groups: [g_body, 1, 1],
-            });
+            }
+            if !external_contacts {
+                steps.push(Step {
+                    pipe: P_STATIC,
+                    bufs: vec![a, self.list, self.lcount],
+                    push,
+                    groups: [g_body, 1, 1],
+                });
+            }
+            if !external_contacts {
+                steps.push(Step {
+                    pipe: P_BROAD,
+                    bufs: vec![a, self.starts, self.cbody, self.list, self.lcount],
+                    push,
+                    groups: [g_body, 1, 1],
+                });
+            }
             // Итерации солвера: чётное число, поэтому данные возвращаются в a.
             for it in 0..iterations {
                 let (src, dst) = if it % 2 == 0 { (a, b) } else { (b, a) };
