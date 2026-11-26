@@ -63,17 +63,17 @@ impl LiveBody {
         r
     }
 
-    fn world_tets(&self) -> Vec<[[f32; 3]; 4]> {
+    /// Тетраэдры в системе тела, ПОВЁРНУТЫЕ, но без переноса: `collide::build`
+    /// сам прибавляет позицию тела. Раньше здесь прибавлялась ещё и позиция —
+    /// коллайдер уезжал на удвоенную высоту: плита падала сквозь пол на 28 см,
+    /// спала там и «прыгала», а каркас не совпадал с мешем.
+    fn rotated_tets(&self) -> Vec<[[f32; 3]; 4]> {
         self.local
             .iter()
             .map(|t| {
                 std::array::from_fn(|k| {
                     let p = rot(self.quat, [t[k][0] as f64, t[k][1] as f64, t[k][2] as f64]);
-                    [
-                        (p[0] + self.pos[0]) as f32,
-                        (p[1] + self.pos[1]) as f32,
-                        (p[2] + self.pos[2]) as f32,
-                    ]
+                    [p[0] as f32, p[1] as f32, p[2] as f32]
                 })
             })
             .collect()
@@ -153,6 +153,18 @@ impl Live {
             alive: true,
         };
         body.rebuild();
+        // Ставим плиту ровно на пол по ЛОКАЛЬНЫМ тетраэдрам (это и есть
+        // коллайдер). bounds() считает в другой системе, из-за него плита
+        // стартовала вдвое выше, падала на 28 см и подпрыгивала.
+        let mut lowest_local = f32::MAX;
+        for t in &body.local {
+            for v in t {
+                lowest_local = lowest_local.min(v[1]);
+            }
+        }
+        if lowest_local.is_finite() {
+            body.pos[1] = (-lowest_local) as f64 + 0.001;
+        }
 
         let mut gpu_bodies: Vec<GpuBody> = Vec::with_capacity(MAX_BODIES);
         gpu_bodies.push(gpu_body(&body));
@@ -228,7 +240,7 @@ impl Live {
         for _ in 0..chunks {
             let mut tet_shapes: Vec<Vec<[[f32; 3]; 4]>> = Vec::with_capacity(MAX_BODIES);
             for b in &self.bodies {
-                tet_shapes.push(if b.alive { b.world_tets() } else { Vec::new() });
+                tet_shapes.push(if b.alive { b.rotated_tets() } else { Vec::new() });
             }
             while tet_shapes.len() < MAX_BODIES {
                 tet_shapes.push(Vec::new());
@@ -358,7 +370,7 @@ impl Live {
     pub fn max_pen(&self) -> f32 {
         let mut tet_shapes: Vec<Vec<[[f32; 3]; 4]>> = Vec::with_capacity(MAX_BODIES);
         for b in &self.bodies {
-            tet_shapes.push(if b.alive { b.world_tets() } else { Vec::new() });
+            tet_shapes.push(if b.alive { b.rotated_tets() } else { Vec::new() });
         }
         while tet_shapes.len() < MAX_BODIES {
             tet_shapes.push(Vec::new());
