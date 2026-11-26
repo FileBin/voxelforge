@@ -212,6 +212,75 @@ pub fn tet_tet(a: &[[f32; 3]; 4], b: &[[f32; 3]; 4]) -> Option<([f32; 3], f32, [
     Some((best_axis, best_overlap, p))
 }
 
+
+/// Копия логики `sat.comp`, написанная дословно (для бисекта: если она
+/// совпадает с CPU, значит расходится не алгоритм, а входные данные шейдера).
+pub fn tet_tet_shader_style(a: &[[f32; 3]; 4], b: &[[f32; 3]; 4]) -> Option<([f32; 3], f32, [f32; 3])> {
+    let mut alo = [f32::MAX; 3];
+    let mut ahi = [f32::MIN; 3];
+    for v in a { for k in 0..3 { alo[k] = alo[k].min(v[k]); ahi[k] = ahi[k].max(v[k]); } }
+    let mut blo = [f32::MAX; 3];
+    let mut bhi = [f32::MIN; 3];
+    for v in b { for k in 0..3 { blo[k] = blo[k].min(v[k]); bhi[k] = bhi[k].max(v[k]); } }
+    for k in 0..3 { if alo[k] > bhi[k] || blo[k] > ahi[k] { return None; } }
+
+    let mut axes = [[0.0f32; 3]; 44];
+    let mut na = 0usize;
+    // те же тройки вершин, что в шейдере: (0,1,2), (0,2,3), (1,2,3), (0,1,3)
+    let faces: [(usize, usize, usize); 4] = [(0, 1, 2), (0, 2, 3), (1, 2, 3), (0, 1, 3)];
+    for t in [a, b] {
+        for (i, j, k) in faces {
+            let u = sub(t[j], t[i]);
+            let v = sub(t[k], t[i]);
+            axes[na] = norm(cross(u, v));
+            na += 1;
+        }
+    }
+    const EDGES: [(usize, usize); 6] = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)];
+    for (i, j) in EDGES {
+        let ea = sub(a[j], a[i]);
+        for (k, l) in EDGES {
+            let eb = sub(b[l], b[k]);
+            let c = cross(ea, eb);
+            let len2 = dot(c, c);
+            if len2 > 1e-8 {
+                let inv = 1.0 / len2.sqrt();
+                axes[na] = [c[0] * inv, c[1] * inv, c[2] * inv];
+                na += 1;
+            }
+        }
+    }
+
+    let ca = [(a[0][0] + a[1][0] + a[2][0] + a[3][0]) * 0.25,
+              (a[0][1] + a[1][1] + a[2][1] + a[3][1]) * 0.25,
+              (a[0][2] + a[1][2] + a[2][2] + a[3][2]) * 0.25];
+    let cb = [(b[0][0] + b[1][0] + b[2][0] + b[3][0]) * 0.25,
+              (b[0][1] + b[1][1] + b[2][1] + b[3][1]) * 0.25,
+              (b[0][2] + b[1][2] + b[2][2] + b[3][2]) * 0.25];
+
+    let mut best_axis = [0.0f32; 3];
+    let mut best_overlap = f32::MAX;
+    for n in axes[..na].iter() {
+        let (al, ah) = project(a, *n);
+        let (bl, bh) = project(b, *n);
+        let overlap = ah.min(bh) - al.max(bl);
+        if overlap <= 0.0 { return None; }
+        if overlap < best_overlap {
+            best_overlap = overlap;
+            best_axis = if dot(sub(cb, ca), *n) < 0.0 { [-n[0], -n[1], -n[2]] } else { *n };
+        }
+    }
+    if best_overlap == f32::MAX { return None; }
+    let n = best_axis;
+    let mut va = a[0];
+    let mut best = dot(a[0], n);
+    for v in a.iter() { if dot(*v, n) > best { best = dot(*v, n); va = *v; } }
+    let mut vb = b[0];
+    let mut worst = dot(b[0], n);
+    for v in b.iter() { if dot(*v, n) < worst { worst = dot(*v, n); vb = *v; } }
+    Some((n, best_overlap, [0.5 * (va[0] + vb[0]), 0.5 * (va[1] + vb[1]), 0.5 * (va[2] + vb[2])]))
+}
+
 /// Пары тетраэдров, которые вообще стоит проверять SAT.
 ///
 /// Та же сетка и та же дедупликация, что в `build`, только без SAT: на GPU

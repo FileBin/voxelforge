@@ -24,6 +24,7 @@ fn main() {
         let wa: [[f32; 3]; 4] = rotated[b1][t1].map(|v| [v[0] + pos[b1][0], v[1] + pos[b1][1], v[2] + pos[b1][2]]);
         let wb: [[f32; 3]; 4] = rotated[b2][t2].map(|v| [v[0] + pos[b2][0], v[1] + pos[b2][1], v[2] + pos[b2][2]]);
         let Some((cn, cpen, cp)) = collide::tet_tet(&wa, &wb) else { continue };
+        let sh = collide::tet_tet_shader_style(&wa, &wb);
 
         w.gpu.set_pairs(&[(((b1 as u32) << 20) | t1 as u32, ((b2 as u32) << 20) | t2 as u32)]);
         w.gpu.run_sat();
@@ -31,6 +32,11 @@ fn main() {
         let Some(gc) = g[b1].first() else { println!("GPU контакта нет, CPU есть (pen {cpen:.4})"); continue };
         println!("CPU: n=[{:.3},{:.3},{:.3}] pen={:.4} p=[{:.3},{:.3},{:.3}]",
             cn[0], cn[1], cn[2], cpen, cp[0], cp[1], cp[2]);
+        match sh {
+            Some((sn, sp, spp)) => println!("ШЕЙДЕР-В-RUST: n=[{:.3},{:.3},{:.3}] pen={:.4} p=[{:.3},{:.3},{:.3}]",
+                sn[0], sn[1], sn[2], sp, spp[0], spp[1], spp[2]),
+            None => println!("ШЕЙДЕР-В-RUST: нет контакта"),
+        }
         println!("GPU: n=[{:.3},{:.3},{:.3}] pen={:.4} p=[{:.3},{:.3},{:.3}]",
             gc.n[0], gc.n[1], gc.n[2], gc.pen, gc.p[0], gc.p[1], gc.p[2]);
         shown += 1;
