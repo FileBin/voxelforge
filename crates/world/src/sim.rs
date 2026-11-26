@@ -4,46 +4,47 @@
 //! сетка пар. CPU за кадр делает ровно одно дело — отправляет пачку
 //! dispatch'ей и (в тестовом режиме) читает обратно результат для сверки.
 
+use crate::types::{Body, Shape};
 use std::ffi::{c_char, c_void, CStr};
 use std::path::{Path, PathBuf};
 
 #[repr(C)]
-pub(crate) struct VfStatus {
+pub struct VfStatus {
     pub(crate) code: i32,
     msg: *const c_char,
 }
 
 #[repr(C)]
-pub(crate) struct VfDispatch {
-    pub(crate) pipeline: *mut c_void,
-    pub(crate) buffers: *mut *mut c_void,
-    pub(crate) n_buffers: u32,
-    pub(crate) push: *const c_void,
-    pub(crate) push_bytes: u32,
-    pub(crate) groups: [u32; 3],
+pub struct VfDispatch {
+    pub pipeline: *mut c_void,
+    pub buffers: *mut *mut c_void,
+    pub n_buffers: u32,
+    pub push: *const c_void,
+    pub push_bytes: u32,
+    pub groups: [u32; 3],
 }
 
 unsafe extern "C" {
-    pub(crate) fn vf_init(out: *mut *mut c_void) -> VfStatus;
-    pub(crate) fn vf_shutdown(c: *mut c_void);
-    pub(crate) fn vf_device_info(c: *mut c_void, name: *mut c_char, len: usize, api: *mut u32) -> VfStatus;
-    pub(crate) fn vf_buffer_new(c: *mut c_void, bytes: usize, host: i32, out: *mut *mut c_void) -> VfStatus;
-    pub(crate) fn vf_buffer_free(c: *mut c_void, b: *mut c_void);
-    pub(crate) fn vf_buffer_write(
+    pub fn vf_init(out: *mut *mut c_void) -> VfStatus;
+    pub fn vf_shutdown(c: *mut c_void);
+    pub fn vf_device_info(c: *mut c_void, name: *mut c_char, len: usize, api: *mut u32) -> VfStatus;
+    pub fn vf_buffer_new(c: *mut c_void, bytes: usize, host: i32, out: *mut *mut c_void) -> VfStatus;
+    pub fn vf_buffer_free(c: *mut c_void, b: *mut c_void);
+    pub fn vf_buffer_write(
         c: *mut c_void,
         b: *mut c_void,
         off: usize,
         src: *const c_void,
         n: usize,
     ) -> VfStatus;
-    pub(crate) fn vf_buffer_read(
+    pub fn vf_buffer_read(
         c: *mut c_void,
         b: *mut c_void,
         off: usize,
         dst: *mut c_void,
         n: usize,
     ) -> VfStatus;
-    pub(crate) fn vf_pipeline_new(
+    pub fn vf_pipeline_new(
         c: *mut c_void,
         spirv: *const u32,
         bytes: usize,
@@ -52,11 +53,11 @@ unsafe extern "C" {
         name: *const c_char,
         out: *mut *mut c_void,
     ) -> VfStatus;
-    pub(crate) fn vf_pipeline_free(c: *mut c_void, p: *mut c_void);
-    pub(crate) fn vf_run(c: *mut c_void, list: *mut VfDispatch, count: u32) -> VfStatus;
+    pub fn vf_pipeline_free(c: *mut c_void, p: *mut c_void);
+    pub fn vf_run(c: *mut c_void, list: *mut VfDispatch, count: u32) -> VfStatus;
 }
 
-pub(crate) fn check_status(s: VfStatus, what: &str) {
+pub fn check_status(s: VfStatus, what: &str) {
     if s.code != 0 {
         let msg = unsafe { CStr::from_ptr(s.msg) }.to_string_lossy();
         panic!("{what}: [{:#x}] {msg}", s.code);
@@ -80,11 +81,11 @@ pub struct GpuBody {
 }
 
 impl GpuBody {
-    pub fn from_cpu(b: &crate::Body) -> Self {
+    pub fn from_cpu(b: &Body) -> Self {
         let im = if b.mass > 0.0 { 1.0 / b.mass } else { 0.0 } as f32;
         let shape = match b.shape {
-            crate::Shape::Sphere => 0.0,
-            crate::Shape::Block => 1.0,
+            Shape::Sphere => 0.0,
+            Shape::Block => 1.0,
         };
         Self {
             pos_r: [b.pos[0] as f32, b.pos[1] as f32, b.pos[2] as f32, b.radius],
@@ -106,15 +107,13 @@ impl GpuBody {
 /// Готовая сцена: тела плюс параметры ящика и сетки.
 pub struct Scene {
     pub name: &'static str,
-    /// Воксельный статический коллайдер (поле SDF), если он есть у сцены.
-    pub voxel: Option<crate::VoxelBody>,
     /// Тела в представлении эталона: для записи `.vfr` и для сверки.
-    pub cpu: Vec<crate::Body>,
+    pub cpu: Vec<Body>,
     pub bodies: Vec<GpuBody>,
     pub params: Params,
 }
 
-fn params_for(bodies: &[GpuBody], lo: [f32; 3], hi: [f32; 3], friction: f32) -> Params {
+pub fn params_for(bodies: &[GpuBody], lo: [f32; 3], hi: [f32; 3], friction: f32) -> Params {
     /* Ячейка обязана быть не меньше самого крупного тела: иначе пара,
      * которая уже пересекается, окажется в ячейках дальше чем за один шаг. */
     let max_half = bodies
@@ -127,79 +126,6 @@ fn params_for(bodies: &[GpuBody], lo: [f32; 3], hi: [f32; 3], friction: f32) -> 
         cell: (2.0 * max_half * 1.05).max(0.16),
         friction,
         ..Params::default()
-    }
-}
-
-pub fn scene_pile(count: usize) -> Scene {
-    let sim = crate::pile_demo(count);
-    let bodies: Vec<GpuBody> = sim.bodies.iter().map(GpuBody::from_cpu).collect();
-    let top = bodies
-        .iter()
-        .map(|b| b.pos_r[1] + b.half_shape[1])
-        .fold(0.0f32, f32::max);
-    let params = params_for(&bodies, [-0.05, 0.0, -0.05], [4.2, top + 0.5, 4.2], 0.7);
-    Scene {
-        name: "pile",
-        voxel: None,
-        cpu: sim.bodies,
-        bodies,
-        params,
-    }
-}
-
-pub fn scene_drop() -> Scene {
-    let sim = crate::ContactSim::new(vec![crate::Body::block([0.0, 3.0, 0.0], [0.5, 0.5, 0.5])]);
-    let bodies: Vec<GpuBody> = sim.bodies.iter().map(GpuBody::from_cpu).collect();
-    // Трение выключено: эталонный ContactSim его не умеет, иначе сверять нечего.
-    let params = params_for(&bodies, [-3.0, 0.0, -3.0], [3.0, 12.0, 3.0], 0.0);
-    Scene {
-        name: "drop",
-        voxel: None,
-        cpu: sim.bodies,
-        bodies,
-        params,
-    }
-}
-
-/// Тело падает на воксельное тело: поле SDF как статический коллайдер.
-pub fn scene_voxel_fall(speed: f32) -> Scene {
-    let center = [0.0f32, 0.6, 0.0];
-    let radius = 0.5f32;
-    let mut body = crate::VoxelBody::sphere(center, radius, 24, 0.05);
-    // Уточняем верхнюю часть — там, куда прилетит шар.
-    body.refine_region(center, radius, [-0.3, 0.35, -0.3], [0.3, 1.15, 0.3]);
-
-    let ball = crate::Body::new([0.0, 3.0, 0.0], [0.0, -speed as f64, 0.0], 1.0, 0.1);
-    let bodies = vec![GpuBody::from_cpu(&ball)];
-    // Трение нужно: без него шар на макушке сферы не удержится вовсе.
-    let mut params = params_for(&bodies, [-2.0, 0.0, -2.0], [2.0, 4.0, 2.0], 0.8);
-    // Мягкое выталкивание: при 1.0 м/с шар на сфере подпрыгивает вечно.
-    params.max_push = 0.2;
-    Scene {
-        name: "voxel",
-        voxel: Some(body),
-        cpu: vec![ball],
-        bodies,
-        params,
-    }
-}
-
-pub fn scene_stack(count: usize) -> Scene {
-    let half = [0.5f64, 0.2, 0.5];
-    let mut v = Vec::new();
-    for i in 0..count {
-        let y = half[1] + i as f64 * (2.0 * half[1] + 0.002);
-        v.push(crate::Body::block([0.0, y, 0.0], half));
-    }
-    let sim = crate::ContactSim::new(v);
-    let bodies: Vec<GpuBody> = sim.bodies.iter().map(GpuBody::from_cpu).collect();
-    let params = params_for(&bodies, [-3.0, 0.0, -3.0], [3.0, 12.0, 3.0], 0.0);
-    Scene {
-        name: "stack",
-        voxel: None,
-        cpu: sim.bodies,
-        bodies,
-        params,
     }
 }
 
@@ -223,13 +149,12 @@ const P_BROAD: usize = 6;
 const P_SOLVE: usize = 7;
 const P_SLEEP: usize = 8;
 const P_POS: usize = 9;
-const P_VOX: usize = 10;
 
 const CAP: usize = 24;
 /// Body = 5 × vec4.
-const BODY_BYTES: usize = 112;
+pub const BODY_BYTES: usize = 112;
 const WG: u32 = 64;
-pub(crate) const BODY_WG: u32 = 64;
+pub const BODY_WG: u32 = 64;
 
 struct Step {
     pipe: usize,
@@ -303,9 +228,6 @@ pub struct GpuSim {
     starts: *mut c_void,
     cursor: *mut c_void,
     cbody: *mut c_void,
-    vox_sdf: *mut c_void,
-    vox_params: *mut c_void,
-    has_voxel: bool,
     pipes: Vec<*mut c_void>,
 }
 
@@ -314,7 +236,6 @@ impl GpuSim {
         mut bodies: Vec<GpuBody>,
         shader_dir: &Path,
         params: Params,
-        voxel: Option<&crate::VoxelBody>,
     ) -> Self {
         let n = bodies.len();
         let mut ctx: *mut c_void = std::ptr::null_mut();
@@ -352,50 +273,7 @@ impl GpuSim {
         let starts = mk((ncells as usize + 1) * 4, false);
         let cursor = mk(ncells as usize * 4, false);
         let cbody = mk(n * 4, false);
-        let (vox_sdf, vox_params) = match voxel {
-            Some(v) => {
-                let sdf = mk((v.data.len() * 4).max(16), true);
-                let prm = mk(64, true);
-                unsafe {
-                    check_status(
-                        vf_buffer_write(ctx, sdf, 0, v.data.as_ptr() as *const c_void, v.data.len() * 4),
-                        "upload sdf",
-                    )
-                };
-                let mut params_bytes = [0u8; 64];
-                let put4f = |bytes: &mut [u8], off: usize, v: [f32; 4]| {
-                    for (k, x) in v.iter().enumerate() {
-                        bytes[off + k * 4..off + k * 4 + 4].copy_from_slice(&x.to_le_bytes());
-                    }
-                };
-                let put4i = |bytes: &mut [u8], off: usize, v: [i32; 4]| {
-                    for (k, x) in v.iter().enumerate() {
-                        bytes[off + k * 4..off + k * 4 + 4].copy_from_slice(&x.to_le_bytes());
-                    }
-                };
-                put4f(&mut params_bytes, 0, [v.base.origin[0], v.base.origin[1], v.base.origin[2], v.base.cell]);
-                put4i(&mut params_bytes, 16, [v.base.dim as i32, v.base.offset as i32, 0, 0]);
-                match &v.fine {
-                    Some(f) => {
-                        put4f(&mut params_bytes, 32, [f.origin[0], f.origin[1], f.origin[2], f.cell]);
-                        put4i(&mut params_bytes, 48, [f.dim as i32, f.offset as i32, 1, 0]);
-                    }
-                    None => {
-                        put4f(&mut params_bytes, 32, [0.0, 0.0, 0.0, 1.0]);
-                        put4i(&mut params_bytes, 48, [1, 0, 0, 0]);
-                    }
-                }
-                unsafe {
-                    check_status(
-                        vf_buffer_write(ctx, prm, 0, params_bytes.as_ptr() as *const c_void, 64),
-                        "upload vox params",
-                    )
-                };
-                (sdf, prm)
-            }
-            None => (std::ptr::null_mut(), std::ptr::null_mut()),
-        };
-
+        // Тела обязаны попасть на устройство до первого dispatch.
         unsafe {
             check_status(
                 vf_buffer_write(
@@ -409,8 +287,8 @@ impl GpuSim {
             )
         };
 
-        let names = [
-            ("integrate", 1u32),
+        let names: [(&str, u32); 10] = [
+            ("integrate", 1),
             ("clear", 2),
             ("count", 2),
             ("scan", 3),
@@ -420,7 +298,6 @@ impl GpuSim {
             ("solve", 4),
             ("sleep", 1),
             ("integrate_pos", 1),
-            ("voxel", 5),
         ];
         let mut pipes = Vec::new();
         for (nm, nb) in names.iter() {
@@ -461,9 +338,6 @@ impl GpuSim {
             starts,
             cursor,
             cbody,
-            vox_sdf,
-            vox_params,
-            has_voxel: voxel.is_some(),
             pipes,
         }
     }
@@ -529,14 +403,6 @@ impl GpuSim {
                 push,
                 groups: [g_body, 1, 1],
             });
-            if self.has_voxel {
-                steps.push(Step {
-                    pipe: P_VOX,
-                    bufs: vec![a, self.list, self.lcount, self.vox_sdf, self.vox_params],
-                    push,
-                    groups: [g_body, 1, 1],
-                });
-            }
             steps.push(Step {
                 pipe: P_BROAD,
                 bufs: vec![a, self.starts, self.cbody, self.list, self.lcount],
@@ -586,6 +452,25 @@ impl GpuSim {
         unsafe { check_status(vf_run(self.ctx, ds.as_mut_ptr(), ds.len() as u32), "vf_run") };
     }
 
+    /// Записать тела обратно на устройство: нужно, когда мир меняется по ходу
+    /// прогона (импульс раскола при ударе). Пишем в `bodies[0]` — кадр всегда
+    /// начинается с него, а чётное число итераций солвера возвращает данные туда же.
+    pub fn write_bodies(&mut self, bodies: &[GpuBody]) {
+        assert_eq!(bodies.len(), self.n, "число тел изменилось посреди прогона");
+        unsafe {
+            check_status(
+                vf_buffer_write(
+                    self.ctx,
+                    self.bodies[0],
+                    0,
+                    bodies.as_ptr() as *const c_void,
+                    self.n * BODY_BYTES,
+                ),
+                "write_bodies",
+            )
+        };
+    }
+
     pub fn read_bodies(&mut self) -> Vec<GpuBody> {
         let mut out = vec![GpuBody::default(); self.n];
         unsafe {
@@ -628,110 +513,11 @@ impl GpuSim {
     }
 }
 
-/// Мешер на GPU: тот же марширующий тетраэдр, что в CPU-версии, но одним
-/// потоком на ячейку. Возвращает число треугольников и вершины (без сварки —
-/// для отрисовки она не нужна).
-pub fn gpu_mesh(body: &crate::VoxelBody, shader_dir: &Path) -> (usize, Vec<[f32; 3]>) {
-    let mut ctx: *mut c_void = std::ptr::null_mut();
-    unsafe { check_status(vf_init(&mut ctx), "vf_init") };
-
-    let dim = body.base.dim as usize;
-    let cells = (dim - 1) * (dim - 1) * (dim - 1);
-    let cap = cells * 36;
-
-    let mk = |bytes: usize| {
-        let mut b: *mut c_void = std::ptr::null_mut();
-        unsafe { check_status(vf_buffer_new(ctx, bytes, 1, &mut b), "buffer_new") };
-        b
-    };
-    let sdf = mk(body.data.len() * 4);
-    let verts = mk((cap * 16).max(16));
-    let cnt = mk(4);
-    unsafe {
-        check_status(
-            vf_buffer_write(ctx, sdf, 0, body.data.as_ptr() as *const c_void, body.data.len() * 4),
-            "upload sdf",
-        );
-        let zero = [0u8; 4];
-        check_status(vf_buffer_write(ctx, cnt, 0, zero.as_ptr() as *const c_void, 4), "zero cnt");
-    }
-
-    let bytes = std::fs::read(shader_dir.join("mesh.spv")).expect("mesh.spv (соберите glslc)");
-    let mut pipe: *mut c_void = std::ptr::null_mut();
-    let cname = std::ffi::CString::new("mesh").unwrap();
-    unsafe {
-        check_status(
-            vf_pipeline_new(
-                ctx,
-                bytes.as_ptr() as *const u32,
-                bytes.len(),
-                3,
-                80,
-                cname.as_ptr(),
-                &mut pipe,
-            ),
-            "mesh pipeline",
-        )
-    };
-
-    let mut push = [0u8; 80];
-    let put = |buf: &mut [u8], off: usize, v: f32| {
-        buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
-    };
-    put(&mut push, 0, body.base.cell);
-    put(&mut push, 4, dim as f32);
-    put(&mut push, 8, body.base.offset as f32);
-    put(&mut push, 16, body.base.origin[0]);
-    put(&mut push, 20, body.base.origin[1]);
-    put(&mut push, 24, body.base.origin[2]);
-
-    let mut bufs = [sdf, verts, cnt];
-    let mut d = VfDispatch {
-        pipeline: pipe,
-        buffers: bufs.as_mut_ptr(),
-        n_buffers: 3,
-        push: push.as_ptr() as *const c_void,
-        push_bytes: 80,
-        groups: [((cells as u32) + 63) / 64, 1, 1],
-    };
-    unsafe { check_status(vf_run(ctx, &mut d, 1), "mesh run") };
-
-    let mut count = [0u8; 4];
-    unsafe {
-        check_status(vf_buffer_read(ctx, cnt, 0, count.as_mut_ptr() as *mut c_void, 4), "read cnt")
-    };
-    let n_verts = u32::from_le_bytes(count) as usize;
-    let mut flat = vec![0f32; n_verts * 4];
-    unsafe {
-        check_status(
-            vf_buffer_read(ctx, verts, 0, flat.as_mut_ptr() as *mut c_void, n_verts * 16),
-            "read verts",
-        )
-    };
-    let mut out = Vec::with_capacity(n_verts);
-    for i in 0..n_verts {
-        out.push([flat[i * 4], flat[i * 4 + 1], flat[i * 4 + 2]]);
-    }
-
-    unsafe {
-        vf_pipeline_free(ctx, pipe);
-        for b in bufs {
-            vf_buffer_free(ctx, b);
-        }
-        vf_shutdown(ctx);
-    }
-    (n_verts / 3, out)
-}
-
 impl Drop for GpuSim {
     fn drop(&mut self) {
         unsafe {
             for p in &self.pipes {
                 vf_pipeline_free(self.ctx, *p);
-            }
-            if !self.vox_sdf.is_null() {
-                vf_buffer_free(self.ctx, self.vox_sdf);
-                vf_buffer_free(self.ctx, self.vox_params);
             }
             for b in [
                 self.bodies[0],

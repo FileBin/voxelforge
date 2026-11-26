@@ -32,9 +32,15 @@ export class SimRenderer {
       const x = trace.pos[base + i * 3];
       const y = trace.pos[base + i * 3 + 1];
       const z = trace.pos[base + i * 3 + 2];
-      const s = trace.scale[i];
-      if (trace.shapes[i] === 1) this.boxes.push([x, y, z, s[0], s[1], s[2]]);
-      else this.spheres.push([x, y, z, s[0], s[0], s[0]]);
+      if (trace.shapes[i] === 1) {
+        this.boxes.push([
+          x, y, z,
+          trace.half[i * 3], trace.half[i * 3 + 1], trace.half[i * 3 + 2],
+        ]);
+      } else {
+        const r = trace.radius[i];
+        this.spheres.push([x, y, z, r, r, r]);
+      }
     }
   }
 

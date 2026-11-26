@@ -1,23 +1,20 @@
-/* Точка входа: собирает вместе камеру, рендереры, панель и файл.
+/* Точка входа вьюера: камера, рендереры, панель, файл.
  *
- * Здесь только склейка — вся логика лежит в соседних модулях:
- *   parse.js        чтение .vfr и .vfm
- *   camera.js       орбита/зум/пан
- *   gl.js           WebGL2, программы, геометрия
- *   render-sim.js   инстансинг тел
- *   render-mesh.js  воксельный меш и каркас BCC
- *   render-grid.js  пол-сетка
- *   ui.js           панель, клавиши, перетаскивание
- */
+ * Вьюер понимает два файла:
+ *   .vfw — мир движка (BCC-ячейки, раскол и дробление)
+ *   .vfr — траектории CPU-эталона (проверка физики)
+ *
+ * Модули: parse — форматы, bcc — геометрия ячейки, gl — WebGL2 и программы,
+ * render-world — инстансинг ячеек, render-sim — сферы/блоки эталона,
+ * render-grid — пол, camera — управление, ui — панель. */
 
 import { OrbitCamera, attachControls } from "./camera.js";
 import { createGL } from "./gl.js";
-import { detectFormat, parseTrace, parseMesh, parseFracture } from "./parse.js";
+import { detectFormat, parseTrace, parseWorld } from "./parse.js";
 import { persp, lookAt, mul } from "./mat4.js";
 import { GridRenderer } from "./render-grid.js";
 import { SimRenderer } from "./render-sim.js";
-import { MeshRenderer } from "./render-mesh.js";
-import { FractureRenderer } from "./render-fracture.js";
+import { WorldRenderer } from "./render-world.js";
 import { UI } from "./ui.js";
 
 const canvas = document.getElementById("cv");
@@ -27,11 +24,9 @@ const ui = new UI({ onFile: (f) => loadFile(f) });
 let gl = null;
 let grid = null;
 let simRenderer = null;
-let meshRenderer = null;
-let fractureRenderer = null;
-let fracture = null;
+let worldRenderer = null;
 let trace = null;
-let mesh = null;
+let world = null;
 
 function resize() {
   const dpr = Math.min(2, window.devicePixelRatio || 1);
@@ -59,55 +54,38 @@ function render() {
 
   const { vp, eye } = viewProj();
   grid.draw(vp, eye);
-  if (fracture) {
-    fractureRenderer.draw(vp, eye, ui.frame);
-  } else if (mesh) {
-    meshRenderer.draw(vp, eye);
+  if (world) {
+    worldRenderer.draw(vp, eye, ui.frame);
   } else if (trace) {
     simRenderer.prepare(trace, ui.frame);
     simRenderer.draw(vp, eye);
   }
 }
 
-/** Загрузить файл: экспортируется, чтобы путь можно было прогнать тестом. */
+function describe(w) {
+  const levels = new Set(w.shapes.map((s) => s.level));
+  const edges = [...levels].sort().map((l) => (w.base / (1 << l)).toFixed(3)).join(" → ");
+  return `ячейка ${edges} м · кадров ${w.nf}`;
+}
+
+/** Загрузить файл; экспортируется, чтобы путь проверялся тестом. */
 export function loadFile(file) {
   file.arrayBuffer().then((buf) => {
     const format = detectFormat(buf);
     if (!format) {
       const head = new TextDecoder().decode(new Uint8Array(buf.slice(0, 4)));
-      throw new Error(
-        `неизвестный формат (начало файла: ${JSON.stringify(head)}). ` +
-        "Ожидался VFR1/VFR2 (.vfr), VFM1 (.vfm) или VFX1 (.vfx)",
-      );
+      throw new Error(`неизвестный формат (начало: ${JSON.stringify(head)}); ожидался VFW1 или VFR2`);
     }
 
-    if (format === "vfx") {
+    if (format === "vfw") {
       trace = null;
-      mesh = null;
-      fracture = parseFracture(buf);
-      fractureRenderer.setData(fracture);
-      cam.fit(fracture.lo, fracture.hi);
-      ui.setTrace(fracture.nf);
-      ui.setMeta(
-        `${file.name} · раскол: ${fracture.nShards} осколков, ${fracture.total} вокселей, кадров ${fracture.nf}`,
-      );
-      ui.hideMessage();
-      render();
-      return;
-    }
-
-    if (format === "vfm") {
-      trace = null;
-      fracture = null;
-      mesh = parseMesh(buf);
-      meshRenderer.setMesh(mesh);
-      cam.fit(mesh.lo, mesh.hi);
-      ui.setMeshMode(
-        `${file.name} · меш: ${mesh.nv} вершин, ${mesh.ni / 3} треугольников, ${mesh.nl / 2} рёбер каркаса`,
-      );
+      world = parseWorld(buf);
+      worldRenderer.setData(world);
+      cam.fit(world.lo, world.hi);
+      ui.setTrace(world.nf);
+      ui.setMeta(`${file.name} · ${world.shapes.length} форм · ${describe(world)}`);
     } else {
-      mesh = null;
-      fracture = null;
+      world = null;
       trace = parseTrace(buf);
       cam.fit(trace.lo, trace.hi);
       ui.setTrace(trace.nf);
@@ -131,13 +109,8 @@ try {
   gl = createGL(canvas);
   grid = new GridRenderer(gl);
   simRenderer = new SimRenderer(gl);
-  meshRenderer = new MeshRenderer(gl);
-  fractureRenderer = new FractureRenderer(gl);
+  worldRenderer = new WorldRenderer(gl);
   attachControls(canvas, cam);
-
-  document.getElementById("lattice").addEventListener("change", (e) => {
-    meshRenderer.showLattice = e.target.checked;
-  });
 
   const q = new URLSearchParams(location.search).get("file");
   if (q) {

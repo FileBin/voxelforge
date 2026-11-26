@@ -1,10 +1,9 @@
 {
-  description = "voxelforge — GPU-резидентный воксельный движок (BCC, C-ядро + Rust-хост)";
+  description = "voxelforge — GPU-резидентный воксельный движок на решётке BCC";
 
   # Один вход — это и есть «работает через год»: flake.lock фиксирует точную
   # ревизию nixpkgs, из которой берутся rustc, glslc, spirv-tools, mesa и gcc.
-  # Комбинация flake.lock + Cargo.lock + `--locked` делает сборку
-  # воспроизводимой независимо от того, что успело уехать вперёд на crates.io.
+  # flake.lock + Cargo.lock + `--locked` делают сборку воспроизводимой.
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
   outputs = { self, nixpkgs }:
@@ -12,20 +11,15 @@
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forAll = f: nixpkgs.lib.genAttrs systems (system: f system (import nixpkgs { inherit system; }));
 
-      # Общие пакеты тулчейна: и для devShell, и для будущей сборки C-ядра.
       toolchain = pkgs: with pkgs; [
-        # Rust
         cargo
         rustc
         rustfmt
         clippy
-        # линковка тестов и будущего C-ядра (на хосте нет cc в голом шелле)
         gcc
-        # C-ядро (появится в M0)
         cmake
         ninja
         pkg-config
-        # Vulkan: компилятор шейдеров, валидаторы, интроспекция
         shaderc
         spirv-tools
         vulkan-headers
@@ -33,7 +27,6 @@
         vulkan-tools
         # CPU-Vulkan (lavapipe) — headless-прогоны и CI, без касания GPU
         mesa
-        # окружение поверхности окна (понадобится с M0)
         wayland
         wayland-protocols
         libxkbcommon
@@ -42,173 +35,68 @@
     {
       apps = forAll (system: pkgs:
         let
-          vfref = self.packages.${system}.default;
-
-          # Обёртка демки: пишет результаты в $OUT_DIR (по умолчанию ./out),
-          # лишние аргументы после `--` уходят прямо в vf-ref и перекрывают
-          # дефолты (парсер берёт последнее значение).
-          demo = name: scenario: defaults: pkgs.writeShellApplication {
-            name = "voxelforge-${name}";
-            text = ''
-              out="''${OUT_DIR:-demos/out}"
-              mkdir -p "$out"
-              ${vfref}/bin/vf-ref --scenario ${scenario} ${defaults} \
-                --out "$out/${name}.vfr" --svg "$out/${name}.svg" --json "$out/${name}.json" \
-                "$@"
-              echo ""
-              echo "готово: $out/${name}.vfr"
-              echo "смотреть: открыть viewer/index.html и перетащить туда файл"
-            '';
-          };
+          engine = self.packages.${system}.default;
 
           help = pkgs.writeShellApplication {
             name = "voxelforge";
             text = ''
-              echo "voxelforge — демки физики на CPU-эталоне"
+              echo "voxelforge — воксельный движок на решётке BCC"
               echo ""
-              echo "  nix run .#orbit       орбиты: звезда + 3 планеты, 2 периода"
-              echo "  nix run .#collapse    гравитационный коллапс облака (400 тел)"
-              echo "  nix run .#drop        D1: блок падает на пол и остаётся лежать"
-              echo "  nix run .#stack       D2: стопка из 10 блоков стоит 10 секунд"
-              echo "  nix run .#pile        D3: куча из 2000 сфер ложится и засыпает"
-              echo "  nix run .#gpu         то же на видеокарте (Vulkan compute)"
-              echo "  nix run .#mesh        BCC-меш поверхности → demos/out/voxel-*.vfm"
-              echo "  nix run .#fracture    воксельное тело раскалывается на осколки (Вороной)"
-              echo "  nix run .#viewer      локальный сервер вьюера (http://localhost:8080)"
-              echo "  nix run .#vf-ref -- --scenario stack --bodies 20   прямой доступ к CLI"
-              echo "  nix run .#help        эта справка"
+              echo "  nix run .#world     мир: снаряд влетает в BCC-плиту, она раскалывается,"
+              echo "                      осколки дробят ячейки 0.28 → 0.14 → 0.07 м"
+              echo "  nix run .#viewer    локальный сервер вьюера (http://localhost:8080)"
+              echo "  nix run .#ref       CPU-эталон (оракул для тестов), полный CLI"
               echo ""
-              echo "  результаты → demos/out  (другой каталог: OUT_DIR=dir nix run .#stack)"
-              echo "  просмотр   → viewer/index.html, перетащить .vfr в окно"
+              echo "  результат → demos/out/world.vfw; смотреть: nix run .#viewer"
+              echo "  флаги движка: --frames --substeps --iterations --out --shaders --quiet"
+            '';
+          };
+
+          viewer = pkgs.writeShellApplication {
+            name = "voxelforge-viewer";
+            runtimeInputs = [ pkgs.python3 ];
+            text = ''
+              if [ -f viewer/index.html ]; then
+                root="$(pwd)"
+              else
+                root="${self}"
+              fi
+              echo "вьюер: http://localhost:8080/viewer/index.html"
+              echo "мир:    http://localhost:8080/viewer/index.html?file=../demos/out/world.vfw"
+              echo "Ctrl+C — остановить"
+              exec python3 -m http.server 8080 --directory "$root"
+            '';
+          };
+
+          # Мир: движок считает на видеокарте. В CI остаётся lavapipe.
+          world = pkgs.writeShellApplication {
+            name = "voxelforge-world";
+            runtimeInputs = [ pkgs.mesa pkgs.vulkan-loader ];
+            text = ''
+              out="''${OUT_DIR:-demos/out}"
+              mkdir -p "$out"
+              if [ -z "''${VK_ICD_FILENAMES:-}" ]; then
+                lvp="$(ls ${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.*.json 2>/dev/null | head -n1)"
+                [ -n "$lvp" ] && export VK_ICD_FILENAMES="$lvp"
+              fi
+              ${engine}/bin/voxelforge \
+                --shaders ${self.packages.${system}.spirv} \
+                --out "$out/world.vfw" "$@"
               echo ""
-              echo "  все флаги: --frames --dt --periods --substeps --iterations --bodies --seed --svg --size"
+              echo "смотреть: nix run .#viewer → перетащить $out/world.vfw"
             '';
           };
         in
         {
           default = { type = "app"; program = "${help}/bin/voxelforge"; };
           help = { type = "app"; program = "${help}/bin/voxelforge"; };
-          orbit = {
-            type = "app";
-            program = "${demo "orbit" "orbit" "--frames 1500 --periods 2 --substeps 4"}/bin/voxelforge-orbit";
-          };
-          collapse = {
-            type = "app";
-            program = "${demo "collapse" "collapse" "--bodies 400 --frames 900 --seed 7 --dt 0.01"}/bin/voxelforge-collapse";
-          };
-          drop = {
-            type = "app";
-            program = "${demo "drop" "drop" "--frames 300 --dt 0.0166 --substeps 8 --iterations 6"}/bin/voxelforge-drop";
-          };
-          stack = {
-            type = "app";
-            program = "${demo "stack" "stack" "--bodies 10 --frames 600 --dt 0.0166 --substeps 8 --iterations 8"}/bin/voxelforge-stack";
-          };
-          pile = {
-            type = "app";
-            program = "${demo "pile" "pile" "--bodies 2000 --frames 420 --substeps 8 --iterations 8"}/bin/voxelforge-pile";
-          };
-          vf-ref = { type = "app"; program = "${vfref}/bin/vf-ref"; };
-          viewer = {
-            type = "app";
-            program = "${pkgs.writeShellApplication {
-              name = "voxelforge-viewer";
-              runtimeInputs = [ pkgs.python3 ];
-              text = ''
-                if [ -f viewer/index.html ]; then
-                  root="$(pwd)"
-                  echo "вьюер: http://localhost:8080/viewer/index.html"
-                  echo "меш:   http://localhost:8080/viewer/index.html?file=../demos/out/voxel-sphere.vfm"
-                  echo "раскол:http://localhost:8080/viewer/index.html?file=../demos/out/fracture-voxel.vfx"
-                else
-                  root="${self}"
-                  echo "вьюер (из репозитория): http://localhost:8080/viewer/index.html"
-                fi
-                echo "Ctrl+C — остановить"
-                exec python3 -m http.server 8080 --directory "$root"
-              '';
-            }}/bin/voxelforge-viewer";
-          };
-          fracture = {
-            type = "app";
-            program = "${pkgs.writeShellApplication {
-              name = "voxelforge-fracture";
-              runtimeInputs = [ pkgs.mesa pkgs.vulkan-loader ];
-              text = ''
-                out="''${OUT_DIR:-demos/out}"
-                mkdir -p "$out"
-                if [ -z "''${VK_ICD_FILENAMES:-}" ]; then
-                  lvp="$(ls ${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.*.json 2>/dev/null | head -n1)"
-                  [ -n "$lvp" ] && export VK_ICD_FILENAMES="$lvp"
-                fi
-                ${vfref}/bin/vf_fracture \
-                  --shaders ${self.packages.${system}.spirv} \
-                  --out "$out/fracture-voxel.vfx" "$@"
-                echo ""
-                echo "смотреть: nix run .#viewer → перетащить $out/fracture-voxel.vfx"
-              '';
-            }}/bin/voxelforge-fracture";
-          };
-          mesh = {
-            type = "app";
-            program = "${pkgs.writeShellApplication {
-              name = "voxelforge-mesh";
-              text = ''
-                out="''${OUT_DIR:-demos/out}"
-                mkdir -p "$out"
-                shape="''${1:-sphere}"; shift || true
-                ${vfref}/bin/vf_mesh --shape "$shape" --out "$out/voxel-$shape.vfm" "$@"
-                echo "смотреть: viewer/index.html, перетащить $out/voxel-$shape.vfm"
-              '';
-            }}/bin/voxelforge-mesh";
-          };
-          gpu = {
-            type = "app";
-            program = "${pkgs.writeShellApplication {
-              name = "voxelforge-gpu";
-              runtimeInputs = [ pkgs.mesa pkgs.vulkan-loader ];
-              text = ''
-                out="''${OUT_DIR:-demos/out}"
-                mkdir -p "$out"
-                if [ -z "''${VK_ICD_FILENAMES:-}" ]; then
-                  lvp="$(ls ${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.*.json 2>/dev/null | head -n1)"
-                  [ -n "$lvp" ] && export VK_ICD_FILENAMES="$lvp"
-                fi
-                ${vfref}/bin/vf_gpu --shaders ${self.packages.${system}.spirv} \
-                  --out "$out/pile-gpu.vfr" --json "$out/pile-gpu.json" "$@"
-                echo ""
-                echo "готово: $out/pile-gpu.vfr"
-                echo "смотреть: открыть viewer/index.html и перетащить туда файл"
-              '';
-            }}/bin/voxelforge-gpu";
-          };
+          world = { type = "app"; program = "${world}/bin/voxelforge-world"; };
+          viewer = { type = "app"; program = "${viewer}/bin/voxelforge-viewer"; };
+          ref = { type = "app"; program = "${engine}/bin/vf-ref"; };
         });
 
-      devShells = forAll (system: pkgs: {
-        default = pkgs.mkShell {
-          name = "voxelforge";
-          packages = toolchain pkgs;
-          # Даёт LIBCLANG_PATH, если в проекте когда-нибудь появится bindgen.
-          nativeBuildInputs = [ pkgs.rustPlatform.bindgenHook ];
-          RUST_BACKTRACE = "1";
-          shellHook = ''
-            # lavapipe: полностью программный Vulkan. Демки и тесты по умолчанию
-            # гоняются на нём — он не трогает видеокарту и не может её подвесить.
-            if [ -z "''${VK_ICD_FILENAMES:-}" ]; then
-              lvp="$(ls ${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.*.json 2>/dev/null | head -n1)"
-              if [ -n "$lvp" ]; then export VK_ICD_FILENAMES="$lvp"; fi
-            fi
-            echo "voxelforge · rustc $(rustc --version | cut -d' ' -f2) · nixpkgs ${builtins.substring 0 7 nixpkgs.rev}"
-            [ -n "''${VK_ICD_FILENAMES:-}" ] && echo "  lavapipe: $VK_ICD_FILENAMES"
-            echo "  тесты:  cargo test --locked"
-            echo "  демо:   cargo run --release --locked -p voxelforge-refsim --bin vf-ref -- --scenario orbit --out demos/out/orbit.vfr"
-          '';
-        };
-      });
-
       packages = forAll (system: pkgs: {
-        # SPIR-V из GLSL: собирается один раз, используется приложением, гейтом
-        # и тестами. Шейдеры грузятся в рантайме, поэтому путь передаётся явно.
+        # SPIR-V из GLSL: собирается один раз и передаётся движку путём.
         spirv = pkgs.runCommand "voxelforge-spv" {
           nativeBuildInputs = [ pkgs.shaderc ];
         } ''
@@ -220,7 +108,7 @@
         '';
 
         default = pkgs.rustPlatform.buildRustPackage {
-          pname = "vf-ref";
+          pname = "voxelforge";
           version = "0.0.0";
           src = pkgs.lib.cleanSourceWith {
             src = ./.;
@@ -233,17 +121,29 @@
           # headers нужны на этапе сборки C-ядра (build.rs зовёт gcc),
           # loader — на линковке и в рантайме
           buildInputs = [ pkgs.vulkan-headers pkgs.vulkan-loader ];
-          meta.mainProgram = "vf-ref";
+          meta.mainProgram = "voxelforge";
         };
       });
 
       checks = forAll (system: pkgs: {
-        # Один шлюз: юнит-тесты эталона (замыкание орбиты, дрейф энергии,
-        # сохранение импульса, побайтовый детерминизм записи).
+        # Юнит- и интеграционные тесты: BCC-решётка, раскол, подразбиение,
+        # физика эталона, сверка CPU и GPU, вода.
         tests = self.packages.${system}.default.overrideAttrs (_: { doCheck = true; });
 
-        # Демка как приёмочный тест: падает, если дрейф энергии > 1%
-        # или орбита не замкнулась за 1%.
+        # Мир целиком на lavapipe: движок обязан отработать headless и выдать
+        # запись, в которой осколки действительно раздробились (форм > тел).
+        demo-world = pkgs.runCommand "demo-world" { } ''
+          mkdir -p "$out"
+          export VK_ICD_FILENAMES="$(ls ${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.*.json | head -n1)"
+          ${self.packages.${system}.default}/bin/voxelforge \
+            --shaders ${self.packages.${system}.spirv} \
+            --frames 60 --out "$out/world.vfw" | tee "$out/log.txt"
+          test -s "$out/world.vfw"
+          grep -q "дроблений" "$out/log.txt"
+          echo "мир записан: $(stat -c%s "$out/world.vfw") байт"
+        '';
+
+        # Эталон: орбита замыкается, энергия не дрейфует.
         demo-orbit = pkgs.runCommand "demo-orbit" { } ''
           mkdir -p "$out"
           ${self.packages.${system}.default}/bin/vf-ref \
@@ -259,30 +159,28 @@
             --scenario stack --bodies 10 --frames 600 --substeps 8 --iterations 8 \
             --json "$out/stack.json" --out "$out/stack.vfr" | tee "$out/log.txt"
         '';
+      });
 
-        # GPU-путь целиком: C-ядро, шейдеры, сетка пар, солвер, сон.
-        # Гоняется на lavapipe — видеокарта не нужна и не может подвиснуть.
-        demo-gpu = pkgs.runCommand "demo-gpu" { } ''
-          mkdir -p "$out"
-          export VK_ICD_FILENAMES="$(ls ${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.*.json | head -n1)"
-          ${self.packages.${system}.default}/bin/vf_gpu \
-            --shaders ${self.packages.${system}.spirv} \
-            --bodies 1000 --frames 300 --iterations 16 \
-            --json "$out/pile.json" --out "$out/pile.vfr" | tee "$out/log.txt"
-          grep -q "summary:" "$out/log.txt"
-          pen=$(sed -n 's/.*pen=\([0-9.]*\).*/\1/p' "$out/log.txt" | head -n1)
-          echo "проникновение: $pen м"
-          awk -v p="$pen" 'BEGIN { if (p + 0 > 0.01) { print "FAIL: проникновение > 1 см"; exit 1 } }'
-        '';
-
-        # D3: куча должна уснуть и не провалиться. Файл трека не пишем —
-        # он весит десятки мегабайт, а гейту нужны только метрики.
-        demo-pile = pkgs.runCommand "demo-pile" { } ''
-          mkdir -p "$out"
-          ${self.packages.${system}.default}/bin/vf-ref \
-            --scenario pile --bodies 1200 --frames 300 --substeps 4 --iterations 8 \
-            --json "$out/pile.json" | tee "$out/log.txt"
-        '';
+      devShells = forAll (system: pkgs: {
+        default = pkgs.mkShell {
+          name = "voxelforge";
+          packages = toolchain pkgs;
+          nativeBuildInputs = [ pkgs.rustPlatform.bindgenHook ];
+          RUST_BACKTRACE = "1";
+          shellHook = ''
+            # lavapipe: полностью программный Vulkan. Прогоны по умолчанию идут
+            # на нём — он не трогает видеокарту и не может её подвесить.
+            if [ -z "''${VK_ICD_FILENAMES:-}" ]; then
+              lvp="$(ls ${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.*.json 2>/dev/null | head -n1)"
+              if [ -n "$lvp" ]; then export VK_ICD_FILENAMES="$lvp"; fi
+            fi
+            echo "voxelforge · rustc $(rustc --version | cut -d' ' -f2) · nixpkgs ${builtins.substring 0 7 nixpkgs.rev}"
+            [ -n "''${VK_ICD_FILENAMES:-}" ] && echo "  lavapipe: $VK_ICD_FILENAMES"
+            echo "  шейдеры: nix build .#spirv -o shaders/spv-out"
+            echo "  тесты:   cargo test --locked"
+            echo "  мир:     nix run .#world   (или ./target/release/voxelforge --help)"
+          '';
+        };
       });
     };
 }

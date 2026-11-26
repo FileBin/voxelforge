@@ -12,6 +12,9 @@ dependencies = [
 [[package]]
 name = "voxelforge-refsim"
 version = "0.0.0"
+dependencies = [
+ "voxelforge-world",
+]
 
 [[package]]
 name = "voxelforge-world"

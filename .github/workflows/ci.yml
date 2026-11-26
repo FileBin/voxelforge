@@ -27,9 +27,12 @@ jobs:
             --scenario orbit --frames 1500 --periods 2 --substeps 4 \
             --json demos/out/orbit.json --out demos/out/orbit.vfr
 
-      - name: "demo gate: D0 коллапс"
+      - name: "gate: мир на lavapipe"
         run: |
-          nix develop --command cargo run --release --locked \
-            -p voxelforge-refsim --bin vf-ref -- \
-            --scenario collapse --bodies 400 --frames 900 --seed 7 --dt 0.01 \
-            --json demos/out/collapse.json
+          mkdir -p demos/out
+          nix develop --command bash -c '
+            nix build .#spirv -o /tmp/spv
+            ./target/release/voxelforge --shaders /tmp/spv \
+              --frames 60 --out demos/out/world.vfw
+          '
+          test -s demos/out/world.vfw

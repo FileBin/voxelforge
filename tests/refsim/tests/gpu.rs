@@ -8,9 +8,8 @@
 
 use std::path::{Path, PathBuf};
 
-use voxelforge_refsim::gpu::{
-    find_shaders, scene_drop, scene_pile, scene_stack, scene_voxel_fall, GpuBody, GpuSim, Scene,
-};
+use voxelforge_refsim::gpu::{find_shaders, GpuBody, GpuSim, Scene};
+use voxelforge_refsim::{scene_drop, scene_pile, scene_stack};
 use voxelforge_refsim::{pile_demo, ContactSim};
 
 fn shader_dir() -> Option<PathBuf> {
@@ -55,7 +54,7 @@ struct Outcome {
 fn run(sc: Scene, frames: u32, iters: u32, shaders: &Path) -> Outcome {
     let n = sc.bodies.len();
     let (lo, hi) = (sc.params.lo, sc.params.hi);
-    let mut gpu = GpuSim::new(sc.bodies, shaders, sc.params, sc.voxel.as_ref());
+    let mut gpu = GpuSim::new(sc.bodies, shaders, sc.params);
     for _ in 0..frames {
         gpu.frame(1.0 / 60.0, 8, iters);
     }
@@ -116,7 +115,7 @@ fn setup() -> Option<(PathBuf, String)> {
     let shaders = shader_dir()?;
     let probe = std::panic::catch_unwind(|| {
         let sc = scene_drop();
-        let g = GpuSim::new(sc.bodies, &shaders, sc.params, sc.voxel.as_ref());
+        let g = GpuSim::new(sc.bodies, &shaders, sc.params);
         g.name.clone()
     });
     match probe {
@@ -309,46 +308,4 @@ fn gpu_pile_of_5000_settles() {
     );
 }
 
-/// Тело ложится на воксельное поле: центр покоя = центр воксельной сферы
-/// + её радиус + радиус тела = 0.6 + 0.5 + 0.1.
-#[test]
-fn gpu_body_rests_on_voxel_field() {
-    let Some((shaders, _)) = setup() else {
-        eprintln!("пропуск: нет SPIR-V или Vulkan-устройства");
-        return;
-    };
-    let gpu = run(scene_voxel_fall(0.0), 600, 12, &shaders);
-    let center = gpu.top - 0.1;
-    eprintln!("воксель: центр {center:.3} pen={:.4} v={:.4}", gpu.pen, gpu.vmax);
-    assert!(
-        (center as f64 - 1.20).abs() < 0.04,
-        "шар покоится на {center:.3}, ожидалось ~1.20"
-    );
-    assert!(gpu.vmax < 0.01, "шар не успокоился: {:.4} м/с", gpu.vmax);
-    assert_eq!(gpu.asleep, 1, "шар не уснул на воксельном теле");
-}
 
-/// Быстрое тело не прошивает воксельное поле: за подшаг оно проходит
-/// меньше ячейки, а выборка поля интерполируется.
-#[test]
-fn gpu_fast_body_does_not_tunnel_voxel() {
-    let Some((shaders, _)) = setup() else {
-        eprintln!("пропуск: нет SPIR-V или Vulkan-устройства");
-        return;
-    };
-    let gpu = run(scene_voxel_fall(30.0), 600, 12, &shaders);
-    let center = gpu.top - 0.1;
-    eprintln!(
-        "воксель 30 м/с: центр {center:.3} pen={:.4} v={:.4} asleep={}",
-        gpu.pen, gpu.vmax, gpu.asleep
-    );
-    assert!(
-        center > 1.05,
-        "шар провалился сквозь воксельное тело: центр {center:.3}"
-    );
-    assert!(
-        (center as f64 - 1.20).abs() < 0.05,
-        "после удара на 30 м/с шар покоится на {center:.3}, ожидалось ~1.20"
-    );
-    assert!(gpu.asleep == 1, "шар не успокоился после удара");
-}

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>voxelforge · 3D (WebGL2)</title>
+<title>voxelforge · BCC (WebGL2)</title>
 <style>
   :root { color-scheme: dark; }
   html, body { margin: 0; height: 100%; background: #0b0f14; color: #cfd8e3;
@@ -16,7 +16,7 @@
   button, select, input[type=range] { background: #131c25; color: #cfd8e3;
          border: 1px solid #253545; border-radius: 6px; padding: 4px 10px; font: inherit; }
   button:hover { border-color: #3b5875; }
-  input[type=range] { padding: 0; width: 200px; }
+  input[type=range] { padding: 0; width: 190px; }
   #meta { margin-left: auto; color: #6b8299; font-variant-numeric: tabular-nums; }
   canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
   #msg { position: fixed; inset: 0; display: grid; place-content: center; text-align: center;
@@ -27,7 +27,7 @@
 <body>
 <div id="bar">
   <b>voxelforge</b>
-  <input id="file" type="file" accept=".vfr,.vfm,.vfx" style="max-width:180px">
+  <input id="file" type="file" accept=".vfw,.vfr" style="max-width:170px">
   <button id="play">⏸ пауза</button>
   <button id="prev10" title="−10 кадров (Shift+←)">«10</button>
   <button id="prev" title="предыдущий кадр (←)">◀</button>
@@ -42,16 +42,15 @@
     <option value="120">2×</option>
     <option value="240">4×</option>
   </select>
-  <label class="hint"><input id="lattice" type="checkbox" checked> каркас BCC</label>
   <span class="hint">ЛКМ — орбита · колесо — зум · ПКМ/Shift+ЛКМ — пан · пробел — пауза</span>
   <span id="meta">нет данных</span>
 </div>
 <canvas id="cv"></canvas>
-<div id="msg"><b>перетащите .vfr, .vfm или .vfx в окно</b><span>или выберите файл · читается локально, никуда не уходит</span></div>
+<div id="msg"><b>перетащите .vfw или .vfr в окно</b><span>мир движка или траектории эталона · читается локально</span></div>
 
-<!-- Логика в модулях: parse — форматы, camera — управление, gl/render-* — графика,
-     ui — панель, main — склейка. Открывать надо через http (nix run .#viewer):
-     браузеры блокируют модульные скрипты с file://. -->
+<!-- Логика в модулях: parse — форматы, bcc — геометрия ячейки, gl/render-* —
+     графика, camera — управление, ui — панель. Открывать через http
+     (nix run .#viewer): браузеры блокируют модульные скрипты с file://. -->
 <script type="module" src="./js/main.js"></script>
 </body>
 </html>
