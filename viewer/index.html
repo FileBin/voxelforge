@@ -27,7 +27,7 @@
 <body>
 <div id="bar">
   <b>voxelforge</b>
-  <input id="file" type="file" accept=".vfr,.vfm" style="max-width:180px">
+  <input id="file" type="file" accept=".vfr,.vfm,.vfx" style="max-width:180px">
   <button id="play">⏸ пауза</button>
   <button id="prev10" title="−10 кадров (Shift+←)">«10</button>
   <button id="prev" title="предыдущий кадр (←)">◀</button>
@@ -47,7 +47,7 @@
   <span id="meta">нет данных</span>
 </div>
 <canvas id="cv"></canvas>
-<div id="msg"><b>перетащите .vfr или .vfm в окно</b><span>или выберите файл · читается локально, никуда не уходит</span></div>
+<div id="msg"><b>перетащите .vfr, .vfm или .vfx в окно</b><span>или выберите файл · читается локально, никуда не уходит</span></div>
 
 <!-- Логика в модулях: parse — форматы, camera — управление, gl/render-* — графика,
      ui — панель, main — склейка. Открывать надо через http (nix run .#viewer):

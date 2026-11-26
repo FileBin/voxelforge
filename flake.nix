@@ -119,6 +119,7 @@
                   root="$(pwd)"
                   echo "вьюер: http://localhost:8080/viewer/index.html"
                   echo "меш:   http://localhost:8080/viewer/index.html?file=../demos/out/voxel-sphere.vfm"
+                  echo "раскол:http://localhost:8080/viewer/index.html?file=../demos/out/fracture-voxel.vfx"
                 else
                   root="${self}"
                   echo "вьюер (из репозитория): http://localhost:8080/viewer/index.html"

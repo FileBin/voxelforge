@@ -69,10 +69,17 @@ function render() {
   }
 }
 
-function loadFile(file) {
+/** Загрузить файл: экспортируется, чтобы путь можно было прогнать тестом. */
+export function loadFile(file) {
   file.arrayBuffer().then((buf) => {
     const format = detectFormat(buf);
-    if (!format) throw new Error("неизвестный формат (ожидался .vfr или .vfm)");
+    if (!format) {
+      const head = new TextDecoder().decode(new Uint8Array(buf.slice(0, 4)));
+      throw new Error(
+        `неизвестный формат (начало файла: ${JSON.stringify(head)}). ` +
+        "Ожидался VFR1/VFR2 (.vfr), VFM1 (.vfm) или VFX1 (.vfx)",
+      );
+    }
 
     if (format === "vfx") {
       trace = null;
