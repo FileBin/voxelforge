@@ -93,7 +93,7 @@ if [ -n "${HEADLESS_GDB:-}" ]; then
 fi
 
 # shellcheck disable=SC2086
-( exec ${CPUS:+taskset -c $CPUS} $RUNNER "$BIN" $SHADER_ARG --frames "$FRAMES" --shots "$SHOTS" ) \
+( exec ${CPUS:+taskset -c $CPUS} $RUNNER "$BIN" $SHADER_ARG --frames "$FRAMES" --shots "$SHOTS" ${HEADLESS_EXTRA:-} ) \
     >"$WORK/live.log" 2>&1 &
 APP_PID=$!
 

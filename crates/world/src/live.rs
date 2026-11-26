@@ -210,111 +210,83 @@ impl Live {
     }
 
     pub fn step(&mut self, dt: f32, substeps: u32, iterations: u32) {
-        let mut tet_shapes: Vec<Vec<[[f32; 3]; 4]>> = Vec::with_capacity(self.bodies.len());
-        for b in &self.bodies {
-            if b.alive {
-                tet_shapes.push(b.world_tets());
-            } else {
+        // Контакты нельзя снимать один раз на кадр: за 1/60 с снаряд на 26 м/с
+        // пролетает 0.43 м — больше тетраэдра, и просто проходит сквозь тело.
+        // Дробим кадр так, чтобы самое быстрое тело смещалось не больше
+        // трети ячейки за кусок, и пересчитываем контакты на каждом куске.
+        let vmax = self
+            .bodies
+            .iter()
+            .filter(|b| b.alive)
+            .map(|b| (b.vel[0] * b.vel[0] + b.vel[1] * b.vel[1] + b.vel[2] * b.vel[2]).sqrt())
+            .fold(0.0f64, f64::max);
+        let cell = (self.params.cell * 0.5) as f64;
+        let chunks = ((vmax * dt as f64 / (cell * 0.35)).ceil() as u32).clamp(2, 6);
+        let per = (substeps / chunks).max(1);
+        let sdt = dt / chunks as f32;
+
+        for _ in 0..chunks {
+            let mut tet_shapes: Vec<Vec<[[f32; 3]; 4]>> = Vec::with_capacity(MAX_BODIES);
+            for b in &self.bodies {
+                tet_shapes.push(if b.alive { b.world_tets() } else { Vec::new() });
+            }
+            while tet_shapes.len() < MAX_BODIES {
                 tet_shapes.push(Vec::new());
             }
-        }
-        while tet_shapes.len() < MAX_BODIES {
-            tet_shapes.push(Vec::new());
-        }
-
-        let positions: Vec<[f32; 3]> = self
-            .mirror
-            .iter()
-            .map(|b| [b.pos_r[0], b.pos_r[1], b.pos_r[2]])
-            .collect();
-        let mut contacts = collide::build(
-            &tet_shapes,
-            &positions,
-            0.0,
-            (self.params.lo, self.params.hi),
-            self.params.cell * 0.5,
-        );
-        for i in self.bodies.len()..MAX_BODIES {
-            contacts[i].clear();
-        }
-
-        // Позиционная развязка: солвер работает со скоростями, и тяжёлая
-        // плита иначе проседает в пол. Расталкиваем по нормали контакта
-        // пропорционально обратным массам.
-        let mut delta: Vec<[f32; 3]> = vec![[0.0; 3]; self.mirror.len()];
-        let inert = self.mirror.clone();
-        for i in 0..self.bodies.len() {
-            if !self.bodies[i].alive {
-                continue;
+            let positions: Vec<[f32; 3]> = self
+                .mirror
+                .iter()
+                .map(|b| [b.pos_r[0], b.pos_r[1], b.pos_r[2]])
+                .collect();
+            let mut contacts = collide::build(
+                &tet_shapes,
+                &positions,
+                0.0,
+                (self.params.lo, self.params.hi),
+                self.params.cell * 0.5,
+            );
+            for i in self.bodies.len()..MAX_BODIES {
+                contacts[i].clear();
             }
-            for c in &contacts[i] {
-                if c.pen < 0.004 {
+
+            self.depenetrate(&contacts);
+            self.fracture(&contacts);
+
+            self.gpu.write_contacts(&contacts);
+            self.gpu.frame_with_contacts(sdt, per, iterations);
+            let snap = self.gpu.read_bodies();
+
+            for i in 0..self.bodies.len() {
+                if !self.bodies[i].alive {
                     continue;
                 }
-                let k = 0.8 * c.pen;
-                if c.other < 0 {
-                    for a in 0..3 {
-                        delta[i][a] += c.n[a] * k;
-                    }
-                } else if (c.other as usize) < self.bodies.len() {
-                    let j = c.other as usize;
-                    if !self.bodies[j].alive {
-                        continue;
-                    }
-                    let (mi, mj) = (inert[i].vel_m[3], inert[j].vel_m[3]);
-                    if mi <= 0.0 || mj <= 0.0 {
-                        continue;
-                    }
-                    let (wi, wj) = (mi, mj); // vel_m[3] — обратная масса
-                    let share = wi / (wi + wj);
-                    for a in 0..3 {
-                        // нормаль смотрит от тела к партнёру → отталкиваем назад
-                        delta[i][a] -= c.n[a] * k * share;
-                        delta[j][a] += c.n[a] * k * share;
-                    }
-                }
+                let g = &snap[i];
+                let b = &mut self.bodies[i];
+                b.pos = [g.pos_r[0] as f64, g.pos_r[1] as f64, g.pos_r[2] as f64];
+                b.quat = [
+                    g.quat[0] as f64,
+                    g.quat[1] as f64,
+                    g.quat[2] as f64,
+                    g.quat[3] as f64,
+                ];
+                b.vel = [g.vel_m[0] as f64, g.vel_m[1] as f64, g.vel_m[2] as f64];
             }
+            let n = self.bodies.len();
+            self.mirror[..n].copy_from_slice(&snap[..n]);
         }
+
+        // улетевшее за пределы ящика убираем
         let mut moved = false;
-        for i in 0..self.bodies.len() {
-            if delta[i] == [0.0, 0.0, 0.0] {
-                continue;
-            }
-            self.mirror[i].pos_r[0] += delta[i][0];
-            self.mirror[i].pos_r[1] += delta[i][1];
-            self.mirror[i].pos_r[2] += delta[i][2];
-            moved = true;
-        }
-        if moved {
-            self.gpu.write_bodies(&self.mirror);
-        }
-
-        self.fracture(&contacts);
-
-        self.gpu.write_contacts(&contacts);
-        self.gpu.frame_with_contacts(dt, substeps, iterations);
-        let snap = self.gpu.read_bodies();
-        let mut moved = false;
-
         for i in 0..self.bodies.len() {
             if !self.bodies[i].alive {
                 continue;
             }
-            let g = &snap[i];
-            let b = &mut self.bodies[i];
-            b.pos = [g.pos_r[0] as f64, g.pos_r[1] as f64, g.pos_r[2] as f64];
-            b.quat = [
-                g.quat[0] as f64,
-                g.quat[1] as f64,
-                g.quat[2] as f64,
-                g.quat[3] as f64,
-            ];
-            b.vel = [g.vel_m[0] as f64, g.vel_m[1] as f64, g.vel_m[2] as f64];
-            if b.pos[1] < -2.0
-                || b.pos[0].abs() > self.params.hi[0] as f64 + 1.5
-                || b.pos[2].abs() > self.params.hi[2] as f64 + 1.5
+            let p = self.bodies[i].pos;
+            if p[1] < -2.0
+                || p[0].abs() > self.params.hi[0] as f64 + 1.5
+                || p[2].abs() > self.params.hi[2] as f64 + 1.5
             {
-                b.alive = false;
+                self.bodies[i].alive = false;
                 let parked = Body::new([0.0, -400.0, 0.0], [0.0; 3], 1.0, 0.05);
                 let mut g2 = GpuBody::from_cpu(&parked);
                 g2.misc[1] = 1.0;
@@ -322,10 +294,97 @@ impl Live {
                 moved = true;
             }
         }
-        self.mirror[..self.bodies.len()].copy_from_slice(&snap[..self.bodies.len()]);
         if moved {
             self.gpu.write_bodies(&self.mirror);
         }
+    }
+
+    /// Позиционная развязка — мягко и с потолком: жёсткий «выброс» на всю
+    /// глубину контакта в кадр и давал дрожание, будто коллайдер шире меша.
+    fn depenetrate(&mut self, contacts: &[Vec<collide::Contact>]) {
+        let mut delta: Vec<[f32; 3]> = vec![[0.0; 3]; self.mirror.len()];
+        let mut any = false;
+        for i in 0..self.bodies.len() {
+            if !self.bodies[i].alive {
+                continue;
+            }
+            for c in &contacts[i] {
+                if c.pen < 0.006 {
+                    continue;
+                }
+                let k = (0.6 * c.pen).min(0.015);
+                if c.other < 0 {
+                    for a in 0..3 {
+                        delta[i][a] += c.n[a] * k;
+                    }
+                    any = true;
+                } else if (c.other as usize) < self.bodies.len() {
+                    let j = c.other as usize;
+                    if !self.bodies[j].alive {
+                        continue;
+                    }
+                    let (wi, wj) = (self.mirror[i].vel_m[3], self.mirror[j].vel_m[3]);
+                    if wi <= 0.0 || wj <= 0.0 {
+                        continue;
+                    }
+                    let share = wi / (wi + wj);
+                    for a in 0..3 {
+                        delta[i][a] -= c.n[a] * k * share;
+                        delta[j][a] += c.n[a] * k * share;
+                    }
+                    any = true;
+                }
+            }
+        }
+        if !any {
+            return;
+        }
+        for i in 0..self.bodies.len() {
+            if delta[i] == [0.0; 3] {
+                continue;
+            }
+            for a in 0..3 {
+                self.mirror[i].pos_r[a] += delta[i][a];
+            }
+        }
+        self.gpu.write_bodies(&self.mirror);
+    }
+
+    /// Наибольшее проникновение в текущей позе (м) — для проверок и отладки.
+    pub fn max_pen(&self) -> f32 {
+        let mut tet_shapes: Vec<Vec<[[f32; 3]; 4]>> = Vec::with_capacity(MAX_BODIES);
+        for b in &self.bodies {
+            tet_shapes.push(if b.alive { b.world_tets() } else { Vec::new() });
+        }
+        while tet_shapes.len() < MAX_BODIES {
+            tet_shapes.push(Vec::new());
+        }
+        let positions: Vec<[f32; 3]> = self
+            .mirror
+            .iter()
+            .map(|b| [b.pos_r[0], b.pos_r[1], b.pos_r[2]])
+            .collect();
+        let contacts = collide::build(
+            &tet_shapes,
+            &positions,
+            0.0,
+            (self.params.lo, self.params.hi),
+            self.params.cell * 0.5,
+        );
+        contacts
+            .iter()
+            .flatten()
+            .map(|c| c.pen)
+            .fold(0.0f32, f32::max)
+    }
+
+    /// Наибольшая скорость среди живых тел.
+    pub fn max_speed(&self) -> f64 {
+        self.bodies
+            .iter()
+            .filter(|b| b.alive)
+            .map(|b| (b.vel[0] * b.vel[0] + b.vel[1] * b.vel[1] + b.vel[2] * b.vel[2]).sqrt())
+            .fold(0.0, f64::max)
     }
 
     fn fracture(&mut self, contacts: &[Vec<collide::Contact>]) {
@@ -560,12 +619,9 @@ impl Live {
             p[1] -= c[1];
             p[2] -= c[2];
         }
-        let mut edges = tb.edge_lines();
-        for p in edges.iter_mut() {
-            p[0] -= c[0];
-            p[1] -= c[1];
-            p[2] -= c[2];
-        }
+        // edge_lines() уже отдаёт точки относительно центроида — второй раз
+        // вычитать нельзя, иначе каркас уезжает от меша
+        let edges = tb.edge_lines();
         Some(Shape {
             level: mesh.level,
             mesh,

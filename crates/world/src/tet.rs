@@ -450,7 +450,7 @@ impl TetBody {
 
     pub fn surface_grid(&self) -> (Mesh, Grid) {
         let mut mesh = self.extract_faces();
-        smooth(&mut mesh, 2, 0.45);
+        smooth(&mut mesh, 1, 0.30);
         let level = mesh.level;
         let _step = node_step(level);
         let origin = self.centroid();
@@ -468,7 +468,10 @@ impl TetBody {
     /// Точная поверхность: грани, встречающиеся у одного тетраэдра.
     fn extract_faces(&self) -> Mesh {
         let mut faces: HashMap<[u64; 3], (u32, [Node; 3], u8, [f32; 3])> = HashMap::new();
-        let origin = self.world_centroid();
+        // Узлы решётки отсчитываются от origin тела. Здесь раньше стоял
+        // world_centroid(), и поверхность каждого осколка строилась в своём
+        // сдвинутом кадре — меш уезжал относительно коллайдера.
+        let origin = self.origin;
         for t in &self.tets {
             let p: [[f32; 3]; 4] = std::array::from_fn(|i| node_pos(t.v[i], t.level, origin));
             for (i, j, k) in [(0usize, 1usize, 2usize), (0, 1, 3), (0, 2, 3), (1, 2, 3)] {

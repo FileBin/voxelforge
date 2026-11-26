@@ -126,7 +126,26 @@ try {
     document.getElementById("farVal").textContent = e.target.value;
   });
 
-  const q = new URLSearchParams(location.search).get("file");
+  // Флаги в адресе: ?tets=1 — сразу показать каркас тетраэдров,
+  // ?near=2&far=8 — планки отсечения, ?t=40 — остановиться на кадре.
+  const params = new URLSearchParams(location.search);
+  if (params.has("tets")) {
+    const cb = document.getElementById("grid");
+    cb.checked = params.get("tets") !== "0";
+    worldRenderer.showGrid = cb.checked;
+  }
+  for (const [id, prop] of [["near", "nearDist"], ["far", "farDist"]]) {
+    if (params.has(id)) {
+      const el = document.getElementById(id);
+      el.value = params.get(id);
+      el.dispatchEvent(new Event("input"));
+      worldRenderer[prop] = +el.value;
+    }
+  }
+  const at = params.get("t");
+  if (at !== null) ui.setFrame(+at, true);
+
+  const q = params.get("file");
   if (q) {
     fetch(q)
       .then((r) => r.arrayBuffer())

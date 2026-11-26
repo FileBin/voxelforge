@@ -83,3 +83,40 @@ fn second_shot_breaks_a_shard_again() {
     );
     assert!(w.shards_made > 2);
 }
+
+#[test]
+fn fast_bullet_does_not_pass_through() {
+    let Some(mut w) = world() else { return };
+    let p = w.bodies[0].pos;
+    // 40 м/с: за кадр снаряд пролетает 0.67 м — больше ячейки, но кадр
+    // дробится, поэтому контакт обязан найтись
+    assert!(w.shoot([p[0] - 4.0, p[1], p[2]], [1.0, 0.0, 0.0], 40.0));
+    for _ in 0..90 {
+        w.step(1.0 / 60.0, 4, 10);
+    }
+    assert!(w.cracks >= 1, "быстрый снаряд прошёл сквозь плиту");
+}
+
+#[test]
+fn fragments_settle_without_jitter() {
+    let Some(mut w) = world() else { return };
+    let p = w.bodies[0].pos;
+    assert!(w.shoot([p[0] - 4.0, p[1], p[2]], [1.0, 0.0, 0.0], 26.0));
+    for _ in 0..60 {
+        w.step(1.0 / 60.0, 4, 10);
+    }
+    assert!(w.cracks >= 1, "удар не расколол плиту");
+    for _ in 0..360 {
+        w.step(1.0 / 60.0, 4, 10);
+    }
+    assert!(
+        w.max_speed() < 0.05,
+        "осколки дрожат: скорость {:.3} м/с",
+        w.max_speed()
+    );
+    assert!(
+        w.max_pen() < 0.03,
+        "тела провалились друг в друга: {:.3} м",
+        w.max_pen()
+    );
+}

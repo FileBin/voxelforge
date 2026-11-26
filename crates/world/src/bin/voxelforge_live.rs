@@ -172,11 +172,13 @@ fn main() {
     let mut explicit: Option<std::path::PathBuf> = None;
     let mut max_frames: u64 = 0; // 0 — без ограничения
     let mut shots: Vec<u64> = Vec::new();
+    let mut tets_at_start = false;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--shaders" => explicit = it.next().map(Into::into),
             "--frames" => max_frames = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+            "--tets" => tets_at_start = true,
             "--shots" => {
                 shots = it
                     .next()
@@ -210,6 +212,7 @@ fn main() {
     }
 
     let mut world = Live::new(&shaders);
+    world.lines_on = tets_at_start;
     let mut cam = Fly {
         pos: [3.0, 2.0, 3.6],
         yaw: 0.0,
