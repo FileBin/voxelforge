@@ -24,12 +24,23 @@ export class WorldRenderer {
 
     // сетка вокселей — отдельная программа линий
     this.progLines = compile(gl, VS_GRIDLINES, FS_LINE);
+    // Локации линий — из ПРОГРАММЫ ЛИНИЙ. Раньше здесь брались локации
+    // меша, поэтому uPos/uQuat не доходили до шейдера, и тетраэдры висели
+    // в локальных координатах, не двигаясь с телами.
     this.lineLoc = {
       aPos: gl.getAttribLocation(this.progLines, "aPos"),
       uVP: gl.getUniformLocation(this.progLines, "uVP"),
       uTint: gl.getUniformLocation(this.progLines, "uTint"),
+      uPos: gl.getUniformLocation(this.progLines, "uPos"),
+      uQuat: gl.getUniformLocation(this.progLines, "uQuat"),
+      uEye: gl.getUniformLocation(this.progLines, "uEye"),
+      uNear: gl.getUniformLocation(this.progLines, "uNear"),
+      uFar: gl.getUniformLocation(this.progLines, "uFar"),
     };
     this.showGrid = false;
+    // планки отсечения тетраэдров по расстоянию до камеры, метры
+    this.nearDist = 0;
+    this.farDist = 12;
     this.data = null;
     this.buffers = [];
   }
@@ -122,12 +133,15 @@ export class WorldRenderer {
       gl.useProgram(this.progLines);
       gl.uniformMatrix4fv(this.lineLoc.uVP, false, vp);
       gl.uniform3fv(this.lineLoc.uTint, [0.30, 0.55, 0.85]);
+      gl.uniform3fv(this.lineLoc.uEye, eye);
+      gl.uniform1f(this.lineLoc.uNear, this.nearDist);
+      gl.uniform1f(this.lineLoc.uFar, this.farDist);
       for (const body of row) {
         const buf = this.buffers[body.shape];
         if (!buf || !buf.gcount) continue;
         // линии заданы в локальных координатах — тот же перенос и поворот
-        gl.uniform3fv(this.uPos, body.pos);
-        gl.uniform4fv(this.uQuat, body.quat);
+        gl.uniform3fv(this.lineLoc.uPos, body.pos);
+        gl.uniform4fv(this.lineLoc.uQuat, body.quat);
         gl.bindVertexArray(buf.gvao);
         gl.drawArrays(gl.LINES, 0, buf.gcount);
       }

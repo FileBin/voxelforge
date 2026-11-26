@@ -43,6 +43,14 @@
     <option value="240">4×</option>
   </select>
   <label class="hint"><input id="grid" type="checkbox"> показать тетраэдры</label>
+  <label class="hint" title="ближняя планка отсечения тетраэдров">ближе
+    <input id="near" type="range" min="0" max="30" step="0.5" value="0" style="width:90px">
+    <span id="nearVal">0</span>
+  </label>
+  <label class="hint" title="дальняя планка отсечения тетраэдров">дальше
+    <input id="far" type="range" min="0" max="30" step="0.5" value="12" style="width:90px">
+    <span id="farVal">12</span>
+  </label>
   <span class="hint">ЛКМ — орбита · колесо — зум · ПКМ/Shift+ЛКМ — пан · пробел — пауза</span>
   <span id="meta">нет данных</span>
 </div>

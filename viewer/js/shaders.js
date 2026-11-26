@@ -139,19 +139,30 @@ void main() {
   outColor = vec4(col, 1.0);
 }`;
 
-/* Линии сетки вокселей: те же перенос и поворот, что у меша. */
+/* Каркас тетраэдров: те же перенос и поворот, что у меша, плюс отсечение по
+ * расстоянию до камеры (ближняя и дальняя планка) — иначе линии сливаются. */
 export const VS_GRIDLINES = `#version 300 es
 precision highp float;
 in vec3 aPos;
 uniform mat4 uVP;
 uniform vec3 uPos;
 uniform vec4 uQuat;
+uniform vec3 uEye;
+uniform float uNear;
+uniform float uFar;
 vec3 qrot(vec4 q, vec3 v) {
   vec3 t = 2.0 * cross(q.xyz, v);
   return v + q.w * t + cross(q.xyz, t);
 }
 void main() {
-  gl_Position = uVP * vec4(qrot(uQuat, aPos) + uPos, 1.0);
+  vec3 w = qrot(uQuat, aPos) + uPos;
+  float d = distance(w, uEye);
+  // за пределами планок — уводим вершину за плоскость отсечения
+  if (d < uNear || d > uFar) {
+    gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+    return;
+  }
+  gl_Position = uVP * vec4(w, 1.0);
 }`;
 
 export const VS_LINE = `#version 300 es

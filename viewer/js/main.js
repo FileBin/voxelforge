@@ -115,6 +115,16 @@ try {
   document.getElementById("grid").addEventListener("change", (e) => {
     worldRenderer.showGrid = e.target.checked;
   });
+  const near = document.getElementById("near");
+  const far = document.getElementById("far");
+  near.addEventListener("input", (e) => {
+    worldRenderer.nearDist = +e.target.value;
+    document.getElementById("nearVal").textContent = e.target.value;
+  });
+  far.addEventListener("input", (e) => {
+    worldRenderer.farDist = +e.target.value;
+    document.getElementById("farVal").textContent = e.target.value;
+  });
 
   const q = new URLSearchParams(location.search).get("file");
   if (q) {
