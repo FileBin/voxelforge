@@ -1,0 +1,111 @@
+#version 450
+#include "common.glsl"
+
+/* Проход A: одна точка контакта на вызов.
+ *
+ * Работа строго одинаковая у всех вызовов — ровно один контакт, — поэтому
+ * GPU загружен равномерно. Раньше на вызов приходилось тело и цикл по его
+ * контактам: у тела с 24 контактами работы было в 24 раза больше, чем у тела
+ * с одним, и параллельность съедалась неравномерностью.
+ *
+ * Вызов только СЧИТАЕТ импульс от снимка скоростей и складывает результат
+ * в буфер; применять его будет проход B. Так сумма по контактам тела
+ * считается в фиксированном порядке и не зависит от планировщика.
+ */
+
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) buffer BodiesIn { Body bin[]; };
+layout(std430, set = 0, binding = 1) buffer Lists { C list[]; };
+layout(std430, set = 0, binding = 2) buffer ListCount { uint lc[]; };
+/* Две vec4 на точку контакта: [0] — приращение скорости, [1] — угловой. */
+layout(std430, set = 0, binding = 3) buffer Imp { vec4 imp[]; };
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint nbody = uint(pc.grid.w);
+    if (id >= nbody * uint(CAP)) return;
+
+    uint i = id / uint(CAP);
+    uint k = id % uint(CAP);
+
+    /* Пустой или лишний слот обнуляем: проход B суммирует без проверок. */
+    imp[2u * id] = vec4(0.0);
+    imp[2u * id + 1u] = vec4(0.0);
+
+    Body me = bin[i];
+    if (me.misc.y > 0.5) return; /* спящее тело контакты не решает */
+
+    uint n = lc[i];
+    if (n > uint(CAP)) n = uint(CAP);
+    if (k >= n) return;
+
+    vec3 v = me.vel_m.xyz;
+    vec3 w = me.ang_i.xyz;
+    float im = me.vel_m.w;
+    float ii = me.ang_i.w;
+    float dt = pc.prm0.x;
+    float mu = pc.prm0.w;
+
+    C c = list[i * CAP + k];
+    int j = c.meta.x;
+    vec3 nrm = c.n_pen.xyz;
+    float pen = c.n_pen.w;
+
+    vec3 ov = vec3(0.0);
+    vec3 ow = vec3(0.0);
+    float oim = 0.0;
+    float oii = 0.0;
+    vec3 opos = vec3(0.0);
+    if (j >= 0) {
+        Body o = bin[j];
+        opos = o.pos_r.xyz;
+        ov = o.vel_m.xyz;
+        ow = o.ang_i.xyz;
+        oim = o.vel_m.w;
+        oii = o.ang_i.w;
+    }
+
+    vec3 rself = c.point.xyz - me.pos_r.xyz;
+    vec3 rother = c.point.xyz - opos;
+    bool is_static = (j < 0);
+    vec3 vrel = is_static
+        ? (v + cross(w, rself))
+        : (ov + cross(ow, rother)) - (v + cross(w, rself));
+    float vn = dot(vrel, nrm);
+    vec3 ra_n = cross(rself, nrm);
+    vec3 rb_n = cross(rother, nrm);
+    float wn = im + oim + dot(ra_n, ra_n) * ii + dot(rb_n, rb_n) * oii;
+    if (wn <= 0.0) return;
+    float sgn = is_static ? 1.0 : -1.0;
+
+    float push = min(max(pen - pc.prm1.z, 0.0) * pc.prm1.x / dt, pc.prm1.y);
+    /* Сумма по контактам тела не должна перебирать: каждый контакт решается
+     * против одного и того же снимка и требует полной коррекции, поэтому
+     * делим на число контактов (по большему из двух тел пары, чтобы обе
+     * стороны считали одинаково). */
+    uint nj = (j >= 0) ? min(lc[j], uint(CAP)) : 1u;
+    float inv = 1.0 / float(max(max(n, 1u), max(nj, 1u)));
+    float dl = max(push - vn, 0.0) / wn * inv;
+    vec3 P = nrm * dl;
+    vec3 dv = P * (im * sgn);
+    vec3 dw = cross(rself, P) * (ii * sgn);
+
+    vec3 vt_vec = vrel - nrm * vn;
+    float vt = length(vt_vec);
+    if (mu > 0.0 && vt > 1e-7) {
+        vec3 t = vt_vec / vt;
+        vec3 ra_xt = cross(rself, t);
+        vec3 rb_xt = cross(rother, t);
+        float wt = im + oim + dot(ra_xt, ra_xt) * ii + dot(rb_xt, rb_xt) * oii;
+        if (wt > 0.0) {
+            float cap = mu * max(dl, 0.0);
+            float dlt = clamp(-vt / wt, -cap, cap);
+            vec3 Pt = t * dlt;
+            dv += Pt * (im * sgn);
+            dw += cross(rself, Pt) * (ii * sgn);
+        }
+    }
+
+    imp[2u * id] = vec4(dv, 0.0);
+    imp[2u * id + 1u] = vec4(dw, 0.0);
+}

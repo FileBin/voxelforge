@@ -149,6 +149,8 @@ const P_BROAD: usize = 6;
 const P_SOLVE: usize = 7;
 const P_SLEEP: usize = 8;
 const P_POS: usize = 9;
+const P_SOLVE_CONTACTS: usize = 10;
+const P_SOLVE_APPLY: usize = 11;
 
 const CAP: usize = 24;
 /// Body = 5 × vec4.
@@ -223,6 +225,7 @@ pub struct GpuSim {
     pub params: Params,
     bodies: [*mut c_void; 2],
     list: *mut c_void,
+    imp: *mut c_void,
     lcount: *mut c_void,
     cellcnt: *mut c_void,
     starts: *mut c_void,
@@ -269,6 +272,8 @@ impl GpuSim {
         let bodies_b = mk(n * BODY_BYTES, true);
         // host-visible: контакты может заливать и CPU (столкновения по тетраэдрам)
         let list = mk(n * CAP * 48, true);
+        // Две vec4 на точку контакта: приращение скорости и угловое.
+        let imp = mk(n * CAP * 32, false);
         let lcount = mk(n * 4, true);
         let cellcnt = mk(ncells as usize * 4, false);
         let starts = mk((ncells as usize + 1) * 4, false);
@@ -288,7 +293,7 @@ impl GpuSim {
             )
         };
 
-        let names: [(&str, u32); 10] = [
+        let names: [(&str, u32); 12] = [
             ("integrate", 1),
             ("clear", 2),
             ("count", 2),
@@ -299,6 +304,8 @@ impl GpuSim {
             ("solve", 4),
             ("sleep", 1),
             ("integrate_pos", 1),
+            ("solve_contacts", 4),
+            ("solve_apply", 4),
         ];
         let mut pipes = Vec::new();
         for (nm, nb) in names.iter() {
@@ -334,6 +341,7 @@ impl GpuSim {
             params,
             bodies: [bodies_a, bodies_b],
             list,
+            imp,
             lcount,
             cellcnt,
             starts,
@@ -468,14 +476,38 @@ impl GpuSim {
                 });
             }
             // Итерации солвера: чётное число, поэтому данные возвращаются в a.
+            // Два прохода: A — по точкам контакта (работа одинаковая),
+            // B — по телам (только сложение). Иначе у тела с 24 контактами
+            // работы в 24 раза больше, чем у тела с одним.
+            let g_contacts = ((self.n * CAP) as u32 + 63) / 64;
+            // VF_SOLVE=bodies — вернуть солвер «по телам» для сравнения.
+            let by_contacts = std::env::var("VF_SOLVE")
+                .map(|v| v != "bodies")
+                .unwrap_or(true);
             for it in 0..iterations {
                 let (src, dst) = if it % 2 == 0 { (a, b) } else { (b, a) };
-                steps.push(Step {
-                    pipe: P_SOLVE,
-                    bufs: vec![src, self.list, self.lcount, dst],
-                    push,
-                    groups: [g_body, 1, 1],
-                });
+                if by_contacts {
+                    // A: по точкам контакта (одинаковая работа), B: по телам (сумма)
+                    steps.push(Step {
+                        pipe: P_SOLVE_CONTACTS,
+                        bufs: vec![src, self.list, self.lcount, self.imp],
+                        push,
+                        groups: [g_contacts, 1, 1],
+                    });
+                    steps.push(Step {
+                        pipe: P_SOLVE_APPLY,
+                        bufs: vec![src, self.lcount, self.imp, dst],
+                        push,
+                        groups: [g_body, 1, 1],
+                    });
+                } else {
+                    steps.push(Step {
+                        pipe: P_SOLVE,
+                        bufs: vec![src, self.list, self.lcount, dst],
+                        push,
+                        groups: [g_body, 1, 1],
+                    });
+                }
             }
             steps.push(Step {
                 pipe: P_SLEEP,

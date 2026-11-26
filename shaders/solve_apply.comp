@@ -1,0 +1,50 @@
+#version 450
+#include "common.glsl"
+
+/* Проход B: одна вызовая точка на тело — сумма импульсов всех его контактов.
+ *
+ * Здесь только сложение готовых чисел из буфера, без геометрии и без
+ * нормалей: тяжёлая часть (разбор контакта) уже сделана в проходе A, и она
+ * там равномерная. Порядок суммирования фиксирован (по k), поэтому результат
+ * не зависит от того, как GPU распланировал вызовы.
+ */
+
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) buffer BodiesIn { Body bin[]; };
+layout(std430, set = 0, binding = 1) buffer ListCount { uint lc[]; };
+layout(std430, set = 0, binding = 2) buffer Imp { vec4 imp[]; };
+layout(std430, set = 0, binding = 3) buffer BodiesOut { Body bout[]; };
+
+/* Лёгкая страховка на случай разнонаправленных контактов: полная сумма
+ * без множителя звенит на плотной куче. */
+const float RELAX = 0.85;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.grid.w)) return;
+
+    Body me = bin[i];
+    if (me.misc.y > 0.5) { bout[i] = me; return; }
+
+    uint n = lc[i];
+    if (n > uint(CAP)) n = uint(CAP);
+
+    vec3 dv = vec3(0.0);
+    vec3 dw = vec3(0.0);
+    for (uint k = 0u; k < n; k++) {
+        uint id = i * uint(CAP) + k;
+        dv += imp[2u * id].xyz;
+        dw += imp[2u * id + 1u].xyz;
+    }
+
+    vec3 v = me.vel_m.xyz + dv * RELAX;
+    vec3 w = me.ang_i.xyz + dw * RELAX;
+
+    if (any(isnan(v)) || any(isnan(w))) {
+        /* отладка: помечаем тело, а не разносим мир молча */
+        me.misc.z = -999.0;
+    }
+    me.vel_m = vec4(v, me.vel_m.w);
+    me.ang_i = vec4(w, me.ang_i.w);
+    bout[i] = me;
+}
