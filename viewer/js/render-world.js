@@ -6,7 +6,7 @@
  * появляется новая форма с более мелким тетраэдральным шагом. */
 
 import { compile } from "./gl.js";
-import { VS_WORLD, FS_WORLD } from "./shaders.js";
+import { VS_WORLD, FS_WORLD, VS_GRIDLINES, FS_LINE } from "./shaders.js";
 
 export class WorldRenderer {
   constructor(gl) {
@@ -21,6 +21,15 @@ export class WorldRenderer {
     this.uTint = gl.getUniformLocation(this.prog, "uTint");
     this.uPos = gl.getUniformLocation(this.prog, "uPos");
     this.uQuat = gl.getUniformLocation(this.prog, "uQuat");
+
+    // сетка вокселей — отдельная программа линий
+    this.progLines = compile(gl, VS_GRIDLINES, FS_LINE);
+    this.lineLoc = {
+      aPos: gl.getAttribLocation(this.progLines, "aPos"),
+      uVP: gl.getUniformLocation(this.progLines, "uVP"),
+      uTint: gl.getUniformLocation(this.progLines, "uTint"),
+    };
+    this.showGrid = false;
     this.data = null;
     this.buffers = [];
   }
@@ -43,7 +52,40 @@ export class WorldRenderer {
       gl.vertexAttribPointer(this.loc.aNrm, 3, gl.FLOAT, false, 24, 12);
 
       gl.bindVertexArray(null);
-      return { vao, vb, count: sh.count };
+
+      // линии сетки: контур bbox плюс рёбра через gridStep
+      const lines = [];
+      const lo = sh.gridLo;
+      const hi = sh.gridHi;
+      const st = sh.gridStep > 0 ? sh.gridStep : sh.edge;
+      const pushSeg = (a, b) => lines.push(a[0], a[1], a[2], b[0], b[1], b[2]);
+      for (let axis = 0; axis < 3; axis++) {
+        for (let u = 0; u <= 1; u++) {
+          for (let v = 0; v <= 1; v++) {
+            const p0 = [0, 0, 0];
+            const p1 = [0, 0, 0];
+            const a1 = (axis + 1) % 3;
+            const a2 = (axis + 2) % 3;
+            p0[a1] = u ? hi[a1] : lo[a1];
+            p0[a2] = v ? hi[a2] : lo[a2];
+            p1[a1] = p0[a1];
+            p1[a2] = p0[a2];
+            p0[axis] = lo[axis];
+            p1[axis] = hi[axis];
+            pushSeg(p0, p1);
+          }
+        }
+      }
+      const gvao = gl.createVertexArray();
+      gl.bindVertexArray(gvao);
+      const gvb = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, gvb);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(lines), gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(this.lineLoc.aPos);
+      gl.vertexAttribPointer(this.lineLoc.aPos, 3, gl.FLOAT, false, 0, 0);
+      gl.bindVertexArray(null);
+
+      return { vao, vb, count: sh.count, gvao, gvb, gcount: lines.length / 3 };
     });
   }
 
@@ -71,6 +113,22 @@ export class WorldRenderer {
       gl.drawArrays(gl.TRIANGLES, 0, buf.count);
     }
     gl.bindVertexArray(null);
+
+    if (this.showGrid) {
+      gl.useProgram(this.progLines);
+      gl.uniformMatrix4fv(this.lineLoc.uVP, false, vp);
+      gl.uniform3fv(this.lineLoc.uTint, [0.30, 0.55, 0.85]);
+      for (const body of row) {
+        const buf = this.buffers[body.shape];
+        if (!buf || !buf.gcount) continue;
+        // линии заданы в локальных координатах — тот же перенос и поворот
+        gl.uniform3fv(this.uPos, body.pos);
+        gl.uniform4fv(this.uQuat, body.quat);
+        gl.bindVertexArray(buf.gvao);
+        gl.drawArrays(gl.LINES, 0, buf.gcount);
+      }
+      gl.bindVertexArray(null);
+    }
   }
 
   #dispose() {
@@ -79,6 +137,10 @@ export class WorldRenderer {
     for (const b of this.buffers) {
       gl.deleteVertexArray(b.vao);
       gl.deleteBuffer(b.vb);
+      if (b.gvao) {
+        gl.deleteVertexArray(b.gvao);
+        gl.deleteBuffer(b.gvb);
+      }
     }
     this.buffers = [];
   }

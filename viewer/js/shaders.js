@@ -139,6 +139,21 @@ void main() {
   outColor = vec4(col, 1.0);
 }`;
 
+/* Линии сетки вокселей: те же перенос и поворот, что у меша. */
+export const VS_GRIDLINES = `#version 300 es
+precision highp float;
+in vec3 aPos;
+uniform mat4 uVP;
+uniform vec3 uPos;
+uniform vec4 uQuat;
+vec3 qrot(vec4 q, vec3 v) {
+  vec3 t = 2.0 * cross(q.xyz, v);
+  return v + q.w * t + cross(q.xyz, t);
+}
+void main() {
+  gl_Position = uVP * vec4(qrot(uQuat, aPos) + uPos, 1.0);
+}`;
+
 export const VS_LINE = `#version 300 es
 precision highp float;
 in vec3 aPos;

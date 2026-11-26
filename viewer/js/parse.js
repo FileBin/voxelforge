@@ -17,7 +17,7 @@ function magicOf(buf) {
 export function detectFormat(buf) {
   const m = magicOf(buf);
   if (m === "VFR1" || m === "VFR2") return "vfr";
-  if (m === "VFW1" || m === "VFW2") return "vfw";
+  if (m === "VFW1" || m === "VFW2" || m === "VFW3") return "vfw";
   return null;
 }
 
@@ -74,7 +74,7 @@ export function parseTrace(buf) {
 export function parseWorld(buf) {
   const dv = new DataView(buf);
   const magic = magicOf(buf);
-  if (magic !== "VFW2") throw new Error("не VFW2: " + magic);
+  if (magic !== "VFW2" && magic !== "VFW3") throw new Error("не VFW2/VFW3: " + magic);
   const nf = dv.getUint32(4, true);
   const nShapes = dv.getUint32(8, true);
   const total = dv.getUint32(12, true);
@@ -87,6 +87,15 @@ export function parseWorld(buf) {
     const nv = dv.getUint32(off + 4, true);
     const ni = dv.getUint32(off + 8, true);
     off += 12;
+    const gridLo = [0, 0, 0];
+    const gridHi = [0, 0, 0];
+    let gridStep = 0;
+    if (magic === "VFW3") {
+      for (let k = 0; k < 3; k++) gridLo[k] = dv.getFloat32(off + k * 4, true);
+      for (let k = 0; k < 3; k++) gridHi[k] = dv.getFloat32(off + 12 + k * 4, true);
+      gridStep = dv.getFloat32(off + 24, true);
+      off += 28;
+    }
     const positions = new Float32Array(nv * 3);
     for (let i = 0; i < nv * 3; i++) {
       positions[i] = dv.getFloat32(off, true);
@@ -130,7 +139,17 @@ export function parseWorld(buf) {
         verts[w++] = nx; verts[w++] = ny; verts[w++] = nz;
       }
     }
-    shapes.push({ level, vertices: verts, count: ntri * 3, edge: base / (1 << level), blo, bhi });
+    shapes.push({
+      level,
+      vertices: verts,
+      count: ntri * 3,
+      edge: base / (1 << level),
+      blo,
+      bhi,
+      gridLo,
+      gridHi,
+      gridStep,
+    });
   }
 
   const frames = [];

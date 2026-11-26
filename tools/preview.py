@@ -30,14 +30,21 @@ FOV = math.radians(46.0)
 
 def read_world(path):
     b = Path(path).read_bytes()
-    if b[:4] != b"VFW2":
-        sys.exit(f"{path}: не VFW2 (нужен мир движка)")
+    if b[:4] not in (b"VFW2", b"VFW3"):
+        sys.exit(f"{path}: не VFW2/VFW3 (нужен мир движка)")
     nf, nshapes, _total, base = struct.unpack_from("<IIIf", b, 4)
     off = 20
     shapes = []
     for _ in range(nshapes):
         level, nv, ni = struct.unpack_from("<III", b, off)
         off += 12
+        grid = None
+        if b[:4] == b"VFW3":
+            glo = struct.unpack_from("<fff", b, off)
+            ghi = struct.unpack_from("<fff", b, off + 12)
+            gstep = struct.unpack_from("<f", b, off + 24)[0]
+            grid = (glo, ghi, gstep)
+            off += 28
         pos = np.frombuffer(b, dtype="<f4", count=nv * 3, offset=off).reshape(nv, 3)
         off += nv * 12
         idx = np.frombuffer(b, dtype="<u4", count=ni, offset=off).reshape(-1, 3)

@@ -94,7 +94,20 @@ fn main() {
                 p[2] -= c[2];
             }
         }
-        meshes.into_iter().map(|m| Shape { level: m.level, mesh: m }).collect()
+        meshes
+            .into_iter()
+            .enumerate()
+            .map(|(k, m)| {
+                let g = shards[k].surface_grid().1;
+                Shape {
+                    level: m.level,
+                    mesh: m,
+                    grid_lo: g.lo,
+                    grid_hi: g.hi,
+                    grid_step: g.step,
+                }
+            })
+            .collect()
     }
 
     let mut shapes: Vec<Shape> = rebuild(&shards, plate.origin);

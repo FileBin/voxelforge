@@ -112,6 +112,10 @@ try {
   worldRenderer = new WorldRenderer(gl);
   attachControls(canvas, cam);
 
+  document.getElementById("grid").addEventListener("change", (e) => {
+    worldRenderer.showGrid = e.target.checked;
+  });
+
   const q = new URLSearchParams(location.search).get("file");
   if (q) {
     fetch(q)

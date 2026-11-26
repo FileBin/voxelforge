@@ -17,6 +17,10 @@ use crate::tet::{Mesh, TetBody};
 pub struct Shape {
     pub level: u8,
     pub mesh: Mesh,
+    /// Решётка тела: откуда и с каким шагом идут ячейки (для сетки вокселей).
+    pub grid_lo: [f32; 3],
+    pub grid_hi: [f32; 3],
+    pub grid_step: f32,
 }
 
 pub struct BodyFrame {
@@ -26,7 +30,7 @@ pub struct BodyFrame {
 }
 
 pub fn shape_of(body: &TetBody) -> Shape {
-    let mut mesh = body.surface();
+    let (mut mesh, grid) = body.surface_grid();
     // Меш строится в мировых координатах (узлы решётки), а кадр задаёт
     // позицию тела — значит вершины должны быть ЛОКАЛЬНЫМИ.
     let c = body.centroid();
@@ -35,13 +39,19 @@ pub fn shape_of(body: &TetBody) -> Shape {
         p[1] -= c[1];
         p[2] -= c[2];
     }
-    Shape { level: mesh.level, mesh }
+    Shape {
+        level: mesh.level,
+        mesh,
+        grid_lo: grid.lo,
+        grid_hi: grid.hi,
+        grid_step: grid.step,
+    }
 }
 
 pub fn encode(frames: &[Vec<BodyFrame>], shapes: &[Shape]) -> Vec<u8> {
     let total: usize = shapes.iter().map(|s| s.mesh.positions.len()).sum();
     let mut out = Vec::new();
-    out.extend_from_slice(b"VFW2");
+    out.extend_from_slice(b"VFW3");
     out.extend_from_slice(&(frames.len() as u32).to_le_bytes());
     out.extend_from_slice(&(shapes.len() as u32).to_le_bytes());
     out.extend_from_slice(&(total as u32).to_le_bytes());
@@ -51,6 +61,13 @@ pub fn encode(frames: &[Vec<BodyFrame>], shapes: &[Shape]) -> Vec<u8> {
         out.extend_from_slice(&(s.level as u32).to_le_bytes());
         out.extend_from_slice(&(s.mesh.positions.len() as u32).to_le_bytes());
         out.extend_from_slice(&(s.mesh.indices.len() as u32).to_le_bytes());
+        for k in 0..3 {
+            out.extend_from_slice(&s.grid_lo[k].to_le_bytes());
+        }
+        for k in 0..3 {
+            out.extend_from_slice(&s.grid_hi[k].to_le_bytes());
+        }
+        out.extend_from_slice(&s.grid_step.to_le_bytes());
         for p in &s.mesh.positions {
             for k in 0..3 {
                 out.extend_from_slice(&p[k].to_le_bytes());

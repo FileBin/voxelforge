@@ -295,20 +295,40 @@ impl TetBody {
             .collect()
     }
 
-    /// Марчинг по тетраэдрам: граничные треугольники поверхности.
-    /// Вершины общие для соседних треугольников — меш водонепроницаемый.
+    /// Марчинг по тетраэдрам: граничные грани тетраэдров + сглаживание.
+    ///
+    /// Поле занятости бинарное, поэтому настоящей дроби `t` на ребре не
+    /// бывает: изоповерхность совпадает с гранями, и вершины сидят строго в
+    /// узлах. Чтобы поверхность была живой, после извлечения вершины
+    /// сдвигаются лапласианом (2 итерации) — форма перестаёт быть решёточной,
+    /// а объём возвращается масштабированием относительно центра масс.
     pub fn surface(&self) -> Mesh {
-        // грани, встречающиеся один раз, — поверхность
+        self.surface_grid().0
+    }
+
+    pub fn surface_grid(&self) -> (Mesh, Grid) {
+        let mut mesh = self.extract_faces();
+        smooth(&mut mesh, 2, 0.45);
+        let level = mesh.level;
+        let step = node_step(level);
+        let origin = self.centroid();
+        let (lo, hi) = self.bounds();
+        (
+            mesh,
+            Grid {
+                lo: [lo[0] - origin[0], lo[1] - origin[1], lo[2] - origin[2]],
+                hi: [hi[0] - origin[0], hi[1] - origin[1], hi[2] - origin[2]],
+                step: BASE / (1u32 << level) as f32,
+            },
+        )
+    }
+
+    /// Точная поверхность: грани, встречающиеся у одного тетраэдра.
+    fn extract_faces(&self) -> Mesh {
         let mut faces: HashMap<[u64; 3], (u32, [Node; 3], u8, [f32; 3])> = HashMap::new();
         let origin = self.centroid();
         for t in &self.tets {
             let p: [[f32; 3]; 4] = std::array::from_fn(|i| node_pos(t.v[i], t.level, origin));
-            // центр тетраэдра — чтобы ориентировать нормали наружу
-            let c = [
-                (p[0][0] + p[1][0] + p[2][0] + p[3][0]) / 4.0,
-                (p[0][1] + p[1][1] + p[2][1] + p[3][1]) / 4.0,
-                (p[0][2] + p[1][2] + p[2][2] + p[3][2]) / 4.0,
-            ];
             for (i, j, k) in [(0usize, 1usize, 2usize), (0, 1, 3), (0, 2, 3), (1, 2, 3)] {
                 let mut key = [pack(t.v[i]), pack(t.v[j]), pack(t.v[k])];
                 key.sort();
@@ -331,7 +351,6 @@ impl TetBody {
             if count != 1 {
                 continue;
             }
-            // порядок обхода — наружу от тетраэдра
             let a = node_pos(nodes[0], tet_level, origin);
             let b = node_pos(nodes[1], tet_level, origin);
             let c = node_pos(nodes[2], tet_level, origin);
@@ -347,18 +366,12 @@ impl TetBody {
             ];
             let flip = n[0] * to_out[0] + n[1] * to_out[1] + n[2] * to_out[2] < 0.0;
             let order: [usize; 3] = if flip { [0, 2, 1] } else { [0, 1, 2] };
-
             let mut ids = [0u32; 3];
             for (slot, idx) in order.iter().enumerate() {
                 let key = pack(nodes[*idx]);
                 ids[slot] = *vertex_of.entry(key).or_insert_with(|| {
-                    positions.push(if !flip {
-                        [a, b, c][*idx]
-                    } else {
-                        [a, b, c][*idx]
-                    });
-                    let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-12);
-                    normals.push([n[0] / len, n[1] / len, n[2] / len]);
+                    positions.push([a, b, c][*idx]);
+                    normals.push([n[0], n[1], n[2]]);
                     (positions.len() - 1) as u32
                 });
             }
@@ -372,7 +385,312 @@ impl TetBody {
             level,
         };
         orient_consistently(&mut mesh);
+        recompute_normals(&mut mesh);
         mesh
+    }
+}
+
+/// Параметры решётки тела для отрисовки сетки вокселей.
+#[derive(Clone, Copy, Debug)]
+pub struct Grid {
+    pub lo: [f32; 3],
+    pub hi: [f32; 3],
+    pub step: f32,
+}
+
+/// Расстояние от точки до треугольника (стандартный алгоритм с барицентрикой).
+fn point_tri_dist(p: [f32; 3], a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f32 {
+    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+    let ap = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
+    let dot = |x: [f32; 3], y: [f32; 3]| x[0] * y[0] + x[1] * y[1] + x[2] * y[2];
+    let d1 = dot(ab, ap);
+    let d2 = dot(ac, ap);
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return dot(ap, ap).sqrt();
+    }
+    let bp = [p[0] - b[0], p[1] - b[1], p[2] - b[2]];
+    let d3 = dot(ab, bp);
+    let d4 = dot(ac, bp);
+    if d3 >= 0.0 && d4 <= d3 {
+        return dot(bp, bp).sqrt();
+    }
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        let v = d1 / (d1 - d3);
+        let q = [a[0] + ab[0] * v, a[1] + ab[1] * v, a[2] + ab[2] * v];
+        let d = [p[0] - q[0], p[1] - q[1], p[2] - q[2]];
+        return dot(d, d).sqrt();
+    }
+    let cp = [p[0] - c[0], p[1] - c[1], p[2] - c[2]];
+    let d5 = dot(ab, cp);
+    let d6 = dot(ac, cp);
+    if d6 >= 0.0 && d5 <= d6 {
+        return dot(cp, cp).sqrt();
+    }
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        let w = d2 / (d2 - d6);
+        let q = [a[0] + ac[0] * w, a[1] + ac[1] * w, a[2] + ac[2] * w];
+        let d = [p[0] - q[0], p[1] - q[1], p[2] - q[2]];
+        return dot(d, d).sqrt();
+    }
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+        let w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        let q = [
+            b[0] + (c[0] - b[0]) * w,
+            b[1] + (c[1] - b[1]) * w,
+            b[2] + (c[2] - b[2]) * w,
+        ];
+        let d = [p[0] - q[0], p[1] - q[1], p[2] - q[2]];
+        return dot(d, d).sqrt();
+    }
+    // внутри проекции
+    let denom = 1.0 / (va + vb + vc);
+    let v = vb * denom;
+    let w = vc * denom;
+    let q = [
+        a[0] + ab[0] * v + ac[0] * w,
+        a[1] + ab[1] * v + ac[1] * w,
+        a[2] + ab[2] * v + ac[2] * w,
+    ];
+    let d = [p[0] - q[0], p[1] - q[1], p[2] - q[2]];
+    dot(d, d).sqrt()
+}
+
+/// Марчинг одного тетраэдра по знакам поля с интерполяцией по рёбрам.
+fn march_tet(
+    corners: &[Node; 4],
+    pos: &[[f32; 3]; 4],
+    val: &[f32; 4],
+    vertex: &mut dyn FnMut(Node, Node, f32) -> u32,
+    out: &mut Vec<u32>,
+) {
+    let inside: Vec<usize> = (0..4).filter(|&i| val[i] < 0.0).collect();
+    if inside.is_empty() || inside.len() == 4 {
+        return;
+    }
+    let mut pts: Vec<(u32, [f32; 3])> = Vec::new();
+    for &i in &inside {
+        for j in 0..4 {
+            if val[j] >= 0.0 {
+                // t по линейной интерполяции поля между узлами
+                let t = val[i] / (val[i] - val[j]);
+                let id = vertex(corners[i], corners[j], t);
+                let p = pos[i];
+                let q = pos[j];
+                pts.push((id, [
+                    p[0] + (q[0] - p[0]) * t,
+                    p[1] + (q[1] - p[1]) * t,
+                    p[2] + (q[2] - p[2]) * t,
+                ]));
+            }
+        }
+    }
+    pts.sort_by_key(|(id, _)| *id);
+    pts.dedup_by_key(|(id, _)| *id);
+
+    let centroid_in = {
+        let mut c = [0.0f32; 3];
+        for &i in &inside {
+            for k in 0..3 {
+                c[k] += pos[i][k] / inside.len() as f32;
+            }
+        }
+        c
+    };
+
+    let emit = |a: usize, b: usize, c: usize, out: &mut Vec<u32>| {
+        let pa = pts[a].1;
+        let pb = pts[b].1;
+        let pc = pts[c].1;
+        let n = [
+            (pb[1] - pa[1]) * (pc[2] - pa[2]) - (pb[2] - pa[2]) * (pc[1] - pa[1]),
+            (pb[2] - pa[2]) * (pc[0] - pa[0]) - (pb[0] - pa[0]) * (pc[2] - pa[2]),
+            (pb[0] - pa[0]) * (pc[1] - pa[1]) - (pb[1] - pa[1]) * (pc[0] - pa[0]),
+        ];
+        let mid = [
+            (pa[0] + pb[0] + pc[0]) / 3.0 - centroid_in[0],
+            (pa[1] + pb[1] + pc[1]) / 3.0 - centroid_in[1],
+            (pa[2] + pb[2] + pc[2]) / 3.0 - centroid_in[2],
+        ];
+        let dot = n[0] * mid[0] + n[1] * mid[1] + n[2] * mid[2];
+        if dot >= 0.0 {
+            out.extend_from_slice(&[pts[a].0, pts[b].0, pts[c].0]);
+        } else {
+            out.extend_from_slice(&[pts[a].0, pts[c].0, pts[b].0]);
+        }
+    };
+
+    match pts.len() {
+        3 => emit(0, 1, 2, out),
+        4 => {
+            let mut c = [0.0f32; 3];
+            for (_, p) in &pts {
+                for k in 0..3 {
+                    c[k] += p[k] / 4.0;
+                }
+            }
+            let p0 = pts[0].1;
+            let p1 = pts[1].1;
+            let p2 = pts[2].1;
+            let n = [
+                (p1[1] - p0[1]) * (p2[2] - p0[2]) - (p1[2] - p0[2]) * (p2[1] - p0[1]),
+                (p1[2] - p0[2]) * (p2[0] - p0[0]) - (p1[0] - p0[0]) * (p2[2] - p0[2]),
+                (p1[0] - p0[0]) * (p2[1] - p0[1]) - (p1[1] - p0[1]) * (p2[0] - p0[0]),
+            ];
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-9);
+            let nn = [n[0] / len, n[1] / len, n[2] / len];
+            let d0 = [p0[0] - c[0], p0[1] - c[1], p0[2] - c[2]];
+            let l0 = (d0[0] * d0[0] + d0[1] * d0[1] + d0[2] * d0[2]).sqrt().max(1e-9);
+            let u = [d0[0] / l0, d0[1] / l0, d0[2] / l0];
+            let w = [
+                nn[1] * u[2] - nn[2] * u[1],
+                nn[2] * u[0] - nn[0] * u[2],
+                nn[0] * u[1] - nn[1] * u[0],
+            ];
+            let mut order: Vec<usize> = (0..4).collect();
+            order.sort_by(|&a, &b| {
+                let da = [pts[a].1[0] - c[0], pts[a].1[1] - c[1], pts[a].1[2] - c[2]];
+                let db = [pts[b].1[0] - c[0], pts[b].1[1] - c[1], pts[b].1[2] - c[2]];
+                let aa = (da[0] * w[0] + da[1] * w[1] + da[2] * w[2])
+                    .atan2(da[0] * u[0] + da[1] * u[1] + da[2] * u[2]);
+                let ab = (db[0] * w[0] + db[1] * w[1] + db[2] * w[2])
+                    .atan2(db[0] * u[0] + db[1] * u[1] + db[2] * u[2]);
+                aa.partial_cmp(&ab).unwrap()
+            });
+            emit(order[0], order[1], order[2], out);
+            emit(order[0], order[2], order[3], out);
+        }
+        _ => {}
+    }
+}
+
+/// Поверхности осколков одним проходом по ТЕЛУ: карта граней строится один
+/// раз, поэтому грани на стыке двух осколков попадают в оба меша с одинаковой
+/// ориентацией, и каждый осколок получает замкнутую поверхность.
+pub fn split_surfaces(origin: [f32; 3], tets: &[Tet], shard_of: &[usize], n_shards: usize) -> Vec<Mesh> {
+    use std::collections::HashMap as H;
+    // грань → узлы, уровень и «противоположные» вершины по каждому владельцу
+    // (у грани на стыке двух осколков владельцев два, и каждому нужна своя
+    // ориентация — иначе у одного из осколков поверхность вывернута).
+    let mut faces: H<[u64; 3], ([Node; 3], u8, Vec<(usize, [f32; 3])>)> = H::new();
+    for (ti, t) in tets.iter().enumerate() {
+        let owner = shard_of[ti];
+        let p: [[f32; 3]; 4] = std::array::from_fn(|i| node_pos(t.v[i], t.level, origin));
+        for (i, j, k) in [(0usize, 1usize, 2usize), (0, 1, 3), (0, 2, 3), (1, 2, 3)] {
+            let mut key = [pack(t.v[i]), pack(t.v[j]), pack(t.v[k])];
+            key.sort();
+            let opposite = p[6 - i - j - k];
+            match faces.get_mut(&key) {
+                Some(e) => e.2.push((owner, opposite)),
+                None => {
+                    faces.insert(key, ([t.v[i], t.v[j], t.v[k]], t.level, vec![(owner, opposite)]));
+                }
+            }
+        }
+    }
+
+    let mut out: Vec<Mesh> = (0..n_shards)
+        .map(|_| Mesh {
+            positions: Vec::new(),
+            normals: Vec::new(),
+            indices: Vec::new(),
+            level: 0,
+        })
+        .collect();
+    let mut vertex_of: Vec<H<u64, u32>> = (0..n_shards).map(|_| H::new()).collect();
+
+    for (_, (nodes, level, owners)) in faces {
+        // Грань внутри одного осколка (два тетраэдра одного владельца) — не
+        // поверхность. Грань на стыке двух осколков нужна обоим, каждая со
+        // своей ориентацией.
+        let distinct: std::collections::BTreeSet<usize> =
+            owners.iter().map(|(o, _)| *o).collect();
+        if owners.len() >= 2 && distinct.len() == 1 {
+            continue;
+        }
+        let a = node_pos(nodes[0], level, origin);
+        let b = node_pos(nodes[1], level, origin);
+        let c = node_pos(nodes[2], level, origin);
+        let n = [
+            (b[1] - a[1]) * (c[2] - a[2]) - (b[2] - a[2]) * (c[1] - a[1]),
+            (b[2] - a[2]) * (c[0] - a[0]) - (b[0] - a[0]) * (c[2] - a[2]),
+            (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]),
+        ];
+        let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-12);
+        for (shard, opposite) in owners {
+            let to_out = [
+                (a[0] + b[0] + c[0]) / 3.0 - opposite[0],
+                (a[1] + b[1] + c[1]) / 3.0 - opposite[1],
+                (a[2] + b[2] + c[2]) / 3.0 - opposite[2],
+            ];
+            let flip = n[0] * to_out[0] + n[1] * to_out[1] + n[2] * to_out[2] < 0.0;
+            let order: [usize; 3] = if flip { [0, 2, 1] } else { [0, 1, 2] };
+            let mesh = &mut out[shard];
+            let mut ids = [0u32; 3];
+            for (slot, idx) in order.iter().enumerate() {
+                let key = pack(nodes[*idx]);
+                ids[slot] = *vertex_of[shard].entry(key).or_insert_with(|| {
+                    mesh.positions.push([a, b, c][*idx]);
+                    mesh.normals.push([n[0] / len, n[1] / len, n[2] / len]);
+                    (mesh.positions.len() - 1) as u32
+                });
+            }
+            mesh.indices.extend_from_slice(&ids);
+            mesh.level = mesh.level.max(level);
+        }
+    }
+
+    for m in out.iter_mut() {
+        orient_consistently(m);
+        // сглаживание как в `surface()`: уводит вершины с узлов решётки
+        smooth(m, 2, 0.45);
+    }
+    out
+}
+
+pub struct Mesh {
+    pub positions: Vec<[f32; 3]>,
+    pub normals: Vec<[f32; 3]>,
+    pub indices: Vec<u32>,
+    pub level: u8,
+}
+
+impl Mesh {
+    pub fn triangles(&self) -> usize {
+        self.indices.len() / 3
+    }
+}
+
+/// Объём меша (теорема о дивергенции) — для проверок.
+pub fn mesh_volume(m: &Mesh) -> f32 {
+    let mut v = 0.0f64;
+    for t in m.indices.chunks(3) {
+        let a = m.positions[t[0] as usize];
+        let b = m.positions[t[1] as usize];
+        let c = m.positions[t[2] as usize];
+        v += (a[0] * (b[1] * c[2] - b[2] * c[1])
+            - a[1] * (b[0] * c[2] - b[2] * c[0])
+            + a[2] * (b[0] * c[1] - b[1] * c[0])) as f64
+            / 6.0;
+    }
+    v as f32
+}
+
+/// Детерминированный ГПСЧ: раскол обязан воспроизводиться.
+pub struct Lcg(u64);
+impl Lcg {
+    pub fn new(seed: u64) -> Self {
+        Self(seed | 1)
+    }
+    pub fn unit(&mut self) -> f32 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((self.0 >> 33) as f32) / (u32::MAX as f32)
     }
 }
 
@@ -468,7 +786,6 @@ fn orient_consistently(m: &mut Mesh) {
         }
     }
 
-    // Добивка: остались пары, идущие по ребру в одну сторону — разворачиваем.
     for _ in 0..8 {
         let mut dir: std::collections::HashMap<(u32, u32), usize> = std::collections::HashMap::new();
         for v in &tris {
@@ -503,127 +820,88 @@ fn orient_consistently(m: &mut Mesh) {
     }
 }
 
-/// Поверхности осколков одним проходом по ТЕЛУ: карта граней строится один
-/// раз, поэтому грани на стыке двух осколков попадают в оба меша с одинаковой
-/// ориентацией, и каждый осколок получает замкнутую поверхность.
-pub fn split_surfaces(origin: [f32; 3], tets: &[Tet], shard_of: &[usize], n_shards: usize) -> Vec<Mesh> {
-    use std::collections::HashMap as H;
-    // грань → узлы, уровень и «противоположные» вершины по каждому владельцу
-    // (у грани на стыке двух осколков владельцев два, и каждому нужна своя
-    // ориентация — иначе у одного из осколков поверхность вывернута).
-    let mut faces: H<[u64; 3], ([Node; 3], u8, Vec<(usize, [f32; 3])>)> = H::new();
-    for (ti, t) in tets.iter().enumerate() {
-        let owner = shard_of[ti];
-        let p: [[f32; 3]; 4] = std::array::from_fn(|i| node_pos(t.v[i], t.level, origin));
-        for (i, j, k) in [(0usize, 1usize, 2usize), (0, 1, 3), (0, 2, 3), (1, 2, 3)] {
-            let mut key = [pack(t.v[i]), pack(t.v[j]), pack(t.v[k])];
-            key.sort();
-            let opposite = p[6 - i - j - k];
-            match faces.get_mut(&key) {
-                Some(e) => e.2.push((owner, opposite)),
-                None => {
-                    faces.insert(key, ([t.v[i], t.v[j], t.v[k]], t.level, vec![(owner, opposite)]));
-                }
-            }
+
+/// Лапласиан: вершина тянется к среднему соседей. Снимает «решёточность»
+/// поверхности, не меняя топологию (меш остаётся водонепроницаемым).
+/// Объём возвращается масштабом вокруг центра масс.
+fn smooth(m: &mut Mesh, iterations: usize, lambda: f32) {
+    let n = m.positions.len();
+    if n == 0 {
+        return;
+    }
+    let mut neigh: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for t in m.indices.chunks(3) {
+        for e in 0..3 {
+            let (a, b) = (t[e], t[(e + 1) % 3]);
+            neigh[a as usize].push(b);
+            neigh[b as usize].push(a);
+        }
+    }
+    for v in neigh.iter_mut() {
+        v.sort_unstable();
+        v.dedup();
+    }
+
+    let vol0 = mesh_volume(m);
+    let mut c = [0.0f64; 3];
+    for p in &m.positions {
+        for k in 0..3 {
+            c[k] += p[k] as f64 / n as f64;
         }
     }
 
-    let mut out: Vec<Mesh> = (0..n_shards)
-        .map(|_| Mesh {
-            positions: Vec::new(),
-            normals: Vec::new(),
-            indices: Vec::new(),
-            level: 0,
-        })
-        .collect();
-    let mut vertex_of: Vec<H<u64, u32>> = (0..n_shards).map(|_| H::new()).collect();
-
-    for (_, (nodes, level, owners)) in faces {
-        // Грань внутри одного осколка (два тетраэдра одного владельца) — не
-        // поверхность. Грань на стыке двух осколков нужна обоим, каждая со
-        // своей ориентацией.
-        let distinct: std::collections::BTreeSet<usize> =
-            owners.iter().map(|(o, _)| *o).collect();
-        if owners.len() >= 2 && distinct.len() == 1 {
-            continue;
+    for _ in 0..iterations {
+        let mut next = m.positions.clone();
+        for i in 0..n {
+            if neigh[i].is_empty() {
+                continue;
+            }
+            let mut avg = [0.0f32; 3];
+            for &j in &neigh[i] {
+                for k in 0..3 {
+                    avg[k] += m.positions[j as usize][k] / neigh[i].len() as f32;
+                }
+            }
+            for k in 0..3 {
+                next[i][k] = m.positions[i][k] + lambda * (avg[k] - m.positions[i][k]);
+            }
         }
-        let a = node_pos(nodes[0], level, origin);
-        let b = node_pos(nodes[1], level, origin);
-        let c = node_pos(nodes[2], level, origin);
+        m.positions = next;
+    }
+
+    // объём после сглаживания просел — возвращаем масштабом
+    let vol1 = mesh_volume(m);
+    if vol1.abs() > 1e-9 {
+        let s = (vol0 / vol1).cbrt();
+        for p in m.positions.iter_mut() {
+            for k in 0..3 {
+                p[k] = (c[k] as f32) + (p[k] - c[k] as f32) * s;
+            }
+        }
+    }
+    recompute_normals(m);
+}
+
+/// Плоские нормали по треугольникам (после сдвига вершин старые неверны).
+fn recompute_normals(m: &mut Mesh) {
+    let mut vn = vec![[0.0f32; 3]; m.positions.len()];
+    for t in m.indices.chunks(3) {
+        let a = m.positions[t[0] as usize];
+        let b = m.positions[t[1] as usize];
+        let c = m.positions[t[2] as usize];
         let n = [
             (b[1] - a[1]) * (c[2] - a[2]) - (b[2] - a[2]) * (c[1] - a[1]),
             (b[2] - a[2]) * (c[0] - a[0]) - (b[0] - a[0]) * (c[2] - a[2]),
             (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]),
         ];
-        let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-12);
-        for (shard, opposite) in owners {
-            let to_out = [
-                (a[0] + b[0] + c[0]) / 3.0 - opposite[0],
-                (a[1] + b[1] + c[1]) / 3.0 - opposite[1],
-                (a[2] + b[2] + c[2]) / 3.0 - opposite[2],
-            ];
-            let flip = n[0] * to_out[0] + n[1] * to_out[1] + n[2] * to_out[2] < 0.0;
-            let order: [usize; 3] = if flip { [0, 2, 1] } else { [0, 1, 2] };
-            let mesh = &mut out[shard];
-            let mut ids = [0u32; 3];
-            for (slot, idx) in order.iter().enumerate() {
-                let key = pack(nodes[*idx]);
-                ids[slot] = *vertex_of[shard].entry(key).or_insert_with(|| {
-                    mesh.positions.push([a, b, c][*idx]);
-                    mesh.normals.push([n[0] / len, n[1] / len, n[2] / len]);
-                    (mesh.positions.len() - 1) as u32
-                });
+        for idx in t {
+            for k in 0..3 {
+                vn[*idx as usize][k] += n[k] / 3.0;
             }
-            mesh.indices.extend_from_slice(&ids);
-            mesh.level = mesh.level.max(level);
         }
     }
-
-    for m in out.iter_mut() {
-        orient_consistently(m);
-    }
-    out
-}
-
-pub struct Mesh {
-    pub positions: Vec<[f32; 3]>,
-    pub normals: Vec<[f32; 3]>,
-    pub indices: Vec<u32>,
-    pub level: u8,
-}
-
-impl Mesh {
-    pub fn triangles(&self) -> usize {
-        self.indices.len() / 3
-    }
-}
-
-/// Объём меша (теорема о дивергенции) — для проверок.
-pub fn mesh_volume(m: &Mesh) -> f32 {
-    let mut v = 0.0f64;
-    for t in m.indices.chunks(3) {
-        let a = m.positions[t[0] as usize];
-        let b = m.positions[t[1] as usize];
-        let c = m.positions[t[2] as usize];
-        v += (a[0] * (b[1] * c[2] - b[2] * c[1])
-            - a[1] * (b[0] * c[2] - b[2] * c[0])
-            + a[2] * (b[0] * c[1] - b[1] * c[0])) as f64
-            / 6.0;
-    }
-    v as f32
-}
-
-/// Детерминированный ГПСЧ: раскол обязан воспроизводиться.
-pub struct Lcg(u64);
-impl Lcg {
-    pub fn new(seed: u64) -> Self {
-        Self(seed | 1)
-    }
-    pub fn unit(&mut self) -> f32 {
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        ((self.0 >> 33) as f32) / (u32::MAX as f32)
+    for (i, n) in vn.iter().enumerate() {
+        let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-12);
+        m.normals[i] = [n[0] / l, n[1] / l, n[2] / l];
     }
 }
