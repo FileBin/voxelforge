@@ -92,7 +92,28 @@ pub fn tet_tet(a: &[[f32; 3]; 4], b: &[[f32; 3]; 4]) -> Option<([f32; 3], f32)> 
     let mut best_axis = [0.0f32; 3];
     let mut best_overlap = f32::MAX;
 
+    // Оси: нормали граней обоих тетраэдров ПЛЮС попарные векторные
+    // произведения рёбер. Без последних SAT пропускает разделяющую ось и
+    // выдаёт фантомное проникновение (наблюдалось 0.07 м у стоящих рядом
+    // осколков).
+    let mut axes: Vec<[f32; 3]> = Vec::with_capacity(8 + 36);
     for n in face_normals(a).iter().chain(face_normals(b).iter()) {
+        axes.push(*n);
+    }
+    const EDGES: [(usize, usize); 6] = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)];
+    for (i, j) in EDGES {
+        let ea = sub(a[j], a[i]);
+        for (k, l) in EDGES {
+            let eb = sub(b[l], b[k]);
+            let c = cross(ea, eb);
+            let len = dot(c, c).sqrt();
+            if len > 1e-4 {
+                axes.push([c[0] / len, c[1] / len, c[2] / len]);
+            }
+        }
+    }
+
+    for n in axes.iter() {
         let (alo, ahi) = project(a, *n);
         let (blo, bhi) = project(b, *n);
         let overlap = ahi.min(bhi) - alo.max(blo);

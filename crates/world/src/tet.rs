@@ -394,7 +394,7 @@ impl TetBody {
         let mut mesh = self.extract_faces();
         smooth(&mut mesh, 2, 0.45);
         let level = mesh.level;
-        let step = node_step(level);
+        let _step = node_step(level);
         let origin = self.centroid();
         let (lo, hi) = self.bounds();
         (
@@ -480,67 +480,6 @@ pub struct Grid {
     pub lo: [f32; 3],
     pub hi: [f32; 3],
     pub step: f32,
-}
-
-/// Расстояние от точки до треугольника (стандартный алгоритм с барицентрикой).
-fn point_tri_dist(p: [f32; 3], a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f32 {
-    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-    let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
-    let ap = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
-    let dot = |x: [f32; 3], y: [f32; 3]| x[0] * y[0] + x[1] * y[1] + x[2] * y[2];
-    let d1 = dot(ab, ap);
-    let d2 = dot(ac, ap);
-    if d1 <= 0.0 && d2 <= 0.0 {
-        return dot(ap, ap).sqrt();
-    }
-    let bp = [p[0] - b[0], p[1] - b[1], p[2] - b[2]];
-    let d3 = dot(ab, bp);
-    let d4 = dot(ac, bp);
-    if d3 >= 0.0 && d4 <= d3 {
-        return dot(bp, bp).sqrt();
-    }
-    let vc = d1 * d4 - d3 * d2;
-    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
-        let v = d1 / (d1 - d3);
-        let q = [a[0] + ab[0] * v, a[1] + ab[1] * v, a[2] + ab[2] * v];
-        let d = [p[0] - q[0], p[1] - q[1], p[2] - q[2]];
-        return dot(d, d).sqrt();
-    }
-    let cp = [p[0] - c[0], p[1] - c[1], p[2] - c[2]];
-    let d5 = dot(ab, cp);
-    let d6 = dot(ac, cp);
-    if d6 >= 0.0 && d5 <= d6 {
-        return dot(cp, cp).sqrt();
-    }
-    let vb = d5 * d2 - d1 * d6;
-    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
-        let w = d2 / (d2 - d6);
-        let q = [a[0] + ac[0] * w, a[1] + ac[1] * w, a[2] + ac[2] * w];
-        let d = [p[0] - q[0], p[1] - q[1], p[2] - q[2]];
-        return dot(d, d).sqrt();
-    }
-    let va = d3 * d6 - d5 * d4;
-    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
-        let w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
-        let q = [
-            b[0] + (c[0] - b[0]) * w,
-            b[1] + (c[1] - b[1]) * w,
-            b[2] + (c[2] - b[2]) * w,
-        ];
-        let d = [p[0] - q[0], p[1] - q[1], p[2] - q[2]];
-        return dot(d, d).sqrt();
-    }
-    // внутри проекции
-    let denom = 1.0 / (va + vb + vc);
-    let v = vb * denom;
-    let w = vc * denom;
-    let q = [
-        a[0] + ab[0] * v + ac[0] * w,
-        a[1] + ab[1] * v + ac[1] * w,
-        a[2] + ab[2] * v + ac[2] * w,
-    ];
-    let d = [p[0] - q[0], p[1] - q[1], p[2] - q[2]];
-    dot(d, d).sqrt()
 }
 
 /// Марчинг одного тетраэдра по знакам поля с интерполяцией по рёбрам.

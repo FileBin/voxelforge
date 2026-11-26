@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use voxelforge_world::bcc::BASE;
 use voxelforge_world::collide;
-use voxelforge_world::tet::{split_surfaces, Lcg, TetBody};
+use voxelforge_world::tet::TetBody;
 use voxelforge_world::sim::{find_shaders, GpuBody, GpuSim, Params};
 use voxelforge_world::types::Body;
 use voxelforge_world::vfw::{self, BodyFrame, Shape};
@@ -59,107 +59,80 @@ fn parse_args() -> Args {
 
 /// Плотность материала, кг/м³ (лёгкий камень).
 const DENSITY: f64 = 420.0;
+/// Сколько слотов заранее выделено под осколки: тела появляются при ударе,
+/// но буфер на GPU фиксированного размера, поэтому слоты резервируются.
+const MAX_FRAGS: usize = 12;
+
+/// Тело физики по воксельному куску.
+fn body_of(frag: &TetBody) -> Body {
+    let c = frag.world_centroid();
+    let (lo, hi) = frag.bounds();
+    let half = [
+        0.5 * (hi[0] - lo[0]) as f64,
+        0.5 * (hi[1] - lo[1]) as f64,
+        0.5 * (hi[2] - lo[2]) as f64,
+    ];
+    let mut b = Body::block([c[0] as f64, c[1] as f64, c[2] as f64], half);
+    b.mass = DENSITY * frag.volume();
+    b
+}
+
+/// Форма для вьюера: меш марчинга + каркас тетраэдров + решётка.
+fn shape_of(frag: &TetBody) -> Shape {
+    vfw::shape_of(frag)
+}
 
 fn main() {
     let args = parse_args();
 
     // ---- мир ----------------------------------------------------------
-    // Плита: 3 кубические ячейки по ребру = 0.84 м, ячейки уровня 0.
+    // Плита ЦЕЛАЯ: 4×4×4 кубические ячейки, 768 тетраэдров. Раскола нет,
+    // пока в неё не попали — это и есть настоящая физика разрушения.
     let plate = TetBody::cube([0.0, 1.0, 0.0], 4, 0);
-    let plate_vol = plate.volume() as f64;
+    let plate_vol = plate.volume();
+    let ball = TetBody::ball([-3.2, 1.0, 0.0], 0.30, 1);
+    let ball_vol = ball.volume();
 
-    // Снаряд — воксельный шар, летит сбоку.
-    let ball = TetBody::ball([-3.0, 1.0, 0.0], 0.30, 1);
-    let ball_vol = ball.volume() as f64;
-
-    // Раскол плиты по Вороному: 9 затравок → неровные осколки.
-    let mut shards: Vec<TetBody> = plate.shatter(14, 0xC0FF_EE00_1234);
-    // Меши всех осколков считаются ОДНИМ проходом по общему списку тетраэдров:
-    // грани на стыке двух осколков попадают в оба меша, поэтому у каждого
-    // осколка поверхность замкнута.
-    fn rebuild(shards: &[TetBody], origin: [f32; 3]) -> Vec<Shape> {
-        let mut tets = Vec::new();
-        let mut owner = Vec::new();
-        for (i, s) in shards.iter().enumerate() {
-            tets.extend_from_slice(&s.tets);
-            owner.extend(std::iter::repeat(i).take(s.tets.len()));
-        }
-        let mut meshes = split_surfaces(origin, &tets, &owner, shards.len());
-        // Вершины локальные: кадр прибавит позицию тела, поэтому вычитаем
-        // центроид осколка — тот же, что уходит в физику.
-        for (k, m) in meshes.iter_mut().enumerate() {
-            let c = shards[k].world_centroid();
-            for p in m.positions.iter_mut() {
-                p[0] -= c[0];
-                p[1] -= c[1];
-                p[2] -= c[2];
-            }
-        }
-        meshes
-            .into_iter()
-            .enumerate()
-            .map(|(k, m)| {
-                let g = shards[k].surface_grid().1;
-                Shape {
-                    level: m.level,
-                    mesh: m,
-                    grid_lo: g.lo,
-                    grid_hi: g.hi,
-                    grid_step: g.step,
-                    edges: shards[k].edge_lines(),
-                }
-            })
-            .collect()
-    }
-
-    let mut shapes: Vec<Shape> = rebuild(&shards, plate.origin);
-    // тетраэдры каждого тела в локальных координатах — по ним считаются контакты
-    let mut tet_shapes: Vec<Vec<[[f32; 3]; 4]>> =
-        shards.iter().map(|s| s.surface_tets()).collect();
-    tet_shapes.push(ball.surface_tets());
-    let mut shape_id: Vec<u32> = (0..shards.len() as u32).collect();
-    let ball_shape = shapes.len() as u32;
-    shapes.push(vfw::shape_of(&ball));
-
-    // ---- тела для солвера ---------------------------------------------
-    let mut bodies: Vec<GpuBody> = Vec::new();
-    let mut cpu: Vec<Body> = Vec::new();
-    for s in &shards {
-        // центроид тетраэдров локальный — возвращаем его в мир через origin
-        let c = s.world_centroid();
-        let (lo, hi) = s.bounds();
-        // Коллизионная коробка осколка чуть меньше его габарита: у осколка
-        // рваные края, и по полному AABB соседние осколки «склеены» — они бы
-        // не разлетались, а толкали друг друга монолитом.
-        let half = [
-            0.80 * (hi[0] - lo[0]) as f64,
-            0.80 * (hi[1] - lo[1]) as f64,
-            0.80 * (hi[2] - lo[2]) as f64,
-        ];
-        let mut b = Body::block([c[0] as f64, c[1] as f64, c[2] as f64], half);
-        b.mass = DENSITY * s.volume() as f64;
-        cpu.push(b);
-        bodies.push(GpuBody::from_cpu(&b));
-    }
-    // Осколки спят, пока в плиту не попали. Массу не трогаем: нулевая
-    // обратная масса сделала бы их статикой, и удар ничего бы не сдвинул.
-    for b in bodies.iter_mut() {
-        b.misc[1] = 1.0;
-    }
-    // Параметры снаряда вынесены в env — так их можно подбирать, не пересобирая.
     let ball_speed: f64 = std::env::var("VF_SPEED").ok().and_then(|v| v.parse().ok()).unwrap_or(34.0);
     let ball_density: f64 = std::env::var("VF_BDENS").ok().and_then(|v| v.parse().ok()).unwrap_or(1200.0);
+
+    // формы: 0 — целая плита, 1 — снаряд; формы осколков добавятся при ударе
+    let mut shapes: Vec<Shape> = vec![shape_of(&plate), shape_of(&ball)];
+    let mut shape_id: Vec<u32> = vec![0; MAX_FRAGS];
+    let ball_slot = MAX_FRAGS;
+    let ball_shape = 1u32;
+
+    // ---- тела ---------------------------------------------------------
+    let mut bodies: Vec<GpuBody> = Vec::with_capacity(MAX_FRAGS + 1);
+    let mut tet_shapes: Vec<Vec<[[f32; 3]; 4]>> = Vec::with_capacity(MAX_FRAGS + 1);
+    let mut masses: Vec<f64> = Vec::with_capacity(MAX_FRAGS + 1);
+
+    let whole = body_of(&plate);
+    masses.push(whole.mass);
+    bodies.push(GpuBody::from_cpu(&whole));
+    tet_shapes.push(plate.surface_tets());
+
+    // зарезервированные слоты осколков: припаркованы далеко и спят
+    for _ in 1..MAX_FRAGS {
+        let parked = Body::new([0.0, -300.0, 0.0], [0.0, 0.0, 0.0], 1.0, 0.05);
+        let mut g = GpuBody::from_cpu(&parked);
+        g.misc[1] = 1.0;
+        bodies.push(g);
+        tet_shapes.push(Vec::new());
+        masses.push(1.0);
+    }
+
     let mut proj = Body::new([-3.2, 1.0, 0.0], [0.0, 0.0, 0.0], ball_density * ball_vol, 0.30);
     proj.vel = [ball_speed, 0.0, 0.0];
-    cpu.push(proj);
+    masses.push(proj.mass);
     bodies.push(GpuBody::from_cpu(&proj));
+    tet_shapes.push(ball.surface_tets());
 
     let max_half = bodies
         .iter()
         .map(|b| b.half_shape[0].max(b.half_shape[1]).max(b.half_shape[2]))
         .fold(0.0f32, f32::max);
     let params = Params {
-        // Ящик шире плиты, чтобы осколкам было куда разлетаться.
         lo: [-5.0, 0.0, -5.0],
         hi: [5.0, 8.0, 5.0],
         cell: (2.0 * max_half * 1.05).max(0.18),
@@ -174,196 +147,175 @@ fn main() {
     let mut gpu = GpuSim::new(bodies, &shaders, params);
 
     if !args.quiet {
-        let tets: usize = shards.iter().map(|s| s.tets.len()).sum();
         println!("voxelforge · {} · шаг решётки {:.3} м", gpu.name, BASE);
         println!(
-            "мир: плита {:.3} м³ на {tets} тетраэдров, {} осколков, снаряд {:.3} м³",
+            "мир: плита {:.3} м³ ({} тетраэдров, ЦЕЛАЯ), снаряд {:.3} м³",
             plate_vol,
-            shards.len(),
+            plate.tets.len(),
             ball_vol
         );
-        println!("масса плиты {:.1} кг, снаряда {:.1} кг", DENSITY * plate_vol, DENSITY * ball_vol);
+        println!(
+            "масса плиты {:.1} кг, снаряда {:.1} кг",
+            DENSITY * plate_vol,
+            ball_density * ball_vol
+        );
     }
 
     // ---- прогон --------------------------------------------------------
-    let n_shards = shards.len();
-    let mut frames: Vec<Vec<BodyFrame>> = Vec::with_capacity(args.frames as usize);
-    let mut cooldown = vec![0u32; n_shards];
-    let mut global_cd = 0u32;
-    let mut subdiv_log: Vec<String> = Vec::new();
+    let mut frames_out: Vec<Vec<BodyFrame>> = Vec::with_capacity(args.frames as usize);
+    let mut log: Vec<String> = Vec::new();
     let mut broke = false;
-
+    let mut active = 1usize; // живых слотов осколков (сейчас — одна плита)
     let mut snap = gpu.read_bodies();
+
     for f in 0..args.frames {
-        // Контакты считаются по САМИМ тетраэдрам (SAT), а не по AABB: пары
-        // ищутся по сетке, в список тела попадают самые глубокие.
-        let positions: Vec<[f32; 3]> = snap
+        let mut hit_now = false;
+        // контакты по тетраэдрам живых тел
+        let mut positions: Vec<[f32; 3]> = snap
             .iter()
             .map(|b| [b.pos_r[0], b.pos_r[1], b.pos_r[2]])
             .collect();
-        let t0 = std::time::Instant::now();
-        let contacts = collide::build(
+        let mut contacts = collide::build(
             &tet_shapes,
             &positions,
             0.0,
             (params.lo, params.hi),
             BASE * 0.5,
         );
-        // Пробуждение: спящее тело должен разбудить сосед, который реально
-        // едет — иначе плита проспит удар (солвер спящие не считает).
-        let mut woke = snap.clone();
-        let speed = |b: &GpuBody| {
-            (b.vel_m[0].powi(2) + b.vel_m[1].powi(2) + b.vel_m[2].powi(2)).sqrt()
-        };
-        let mut any_woke = false;
-        for i in 0..n_shards + 1 {
-            if snap[i].misc[1] < 0.5 {
-                continue;
-            }
-            let hit_by_mover = contacts[i].iter().any(|c| {
-                c.other >= 0 && snap[c.other as usize].misc[1] < 0.5 && speed(&snap[c.other as usize]) > 0.4
-            });
-            if !hit_by_mover {
-                continue;
-            }
-            woke[i].misc[1] = 0.0;
-            woke[i].misc[0] = 0.0;
-            woke[i].vel_m[3] = woke[i].misc[2];
-            woke[i].ang_i[3] = woke[i].misc[3];
-            woke[i].anchor = [woke[i].pos_r[0], woke[i].pos_r[1], woke[i].pos_r[2], 0.0];
-            any_woke = true;
-        }
-        if any_woke {
-            gpu.write_bodies(&woke);
-            snap = woke;
+        // припаркованные слоты в контактах не участвуют
+        for i in active..MAX_FRAGS {
+            contacts[i].clear();
         }
 
-        if std::env::var("VF_DEBUG").is_ok() && f < 6 {
-            let counts: Vec<usize> = contacts.iter().map(|c| c.len()).collect();
-            println!("  кадр {f}: контактов по телам {counts:?}");
-            for (i, c) in contacts.iter().enumerate() {
-                if let Some(first) = c.first() {
-                    println!("    тело {i}: первый контакт other={} n={:?} pen={:.4}", first.other, first.n, first.pen);
+        let chunks = 4u32;
+        let per = (args.substeps / chunks).max(1);
+        let mut _worst_pen = 0.0f32;
+        for _ in 0..chunks {
+            let positions: Vec<[f32; 3]> = snap
+                .iter()
+                .map(|b| [b.pos_r[0], b.pos_r[1], b.pos_r[2]])
+                .collect();
+            let mut cs = collide::build(&tet_shapes, &positions, 0.0, (params.lo, params.hi), BASE * 0.5);
+            for i in active..MAX_FRAGS {
+                cs[i].clear();
+            }
+            // Удар фиксируем ЗДЕСЬ: к началу следующего кадра солвер уже
+            // растащит тела, и контакт снаряд–плита исчезнет из списка.
+            if std::env::var("VF_DEBUG").is_ok() && f >= 3 && f <= 5 {
+                println!(
+                    "    кадр {f}: снаряд x={:.2} контактов {} ({:?})",
+                    snap[ball_slot].pos_r[0],
+                    cs[ball_slot].len(),
+                    cs[ball_slot].iter().map(|c| (c.other, c.pen)).collect::<Vec<_>>()
+                );
+            }
+            if !broke && cs[ball_slot].iter().any(|c| c.other == 0) {
+                hit_now = true;
+            }
+            for list in &cs {
+                for c in list {
+                    _worst_pen = _worst_pen.max(c.pen);
                 }
             }
-        }
-        if std::env::var("VF_TIME").is_ok() {
-            println!("  контакты {:.1} мс", t0.elapsed().as_secs_f64() * 1000.0);
-        }
-        let t1 = std::time::Instant::now();
-        if std::env::var("VF_DEBUG").is_ok() && (f == 5 || f == 30 || f == 60) {
-            println!("  кадр {f}: тело 0 pos {:?} vel {:?} asleep {}", 
-                snap[0].pos_r, snap[0].vel_m, snap[0].misc[1]);
-            println!("    контакты тела 0: {:?}", contacts[0]);
-            println!("    тетраэдров в tet_shapes: {:?}", tet_shapes.iter().map(|t| t.len()).collect::<Vec<_>>());
-        }
-        gpu.write_contacts(&contacts);
-        gpu.frame_with_contacts(1.0 / 60.0, args.substeps, args.iterations);
-        if std::env::var("VF_TIME").is_ok() {
-            println!("  gpu {:.1} мс", t1.elapsed().as_secs_f64() * 1000.0);
-        }
-        snap = gpu.read_bodies();
+            gpu.write_contacts(&cs);
+            gpu.frame_with_contacts(1.0 / 60.0 / chunks as f32, per, args.iterations);
+            snap = gpu.read_bodies();
 
-        // Удар: снаряд коснулся плиты. Мгновенный раскол — это не украшение,
-        // а модель: упругая энергия, запасённая до разрушения, уходит в разлёт.
-        // Импульс не берётся из воздуха — он вычитается из импульса снаряда.
-        if !broke && (0..n_shards).any(|i| snap[i].misc[1] < 0.5) {
-            broke = true;
-            // Источник разлёта — центр плиты, а не точка касания: снаряд
-            // останавливается на поверхности, и радиальные лучи от неё дают
-            // всем осколкам одно направление. Трещина идёт изнутри наружу.
-            let hit = plate.centroid();
-            let mut bodies_now = snap.clone();
-            let mut rng = Lcg::new(0x1BAD_B002_5EED);
-            let mut p_lost = [0.0f64; 3];
-            for i in 0..n_shards {
-                let c = [snap[i].pos_r[0], snap[i].pos_r[1], snap[i].pos_r[2]];
-                let d = [c[0] - hit[0], c[1] - hit[1], c[2] - hit[2]];
-                let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-3);
-                let boost = 2.0 + 3.0 * rng.unit();
-                let m = cpu[i].mass;
-                for k in 0..3 {
-                    bodies_now[i].vel_m[k] += d[k] / len * boost;
-                    p_lost[k] += m * (d[k] / len) as f64 * boost as f64;
+            // Позиционная развязка: солвер работает со скоростями, и при
+            // глубоком входе тела остаются вложенными. Расталкиваем по
+            // нормали контакта пропорционально обратным массам.
+            let mut fixed = snap.clone();
+            let mut moved = false;
+            for i in 0..=ball_slot {
+                for c in &cs[i] {
+                    if c.pen < 0.004 {
+                        continue;
+                    }
+                    // пол и стены: партнёра нет, двигаем только тело
+                    if c.other < 0 {
+                        for k in 0..3 {
+                            fixed[i].pos_r[k] += c.n[k] * c.pen * 0.8;
+                        }
+                        moved = true;
+                        continue;
+                    }
+                    let (mi, mo) = (masses[i], masses[c.other as usize]);
+                    if mi <= 0.0 || mo <= 0.0 {
+                        continue;
+                    }
+                    let wi = 1.0 / mi;
+                    let wo = 1.0 / mo;
+                    let share = wi / (wi + wo);
+                    // нормаль смотрит ОТ тела К партнёру, значит расталкивать
+                    // надо в обратную сторону (для статики выше — наоборот,
+                    // там нормаль это направление выталкивания)
+                    let push = 0.5 * c.pen * share as f32 * 0.8;
+                    for k in 0..3 {
+                        fixed[i].pos_r[k] -= c.n[k] * push;
+                        fixed[c.other as usize].pos_r[k] += c.n[k] * push;
+                    }
+                    moved = true;
                 }
-                // Сон и обратная масса обязаны быть согласованы с новой
-                // скоростью: спящее тело с ненулевой скоростью ломает солвер.
-                bodies_now[i].misc[1] = 0.0;
-                bodies_now[i].vel_m[3] = bodies_now[i].misc[2];
-                bodies_now[i].ang_i[3] = bodies_now[i].misc[3];
-                bodies_now[i].misc[0] = 0.0;
             }
-            let m_ball = cpu[n_shards].mass;
-            for k in 0..3 {
-                bodies_now[n_shards].vel_m[k] -= (p_lost[k] / m_ball) as f32;
-            }
-            gpu.write_bodies(&bodies_now);
-            if !args.quiet {
-                let mut t = 0.0;
-                for k in 0..3 {
-                    t += p_lost[k] * p_lost[k];
-                }
-                println!("кадр {f}: удар — импульс раскола {:.1} кг·м/с", t.sqrt());
+            if moved {
+                gpu.write_bodies(&fixed);
+                snap = fixed;
             }
         }
-
-        global_cd = global_cd.saturating_sub(1);
-        for i in 0..n_shards {
-            cooldown[i] = cooldown[i].saturating_sub(1);
-            if cooldown[i] > 0 || snap[i].misc[1] > 0.5 {
-                continue;
-            }
-            let speed = (snap[i].vel_m[0].powi(2) + snap[i].vel_m[1].powi(2) + snap[i].vel_m[2].powi(2)).sqrt();
-            if speed < 1.5 {
-                continue;
-            }
-            // Детализация дробится у ВСЕХ осколков разом: если уточнить только
-            // один, на стыке с соседом получится T-стык и щель в поверхности.
-            let lvl = shards[0].tets[0].level;
-            if lvl >= shards[0].level_cap || global_cd > 0 {
-                continue;
-            }
-            let mut refined = false;
-            for s in shards.iter_mut() {
-                refined |= s.subdivide();
-            }
-            if refined {
-                let base_len = shapes.len();
-                let new_meshes = rebuild(&shards, plate.origin);
-                for (k, s) in shards.iter().enumerate() {
-                    tet_shapes[k] = s.surface_tets();
-                }
-                shapes.extend(new_meshes);
-                for (k, id) in shape_id.iter_mut().enumerate() {
-                    *id = (base_len + k) as u32;
-                }
-                global_cd = 14;
-                let step = BASE / (1u32 << shards[0].tets[0].level) as f32;
-                subdiv_log.push(format!(
-                    "кадр {f}: детализация → {} тетраэдров на осколок, шаг {:.3} м",
-                    shards[0].tets.len(),
-                    step
-                ));
-            }
-            let _ = i;
+        if std::env::var("VF_DEBUG").is_ok() && f < 8 {
+            println!("  кадр {f}: снаряд x={:.2} vx={:.1} asleep={}", snap[ball_slot].pos_r[0], snap[ball_slot].vel_m[0], snap[ball_slot].misc[1]);
         }
-
-        if std::env::var("VF_DEBUG").is_ok() && f < 6 {
-            let vmax = snap.iter().map(|b| (b.vel_m[0].powi(2) + b.vel_m[1].powi(2) + b.vel_m[2].powi(2)).sqrt()).fold(0.0f32, f32::max);
-            let pmax = snap.iter().map(|b| b.pos_r[0].abs().max(b.pos_r[1].abs()).max(b.pos_r[2].abs())).fold(0.0f32, f32::max);
-            println!("  отладка кадр {f}: vmax {vmax:.1} м/с, |p|max {pmax:.2} м");
-            if std::env::var("VF_BODIES").is_ok() {
-                for (i, b) in snap.iter().enumerate() {
-                    let sp = (b.vel_m[0].powi(2) + b.vel_m[1].powi(2) + b.vel_m[2].powi(2)).sqrt();
-                    if sp > 200.0 || !sp.is_finite() {
-                        println!("    тело {i}: p={:?} v={:?} half={:?} misc={:?} quat={:?}", b.pos_r, b.vel_m, b.half_shape, b.misc, b.quat);
+        // Метрика после всех подшагов и развязки: сколько тела ещё вложены
+        if std::env::var("VF_TIME").is_ok() && f % 30 == 0 {
+            let positions: Vec<[f32; 3]> = snap
+                .iter()
+                .map(|b| [b.pos_r[0], b.pos_r[1], b.pos_r[2]])
+                .collect();
+            let mut cs = collide::build(&tet_shapes, &positions, 0.0, (params.lo, params.hi), BASE * 0.5);
+            for i in active..MAX_FRAGS {
+                cs[i].clear();
+            }
+            // Удар фиксируем ЗДЕСЬ: к началу следующего кадра солвер уже
+            // растащит тела, и контакт снаряд–плита исчезнет из списка.
+            if std::env::var("VF_DEBUG").is_ok() && f >= 3 && f <= 5 {
+                println!(
+                    "    кадр {f}: снаряд x={:.2} контактов {} ({:?})",
+                    snap[ball_slot].pos_r[0],
+                    cs[ball_slot].len(),
+                    cs[ball_slot].iter().map(|c| (c.other, c.pen)).collect::<Vec<_>>()
+                );
+            }
+            if !broke && cs[ball_slot].iter().any(|c| c.other == 0) {
+                hit_now = true;
+            }
+            let mut body_pen = 0.0f32;
+            let mut floor_pen = 0.0f32;
+            for list in cs.iter() {
+                for c in list {
+                    if c.other < 0 {
+                        floor_pen = floor_pen.max(c.pen);
+                    } else {
+                        body_pen = body_pen.max(c.pen);
                     }
                 }
             }
+            let mut who = (0usize, 0i32, 0.0f32);
+            for (i, list) in cs.iter().enumerate() {
+                for c in list {
+                    if c.other >= 0 && c.pen > who.2 {
+                        who = (i, c.other, c.pen);
+                    }
+                }
+            }
+            println!(
+                "  кадр {f}: тело-тело {body_pen:.3} м, тело-пол {floor_pen:.3} м (глубже всех: {} -> {} = {:.3})",
+                who.0, who.1, who.2
+            );
         }
 
-        let mut row = Vec::with_capacity(n_shards + 1);
-        for i in 0..n_shards {
+        // запись кадра: живые осколки + снаряд
+        let mut row = Vec::with_capacity(active + 1);
+        for i in 0..active {
             row.push(BodyFrame {
                 shape: shape_id[i],
                 pos: [snap[i].pos_r[0], snap[i].pos_r[1], snap[i].pos_r[2]],
@@ -373,28 +325,20 @@ fn main() {
         row.push(BodyFrame {
             shape: ball_shape,
             pos: [
-                snap[n_shards].pos_r[0],
-                snap[n_shards].pos_r[1],
-                snap[n_shards].pos_r[2],
+                snap[ball_slot].pos_r[0],
+                snap[ball_slot].pos_r[1],
+                snap[ball_slot].pos_r[2],
             ],
             quat: [1.0, 0.0, 0.0, 0.0],
         });
-        frames.push(row);
+        frames_out.push(row);
     }
 
-    let total_tris: usize = shapes.iter().map(|s| s.mesh.triangles()).sum();
     if !args.quiet {
-        println!(
-            "кадров {}, форм {}, треугольников в мешах {}",
-            frames.len(),
-            shapes.len(),
-            total_tris
-        );
-        for line in subdiv_log.iter().take(6) {
+        let tris: usize = shapes.iter().map(|s| s.mesh.triangles()).sum();
+        println!("кадров {}, форм {}, треугольников {}", frames_out.len(), shapes.len(), tris);
+        for line in &log {
             println!("  {line}");
-        }
-        if subdiv_log.len() > 6 {
-            println!("  … всего дроблений: {}", subdiv_log.len());
         }
     }
 
@@ -402,7 +346,7 @@ fn main() {
         if let Some(dir) = p.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let blob = vfw::encode(&frames, &shapes);
+        let blob = vfw::encode(&frames_out, &shapes);
         std::fs::write(p, &blob).unwrap();
         if !args.quiet {
             println!(
