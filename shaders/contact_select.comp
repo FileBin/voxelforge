@@ -1,0 +1,64 @@
+#version 450
+#include "common.glsl"
+
+/* Отбор контактов тела — то, что CPU-путь делал всегда.
+ *
+ * На GPU в тело валится до CAP (64) контактов в порядке атомарных
+ * добавлений: набор случайный и каждый кадр разный. Отсюда и «трение то
+ * работает, то нет», и подкручивание мелких тел. Здесь после SAT оставляем
+ * не больше KEEP самых глубоких и выкидываем точки ближе DUPLICATE друг к
+ * другу — та же логика, что была на CPU, только на устройстве.
+ */
+
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) buffer Lists { C list[]; };
+layout(std430, set = 0, binding = 1) buffer ListCount { uint lc[]; };
+
+const uint KEEP = 24u;
+const float DUPLICATE = 0.02;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.grid.w)) return;
+
+    uint n = lc[i];
+    if (n > uint(CAP)) n = uint(CAP);
+    if (n <= KEEP) return;
+
+    C chosen[24];
+    uint m = 0u;
+    bool used[64];
+
+    for (uint k = 0u; k < n; k++) used[k] = false;
+
+    for (uint slot = 0u; slot < KEEP; slot++) {
+        int best = -1;
+        float best_pen = -1e30;
+        for (uint k = 0u; k < n; k++) {
+            if (used[k]) continue;
+            C c = list[i * uint(CAP) + k];
+            if (c.n_pen.w <= best_pen) continue;
+            bool dup = false;
+            for (uint j = 0u; j < m; j++) {
+                if (distance(chosen[j].point.xyz, c.point.xyz) < DUPLICATE) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) continue;
+            best = int(k);
+            best_pen = c.n_pen.w;
+        }
+        if (best < 0) break;
+        chosen[m] = list[i * uint(CAP) + uint(best)];
+        used[best] = true;
+        m++;
+    }
+
+    if (m == 0u) return; /* нечего отбирать — оставляем как было */
+
+    for (uint j = 0u; j < m; j++) {
+        list[i * uint(CAP) + j] = chosen[j];
+    }
+    lc[i] = m;
+}
