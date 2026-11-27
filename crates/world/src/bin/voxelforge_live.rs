@@ -230,6 +230,13 @@ struct Shared {
     tick: f32,
     t_pub: f64,
     t_pub_at: std::time::Instant,
+    /// Такт считается прямо сейчас. Кадр ждёт его окончания: пока такт в
+    /// полёте, позы в буфере меняются, и alpha от опубликованного снимка
+    /// уже не соответствует паре prev→cur на устройстве.
+    in_tick: bool,
+    /// Измеренный интервал между публикациями (для alpha).
+    interval: f32,
+    last_pub_at: Option<std::time::Instant>,
     shots: usize,
     cracks: usize,
     shards: usize,
@@ -345,6 +352,9 @@ impl Sim {
             tick,
             t_pub: 0.0,
             t_pub_at: std::time::Instant::now(),
+            in_tick: false,
+            interval: 0.0,
+            last_pub_at: None,
             shots: 0,
             cracks: 0,
             shards: 0,
@@ -383,6 +393,7 @@ impl Sim {
                     acc += dt;
                     let mut steps = 0;
                     while acc >= tick && steps < 2 {
+                        sh.lock().unwrap().in_tick = true;
                         let prev: Vec<([f64; 3], [f64; 4])> =
                             live.bodies.iter().map(|b| (b.pos, b.quat)).collect();
                         live.step(tick, substeps, iterations);
@@ -402,7 +413,22 @@ impl Sim {
                         g.bodies = bodies;
                         g.pending.append(&mut fresh);
                         g.t_pub = start.elapsed().as_secs_f64();
-                        g.t_pub_at = std::time::Instant::now();
+                        let now_pub = std::time::Instant::now();
+                        if let Some(prev_pub) = g.last_pub_at {
+                            let d = now_pub.duration_since(prev_pub).as_secs_f32();
+                            /* Измеренный интервал, а не номинальный: такт
+                             * считается дольше, чем 1/20 с, и на номинале
+                             * alpha упиралась в 1 раньше нового снимка —
+                             * картинка замирала, потом прыгала. */
+                            g.interval = if g.interval > 0.0 {
+                                0.8 * g.interval + 0.2 * d
+                            } else {
+                                d
+                            };
+                        }
+                        g.last_pub_at = Some(now_pub);
+                        g.t_pub_at = now_pub;
+                        g.in_tick = false;
                         g.shots = live.shots;
                         g.cracks = live.cracks;
                         g.shards = live.shards_made;
@@ -505,10 +531,21 @@ impl Sim {
                 }
             }
             Sim::Thread { shared, .. } => {
+                /* Ждём, пока такт закроется: позы в буфере на устройстве
+                 * должны быть ровно те, для которых считаем alpha. Такт идёт
+                 * одной очередью с кадром, так что GPU всё равно ждал бы его —
+                 * CPU-ожидание ничего не добавляет. */
+                for _ in 0..4000 {
+                    if !shared.lock().unwrap().in_tick {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                }
                 let mut g = shared.lock().unwrap();
                 // Рисуем на такт позади: от опубликованного снимка к следующему.
-                let alpha = if g.tick > 0.0 {
-                    (g.t_pub_at.elapsed().as_secs_f32() / g.tick).clamp(0.0, 1.0)
+                let step = if g.interval > 0.0 { g.interval } else { g.tick };
+                let alpha = if step > 0.0 {
+                    (g.t_pub_at.elapsed().as_secs_f32() / step).clamp(0.0, 1.0)
                 } else {
                     1.0
                 };
@@ -605,7 +642,9 @@ fn main() {
     unsafe { vf_view_set_bodies(view, body_buf0, voxelforge_world::sim::MAX_BODIES as u32) };
     let mut seen_body_buf = body_buf0 as usize as u64;
 
-    // Такт физики (по умолчанию 20 Гц): рендер интерполирует между тактами.
+    /* Физика идёт своим тактом (по умолчанию 20 Гц) независимо от частоты
+     * кадров: на 240 Гц мониторе кадров четыре на такт, и движение сглаживает
+     * интерполяция по alpha. */
     let tick_hz: f32 = tick_arg.unwrap_or(20.0).clamp(5.0, 240.0);
     let tick: f32 = 1.0 / tick_hz;
     let mut lines_on = tets_at_start;
