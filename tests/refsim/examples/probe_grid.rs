@@ -11,7 +11,7 @@ fn main() {
 
     let local: Vec<Vec<[[f32; 3]; 4]>> = w.bodies.iter().map(|b| b.local_tets().clone()).collect();
     w.gpu.upload_geometry(&local);
-    let total = w.gpu.run_tet_grid();
+    let total = w.gpu.run_tet_grid(1.0 / 60.0);
     let (starts, cell_tets) = w.gpu.read_tet_grid();
 
     let cell = w.params.cell;

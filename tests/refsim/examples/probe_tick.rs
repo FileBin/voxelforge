@@ -10,7 +10,7 @@ fn main() {
     let local: Vec<Vec<[[f32; 3]; 4]>> = w.bodies.iter().map(|b| b.local_tets().clone()).collect();
     w.gpu.upload_geometry(&local);
     w.gpu.set_pairs(&[]);                 // ни одной пары → контактов быть не может
-    w.gpu.frame_gpu_contacts(0.05, 6, 18);
+    w.gpu.frame_gpu_contacts(0.05, 6, 1, 18);
     let gb = w.gpu.read_bodies();
     println!("после такта без пар: vel_m={:?} pos={:?}",
         [gb[slot].vel_m[0], gb[slot].vel_m[1], gb[slot].vel_m[2]],

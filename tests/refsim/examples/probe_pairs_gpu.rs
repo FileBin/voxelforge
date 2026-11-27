@@ -17,7 +17,7 @@ fn main() {
     let cell = w.params.cell; // как в шейдере (prm1.w)
 
     w.gpu.upload_geometry(&local);
-    let n_gpu = w.gpu.run_tet_pairs();
+    let n_gpu = w.gpu.run_tet_pairs(1.0 / 60.0);
     let gpu: Vec<u8> = Vec::new();
     let _ = gpu;
 
