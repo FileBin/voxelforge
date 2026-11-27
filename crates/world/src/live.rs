@@ -372,10 +372,11 @@ impl Live {
         self.gpu.frame_gpu_contacts(dt, chunks, per, iterations);
         // Контакты нужны и геймплею: раскол и пробуждение по контакту решаются
         // на CPU, поэтому читаем их один раз за такт (73 КБ при 64 телах).
-        let contacts = self.gpu.read_contacts();
-        /* Пробуждение делает сам SAT на устройстве, поэтому на GPU-пути
-         * CPU в сон не вмешивается вовсе. */
+        /* Контакты нужны CPU ТОЛЬКО для раскола: пробуждение делает SAT на
+         * устройстве. Значит при выключенном расколе читать их обратно не
+         * нужно вовсе — минус ~196 КБ за такт. */
         if self.fracture_enabled {
+            let contacts = self.gpu.read_contacts();
             self.fracture(&contacts);
         }
         let snap = self.gpu.read_bodies();
