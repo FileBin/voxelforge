@@ -19,6 +19,7 @@ layout(std430, set = 0, binding = 2) buffer Span { uvec2 span[]; };
 layout(std430, set = 0, binding = 3) buffer Pairs { uvec2 pairs[]; };
 layout(std430, set = 0, binding = 4) buffer Lists { C list[]; };
 layout(std430, set = 0, binding = 5) buffer ListCount { uint lc[]; };
+layout(std430, set = 0, binding = 6) buffer PairCount { uint pcnt[]; };
 
 const uint EMPTY = 0xFFFFFFFFu;
 const uint TET_MASK = 0xFFFFFu;
@@ -58,6 +59,10 @@ void project(vec3 t[4], vec3 n, out float lo, out float hi) {
 void main() {
     uint pid = gl_GlobalInvocationID.x;
     uint nbody = uint(pc.grid.w);
+    /* Число пар берём ИЗ БУФЕРА, а не из push-константы: при пары-на-GPU их
+     * количество известно только устройству, и чтение его на CPU было бы
+     * лишней точкой синхронизации в каждом такте. */
+    if (pid >= pcnt[0]) return;
 
     uvec2 pr = pairs[pid];
     if (pr.x == EMPTY || pr.y == EMPTY) return;

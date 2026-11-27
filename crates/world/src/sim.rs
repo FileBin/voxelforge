@@ -268,6 +268,8 @@ pub struct GpuSim {
     impact: *mut c_void,
     /// AABB тел для префильтра пар (2 vec4 на тело).
     baabb: *mut c_void,
+    /// Пары и их число известны только устройству (SAT берёт число из буфера).
+    pub pairs_on_gpu: bool,
     /// Пары тетраэдров, посчитанные CPU один раз на такт.
     pairs: *mut c_void,
     pub n_pairs: usize,
@@ -362,7 +364,7 @@ impl GpuSim {
             ("integrate_pos", 1),
             ("solve_contacts", 4),
             ("solve_apply", 4),
-            ("sat", 6),
+            ("sat", 7),
             ("depenetrate", 3),
             ("contact_select", 2),
             ("tet_key", 4),
@@ -419,6 +421,7 @@ impl GpuSim {
             pair_count,
             impact,
             baabb,
+            pairs_on_gpu: false,
             pairs,
             n_pairs: 0,
             lcount,
@@ -500,7 +503,11 @@ impl GpuSim {
         let total = chunks.max(1) * per.max(1);
         let h = dt / total as f32;
         let g_body = ((self.n as u32) + WG - 1) / WG;
-        let g_pairs = ((self.n_pairs as u32) + WG - 1) / WG;
+        let g_pairs = if self.pairs_on_gpu {
+            ((MAX_PAIRS as u32) + WG - 1) / WG
+        } else {
+            ((self.n_pairs as u32) + WG - 1) / WG
+        };
         let push = self.push(h, g_body);
         {
             let zero = vec![0u8; MAX_BODIES * 32];
@@ -531,7 +538,7 @@ impl GpuSim {
             });
             steps.push(Step {
                 pipe: P_SAT,
-                bufs: vec![a, self.tets, self.span, self.pairs, self.list, self.lcount],
+                bufs: vec![a, self.tets, self.span, self.pairs, self.list, self.lcount, self.pair_count],
                 push,
                 groups: [g_pairs.max(1), 1, 1],
             });
@@ -836,12 +843,22 @@ impl GpuSim {
     /// Пары тетраэдров на такт: `(body<<20|tet, body<<20|tet)`. Добиваем до
     /// кратности 64 пустыми — шейдер их отбросит.
     pub fn set_pairs(&mut self, pairs: &[(u32, u32)]) {
+        self.pairs_on_gpu = false;
         let mut flat: Vec<[u32; 2]> = pairs.iter().map(|(a, b)| [*a, *b]).collect();
         while flat.len() % 64 != 0 {
             flat.push([0xFFFF_FFFF, 0xFFFF_FFFF]);
         }
         self.n_pairs = flat.len();
         self.bytes_up += (flat.len() * 8) as u64;
+        {
+            let n = [flat.len() as u32];
+            unsafe {
+                check_status(
+                    vf_buffer_write(self.ctx, self.pair_count, 0, n.as_ptr() as *const c_void, 4),
+                    "set_pair_count",
+                );
+            }
+        }
         unsafe {
             check_status(
                 vf_buffer_write(self.ctx, self.pairs, 0, flat.as_ptr() as *const c_void, flat.len() * 8),
@@ -1041,14 +1058,10 @@ impl GpuSim {
         unsafe {
             check_status(vf_run(self.ctx, ds.as_mut_ptr(), ds.len() as u32), "run_tet_pairs");
         }
-        let mut n = [0u32; 1];
-        unsafe {
-            check_status(
-                vf_buffer_read(self.ctx, self.pair_count, 0, n.as_mut_ptr() as *mut c_void, 4),
-                "read_pair_count",
-            );
-        }
-        self.n_pairs = n[0] as usize;
+        /* Счётчик пад не читаем: он нужен только диспатчу SAT, а тот берёт
+         * число из буфера. На CPU при этом не остаётся ни байта состояния. */
+        self.pairs_on_gpu = true;
+        self.n_pairs = MAX_PAIRS;
         self.n_pairs
     }
 
