@@ -67,13 +67,14 @@ void main() {
             aabb(B.x, tb, blo, bhi, okb);
             if (!oka || !okb) continue;
 
-            vec3 ilo = max(alo, blo);
-            vec3 ihi = min(ahi, bhi);
-            if (any(greaterThan(ilo, ihi))) continue; /* AABB не пересекаются */
-
-            /* дедуп: испускаем только в ячейке минимального угла пересечения */
-            ivec3 ci = clamp(ivec3(floor((ilo - lo_box) / cell)), ivec3(0), dims - ivec3(1));
-            int canon = (ci.z * dims.y + ci.y) * dims.x + ci.x;
+            /* Дедуп: пара испускается ровно в ОДНОЙ клетке — минимальной из
+             * пересечения диапазонов клеток обоих тетов. Проверять пересечение
+             * самих AABB здесь нельзя: это уже узкая фаза, и она выбрасывала
+             * бы пары, которые просто делят клетку (310 против 3366 у CPU). */
+            ivec3 ca = clamp(ivec3(floor((alo - lo_box) / cell)), ivec3(0), dims - ivec3(1));
+            ivec3 cb = clamp(ivec3(floor((blo - lo_box) / cell)), ivec3(0), dims - ivec3(1));
+            ivec3 canon3 = max(ca, cb);
+            int canon = (canon3.z * dims.y + canon3.y) * dims.x + canon3.x;
             if (uint(canon) != c) continue;
 
             uint k = atomicAdd(pcnt[0], 1u);
