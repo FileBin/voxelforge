@@ -699,6 +699,21 @@ fn main() {
     let mut acc = 0.0f32;
 
     let mut frame_t0 = std::time::Instant::now();
+    /* Прогрев: первые ~0.8 с крутим обычный кадр, но без ввода. На дискретных
+     * картах частоты поднимаются не мгновенно, и первый тяжёлый кадр (целый
+     * куб) выглядит как «лагает в начале». Тот же эффект лечится тем, что
+     * игрок успевает пострелять в сторону, — значит это подъём частот, а не
+     * алгоритм. VF_WARMUP=мс меняет длительность, 0 — выключает. */
+    let warm_ms: u64 = std::env::var("VF_WARMUP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(800);
+    let warm_until = if max_frames == 0 && warm_ms > 0 {
+        eprintln!("[live] прогрев GPU {warm_ms} мс");
+        Some(std::time::Instant::now() + std::time::Duration::from_millis(warm_ms))
+    } else {
+        None
+    };
     loop {
         // Реальная дельта кадра: камера должна идти по времени, а не по
         // фиксированному 1/60 — иначе на просевшем FPS она двигается медленнее.
@@ -710,6 +725,12 @@ fn main() {
         };
         let mut input = VfInput::default();
         let alive = unsafe { vf_view_poll(view, &mut input) };
+        if let Some(t) = warm_until {
+            if std::time::Instant::now() < t {
+                /* пока греемся — не стреляем и не двигаем камеру */
+                input = VfInput::default();
+            }
+        }
         if alive == 0 {
             break;
         }
