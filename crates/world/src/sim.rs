@@ -449,29 +449,27 @@ impl GpuSim {
     /// Такт целиком на GPU: контакты считает `sat.comp` по парам, которые CPU
     /// залил один раз. Всё уходит ОДНИМ командным буфером, CPU читает тела
     /// один раз в конце — это и есть «убрать синхронизации».
-    pub fn frame_gpu_contacts(&mut self, dt: f32, substeps: u32, iterations: u32) {
-        let h = dt / substeps as f32;
+    /// Такт на GPU, но по той же схеме, что CPU-путь: контакты пересобираются
+    /// ОДИН раз на «кусок», а внутри куска идёт `per` подшагов с тем же
+    /// списком. Раньше контакты пересобирались на каждом подшаге, и куча
+    /// вела себя иначе, чем на CPU при том же числе подшагов.
+    pub fn frame_gpu_contacts(&mut self, dt: f32, chunks: u32, per: u32, iterations: u32) {
+        let total = chunks.max(1) * per.max(1);
+        let h = dt / total as f32;
         let g_body = ((self.n as u32) + WG - 1) / WG;
         let g_pairs = ((self.n_pairs as u32) + WG - 1) / WG;
-        let g_cnt = ((self.n as u32) + WG - 1) / WG;
-        let push = self.push(h, g_cnt);
+        let push = self.push(h, g_body);
 
         let mut steps: Vec<Step> = Vec::new();
         let (a, b) = (self.bodies[0], self.bodies[1]);
 
-        for _ in 0..substeps {
-            steps.push(Step {
-                pipe: P_INTEGRATE,
-                bufs: vec![a],
-                push,
-                groups: [g_body, 1, 1],
-            });
-            // счётчики контактов обнуляем на устройстве, без заливки с CPU
+        for _ in 0..chunks {
+            // контакты — раз на кусок
             steps.push(Step {
                 pipe: P_CLEAR,
                 bufs: vec![self.lcount, self.cellcnt],
                 push,
-                groups: [g_cnt, 1, 1],
+                groups: [g_body, 1, 1],
             });
             steps.push(Step {
                 pipe: P_STATIC,
@@ -485,42 +483,48 @@ impl GpuSim {
                 push,
                 groups: [g_pairs.max(1), 1, 1],
             });
-            // отбор контактов: как на CPU — не больше 24, самые глубокие
             steps.push(Step {
                 pipe: P_SELECT,
                 bufs: vec![self.list, self.lcount],
                 push,
                 groups: [g_body, 1, 1],
             });
-            // позиционная развязка на устройстве: без неё глубокие
-            // перекрытия не вынимаются и тела проходят друг сквозь друга
             steps.push(Step {
                 pipe: P_DEP,
                 bufs: vec![a, self.list, self.lcount],
                 push,
                 groups: [g_body, 1, 1],
             });
-            for it in 0..iterations {
-                let (src, dst) = if it % 2 == 0 { (a, b) } else { (b, a) };
+            // подшаги внутри куска — по тому же списку контактов
+            for _ in 0..per {
                 steps.push(Step {
-                    pipe: P_SOLVE_CONTACTS,
-                    bufs: vec![src, self.list, self.lcount, self.imp],
+                    pipe: P_INTEGRATE,
+                    bufs: vec![a],
                     push,
-                    groups: [((self.n * CAP) as u32 + WG - 1) / WG, 1, 1],
+                    groups: [g_body, 1, 1],
                 });
+                for it in 0..iterations {
+                    let (src, dst) = if it % 2 == 0 { (a, b) } else { (b, a) };
+                    steps.push(Step {
+                        pipe: P_SOLVE_CONTACTS,
+                        bufs: vec![src, self.list, self.lcount, self.imp],
+                        push,
+                        groups: [((self.n * CAP) as u32 + WG - 1) / WG, 1, 1],
+                    });
+                    steps.push(Step {
+                        pipe: P_SOLVE_APPLY,
+                        bufs: vec![src, self.lcount, self.imp, dst],
+                        push,
+                        groups: [g_body, 1, 1],
+                    });
+                }
                 steps.push(Step {
-                    pipe: P_SOLVE_APPLY,
-                    bufs: vec![src, self.lcount, self.imp, dst],
+                    pipe: P_POS,
+                    bufs: vec![a],
                     push,
                     groups: [g_body, 1, 1],
                 });
             }
-            steps.push(Step {
-                pipe: P_POS,
-                bufs: vec![a],
-                push,
-                groups: [g_body, 1, 1],
-            });
         }
         if !self.skip_sleep {
             steps.push(Step {
@@ -537,20 +541,17 @@ impl GpuSim {
         let mut ds: Vec<VfDispatch> = steps
             .iter()
             .enumerate()
-            .map(|(i, s)| VfDispatch {
+            .map(|(k, s)| VfDispatch {
                 pipeline: pipes[s.pipe],
-                buffers: keep[i].as_mut_ptr(),
+                buffers: keep[k].as_mut_ptr(),
                 n_buffers: s.bufs.len() as u32,
-                push: &push_keep[i] as *const Push as *const c_void,
+                push: &push_keep[k] as *const Push as *const c_void,
                 push_bytes: 80,
                 groups: s.groups,
             })
             .collect();
         unsafe {
-            check_status(
-                vf_run(self.ctx, ds.as_mut_ptr(), ds.len() as u32),
-                "frame_gpu_contacts",
-            );
+            check_status(vf_run(self.ctx, ds.as_mut_ptr(), ds.len() as u32), "frame_gpu_contacts");
         }
     }
 

@@ -354,8 +354,18 @@ impl Live {
             self.gpu.upload_geometry(&local);
             self.geom_dirty = false;
         }
-        let chunks = ((substeps as f32) * 0.6).round().max(2.0) as u32;
-        self.gpu.frame_gpu_contacts(dt, chunks, iterations);
+        /* Та же нарезка, что на CPU: куски по скорости, внутри куска — подшаги
+         * с ОДНИМ списком контактов. Иначе поведение кучи расходится. */
+        let vmax = self
+            .bodies
+            .iter()
+            .filter(|b| b.alive)
+            .map(|b| (b.vel[0] * b.vel[0] + b.vel[1] * b.vel[1] + b.vel[2] * b.vel[2]).sqrt())
+            .fold(0.0f64, f64::max);
+        let cell = (self.params.cell * 0.5) as f64;
+        let chunks = ((vmax * dt as f64 / (cell * 0.35)).ceil() as u32).clamp(2, 12);
+        let per = (substeps / chunks).max(1);
+        self.gpu.frame_gpu_contacts(dt, chunks, per, iterations);
         // Контакты нужны и геймплею: раскол и пробуждение по контакту решаются
         // на CPU, поэтому читаем их один раз за такт (73 КБ при 64 телах).
         let contacts = self.gpu.read_contacts();
