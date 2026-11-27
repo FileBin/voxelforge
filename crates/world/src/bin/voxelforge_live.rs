@@ -70,6 +70,7 @@ unsafe extern "C" {
     fn vf_view_set_bodies(v: *mut c_void, buffer: *mut c_void, count: u32);
     /// Поза не передаётся: body — номер тела в буфере, alpha — сглаживание.
     fn vf_view_draw(v: *mut c_void, mesh: i32, body: u32, alpha: f32, tint: *const f32);
+    fn vf_view_present_mode(v: *mut c_void) -> i32;
     fn vf_view_draw_lines(v: *mut c_void, lines: i32, model: *const f32, tint: *const f32);
     fn vf_view_end(v: *mut c_void);
 }
@@ -854,11 +855,10 @@ fn main() {
             vf_view_end(view);
         }
 
-        /* С MAILBOX вертикальной синхронизации нет, и цикл без ограничителя
-         * молотит сотни кадров в секунду: GPU забит, такт физики ждёт всю эту
-         * очередь, и картинка проседает рывками. Держим кадр на частоте
-         * экрана; VF_FPS переопределяет. */
-        if max_frames == 0 {
+        /* Ограничитель нужен только когда показ не привязан к развёртке
+         * (MAILBOX/IMMEDIATE): иначе цикл молотит сотни кадров, GPU забит и
+         * такт физики ждёт всю эту очередь. С FIFO ритм задаёт композитор. */
+        if max_frames == 0 && unsafe { vf_view_present_mode(view) } != 0 {
             let want = std::env::var("VF_FPS")
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok())

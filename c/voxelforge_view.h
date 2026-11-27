@@ -45,5 +45,7 @@ void vf_view_set_bodies(vf_view *v, void *buffer, uint32_t count);
 // между прошлым тактом и текущим.
 void vf_view_begin(vf_view *v, float r, float g, float b);
 void vf_view_draw(vf_view *v, int32_t mesh, uint32_t body, float alpha, const float *tint);
+/* 0 — FIFO (показ привязан к развёртке), 1 — MAILBOX/IMMEDIATE. */
+int vf_view_present_mode(vf_view *v);
 void vf_view_draw_lines(vf_view *v, int32_t lines, const float *model, const float *tint);
 void vf_view_end(vf_view *v);

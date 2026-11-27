@@ -36,6 +36,7 @@ struct vf_view {
     VkImage sc_img[MAX_SWAP];
     VkImageView sc_view[MAX_SWAP];
     VkFormat sc_fmt;
+    int present_mode; /* выбранный VkPresentModeKHR — окну и приложению */
     VkExtent2D extent;
 
     VkImage depth;
@@ -390,19 +391,21 @@ static int make_swapchain(vf_view *v) {
         if (modes[i] == VK_PRESENT_MODE_MAILBOX_KHR) has_mailbox = 1;
         if (modes[i] == VK_PRESENT_MODE_IMMEDIATE_KHR) has_immediate = 1;
     }
+    /* По умолчанию FIFO: показ привязан к развёртке, и движение камеры идёт
+     * ровно. MAILBOX отдаёт ритм приложению — с ним картинка отзывчивее, но
+     * фаза у композитора не та, и на движении видно подрагивание.
+     * VF_PRESENT=mailbox|immediate включает их осознанно. */
     VkPresentModeKHR pm = VK_PRESENT_MODE_FIFO_KHR;
     const char *pm_name = "FIFO";
     const char *want_pm = getenv("VF_PRESENT");
     if (want_pm && !strcmp(want_pm, "immediate") && has_immediate) {
         pm = VK_PRESENT_MODE_IMMEDIATE_KHR;
         pm_name = "IMMEDIATE";
-    } else if ((!want_pm || strcmp(want_pm, "fifo")) && has_mailbox) {
+    } else if (want_pm && !strcmp(want_pm, "mailbox") && has_mailbox) {
         pm = VK_PRESENT_MODE_MAILBOX_KHR;
         pm_name = "MAILBOX";
-    } else if (!want_pm && has_immediate) {
-        pm = VK_PRESENT_MODE_IMMEDIATE_KHR;
-        pm_name = "IMMEDIATE";
     }
+    v->present_mode = (int)pm;
 
     VkSwapchainCreateInfoKHR ci = {VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     ci.surface = v->surf;
@@ -585,6 +588,13 @@ static int make_swapchain_shaders(vf_view *v) {
     vkDestroyShaderModule(v->dev, lvs, NULL);
     vkDestroyShaderModule(v->dev, lfs, NULL);
     return v->pipe_mesh && v->pipe_line;
+}
+
+/* Режим показа: 0 — FIFO (развёртка сама задаёт ритм, ограничитель кадра
+ * не нужен), иначе MAILBOX/IMMEDIATE — там ритм задаёт приложение. */
+int vf_view_present_mode(vf_view *v) {
+    if (!v) return 0;
+    return v->present_mode == VK_PRESENT_MODE_FIFO_KHR ? 0 : 1;
 }
 
 void vf_view_free(vf_view *v) {
