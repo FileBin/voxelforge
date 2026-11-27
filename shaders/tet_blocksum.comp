@@ -1,0 +1,36 @@
+#version 450
+#include "common.glsl"
+
+/* Параллельный префикс-скан, проход 1 из 3: частичные суммы по блокам.
+ *
+ * Было: один поток перебирал все ячейки сетки тетов (64x64x64 = 262 144) в
+ * линейном цикле, каждый такт. Теперь блок из 64 потоков складывает по 16
+ * ячеек и считает сумму блока через скан в shared-памяти.
+ *
+ * Ячейки за границей сетки не читаются (nc сверху), запись — только итог
+ * блока. */
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) buffer Cells { uint cellcnt[]; };
+layout(std430, set = 0, binding = 1) buffer Sums { uint blocksum[]; };
+
+shared uint sh[64];
+
+void main() {
+    uint nc = uint(pc.grid.x * pc.grid.y * pc.grid.z);
+    uint t = gl_LocalInvocationID.x;
+    uint base = gl_WorkGroupID.x * 1024u + t * 16u;
+    uint s = 0u;
+    for (uint k = 0u; k < 16u; k++) {
+        uint i = base + k;
+        if (i < nc) s += cellcnt[i];
+    }
+    sh[t] = s;
+    barrier();
+    for (uint off = 1u; off < 64u; off <<= 1u) {
+        uint v = (t >= off) ? sh[t - off] : 0u;
+        barrier();
+        sh[t] += v;
+        barrier();
+    }
+    if (t == 63u) blocksum[gl_WorkGroupID.x] = sh[63];
+}

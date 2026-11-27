@@ -1,0 +1,47 @@
+#version 450
+#include "common.glsl"
+
+/* Проход 3 из 3: начало каждой ячейки = префикс блока + сумма предыдущих
+ * потоков блока + сумма предыдущих ячеек внутри потока. Заодно обнуляются
+ * курсоры раскладки.
+ *
+ * Считает то же самое, что прежний однопоточный tet_scan, но 64 потоками на
+ * блок; сверяется с ним побайтово (см. probe_scan). */
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) buffer Cells { uint cellcnt[]; };
+layout(std430, set = 0, binding = 1) buffer Sums { uint blocksum[]; };
+layout(std430, set = 0, binding = 2) buffer Starts { uint start[]; };
+layout(std430, set = 0, binding = 3) buffer Cursors { uint cursor[]; };
+
+shared uint sh[64];
+
+void main() {
+    uint nc = uint(pc.grid.x * pc.grid.y * pc.grid.z);
+    uint t = gl_LocalInvocationID.x;
+    uint block = gl_WorkGroupID.x;
+    uint base = block * 1024u + t * 16u;
+
+    uint s = 0u;
+    for (uint k = 0u; k < 16u; k++) {
+        uint i = base + k;
+        if (i < nc) s += cellcnt[i];
+    }
+    sh[t] = s;
+    barrier();
+    for (uint off = 1u; off < 64u; off <<= 1u) {
+        uint v = (t >= off) ? sh[t - off] : 0u;
+        barrier();
+        sh[t] += v;
+        barrier();
+    }
+    /* sh[t] — включающий префикс, до t: sh[t] - s */
+    uint running = blocksum[block] + sh[t] - s;
+    for (uint k = 0u; k < 16u; k++) {
+        uint i = base + k;
+        if (i < nc) {
+            start[i] = running;
+            cursor[i] = 0u;
+            running += cellcnt[i];
+        }
+    }
+}

@@ -1,0 +1,23 @@
+#version 450
+#include "common.glsl"
+
+/* Проход 2 из 3: исключающий префикс по суммам блоков.
+ *
+ * Блоков в 1024 раза меньше ячеек (256 при 64x64x64), поэтому линейный проход
+ * здесь ничего не стоит — в отличие от прежнего прохода по всем 262 144
+ * ячейкам. Заодно пишется общий итог в start[nc]. */
+layout(local_size_x = 1) in;
+layout(std430, set = 0, binding = 0) buffer Sums { uint blocksum[]; };
+layout(std430, set = 0, binding = 1) buffer Starts { uint start[]; };
+
+void main() {
+    uint nc = uint(pc.grid.x * pc.grid.y * pc.grid.z);
+    uint nb = (nc + 1023u) / 1024u;
+    uint sum = 0u;
+    for (uint b = 0u; b < nb; b++) {
+        uint v = blocksum[b];
+        blocksum[b] = sum;
+        sum += v;
+    }
+    start[nc] = sum;
+}

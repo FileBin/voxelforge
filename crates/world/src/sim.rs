@@ -178,6 +178,11 @@ const P_BODYAABB: usize = 20;
 const P_SNAPSHOT: usize = 21;
 const P_STATS: usize = 22;
 const P_BODYINIT: usize = 23;
+const P_TETBLOCKSUM: usize = 24;
+const P_TETBLOCKPREF: usize = 25;
+const P_TETSCANP: usize = 26;
+/// Ячеек на блок в параллельном скане (совпадает с 16 * 64 в шейдере).
+pub const SCAN_BLOCK: usize = 1024;
 /// Потолок изменений тел за одно событие (спавн/деспавн).
 pub const MAX_CHANGES: usize = 64;
 /// Потолок записей «тет x ячейка» за такт.
@@ -299,6 +304,10 @@ pub struct GpuSim {
     /// Очередь изменений тел (шаг 3): номера слотов и сами тела.
     bslots: *mut c_void,
     bstage: *mut c_void,
+    /// Частичные суммы блоков для параллельного скана сетки тетов.
+    tetsums: *mut c_void,
+    /// Параллельный скан (по умолчанию). VF_SCAN=serial — старый однопоточный.
+    par_scan: bool,
     /// AABB тел для префильтра пар (2 vec4 на тело).
     baabb: *mut c_void,
     /// Пары и их число известны только устройству (SAT берёт число из буфера).
@@ -396,6 +405,8 @@ impl GpuSim {
         let stat = mk(8, true);
         /* Очередь изменений тел: номер слота + само тело. Хост-видимая, чтобы
          * CPU клал туда только изменённое, а раскладку делал body_init. */
+        let nblocks = (ncells as usize + SCAN_BLOCK - 1) / SCAN_BLOCK + 1;
+        let tetsums = mk(nblocks * 4, true);
         let bslots = mk(MAX_CHANGES * 4, true);
         let bstage = mk(MAX_CHANGES * BODY_BYTES, true);
         let baabb = mk(MAX_BODIES * 32, false);
@@ -418,7 +429,7 @@ impl GpuSim {
             )
         };
 
-        let names: [(&str, u32); 24] = [
+        let names: [(&str, u32); 27] = [
             ("integrate", 1),
             ("clear", 2),
             ("count", 2),
@@ -443,6 +454,9 @@ impl GpuSim {
             ("snapshot", 1),
             ("stats", 2),
             ("body_init", 3),
+            ("tet_blocksum", 2),
+            ("tet_blockprefix", 2),
+            ("tet_scan_p", 4),
         ];
         let mut pipes = Vec::new();
         for (nm, nb) in names.iter() {
@@ -495,6 +509,11 @@ impl GpuSim {
             stat,
             bslots,
             bstage,
+            /* Параллельный скан сетки тетов: раньше один поток перебирал все
+             * 262 144 ячейки каждый такт. VF_SCAN=serial возвращает старый
+             * проход — он нужен для сверки в probe_scan. */
+            tetsums,
+            par_scan: !matches!(std::env::var("VF_SCAN").as_deref(), Ok("serial")),
             baabb,
             pairs_on_gpu: false,
             pairs,
@@ -1084,12 +1103,9 @@ impl GpuSim {
                 push,
                 groups: [g_body, 1, 1],
             },
-            Step {
-                pipe: P_TETSCAN,
-                bufs: vec![self.tetcnt, self.tetstart, self.tetcursor],
-                push,
-                groups: [1, 1, 1],
-            },
+            ];
+            steps.extend(self.scan_steps(push));
+            steps.extend(vec![
             Step {
                 pipe: P_TETFILL,
                 bufs: vec![
@@ -1103,7 +1119,7 @@ impl GpuSim {
                 push,
                 groups: [g_body, 1, 1],
             },
-        ];
+        ]);
         let _ = g_cells;
         let mut keep: Vec<Vec<*mut c_void>> = steps.iter().map(|s| s.bufs.clone()).collect();
         let push_keep: Vec<Push> = steps.iter().map(|s| s.push).collect();
@@ -1130,6 +1146,45 @@ impl GpuSim {
             );
         }
         counts.iter().map(|c| *c as usize).sum()
+    }
+
+    /// Сверка двух реализаций префикс-скана на ОДНИХ И ТОГ ЖЕ данных:
+    /// прогоняет старый однопоточный проход и параллельный, сравнивает
+    /// `tetstart` побайтово. Возвращает число несовпавших ячеек.
+    pub fn verify_scan(&mut self) -> usize {
+        let before = self.par_scan;
+        let push = self.push(0.05, 1);
+        let run = |this: &mut Self, steps: Vec<Step>| {
+            let mut keep: Vec<Vec<*mut c_void>> = steps.iter().map(|s| s.bufs.clone()).collect();
+            let push_keep: Vec<Push> = steps.iter().map(|s| s.push).collect();
+            let mut ds: Vec<VfDispatch> = steps
+                .iter()
+                .enumerate()
+                .map(|(k, s)| VfDispatch {
+                    pipeline: this.pipes[s.pipe],
+                    buffers: keep[k].as_mut_ptr(),
+                    n_buffers: keep[k].len() as u32,
+                    push: &push_keep[k] as *const Push as *const c_void,
+                    push_bytes: 80,
+                    groups: s.groups,
+                })
+                .collect();
+            unsafe {
+                check_status(
+                    vf_run(this.ctx, ds.as_mut_ptr(), ds.len() as u32),
+                    "verify_scan",
+                );
+            }
+        };
+        self.par_scan = false;
+        run(self, self.scan_steps(push));
+        let serial = self.read_tet_grid().0;
+        self.par_scan = true;
+        run(self, self.scan_steps(push));
+        let parallel = self.read_tet_grid().0;
+        self.par_scan = before;
+        assert_eq!(serial.len(), parallel.len());
+        serial.iter().zip(parallel.iter()).filter(|(a, b)| a != b).count()
     }
 
     /// Раскладка по ячейкам (для сверки с CPU). Возвращает (start, cell_tets).
@@ -1193,12 +1248,9 @@ impl GpuSim {
                 push,
                 groups: [g_body, 1, 1],
             },
-            Step {
-                pipe: P_TETSCAN,
-                bufs: vec![self.tetcnt, self.tetstart, self.tetcursor],
-                push,
-                groups: [1, 1, 1],
-            },
+            ];
+            steps.extend(self.scan_steps(push));
+            steps.extend(vec![
             Step {
                 pipe: P_TETFILL,
                 bufs: vec![
@@ -1227,7 +1279,7 @@ impl GpuSim {
                 push,
                 groups: [g_cells, 1, 1],
             },
-        ];
+        ]);
         let mut keep: Vec<Vec<*mut c_void>> = steps.iter().map(|s| s.bufs.clone()).collect();
         let push_keep: Vec<Push> = steps.iter().map(|s| s.push).collect();
         let mut ds: Vec<VfDispatch> = steps
@@ -1415,6 +1467,41 @@ impl GpuSim {
             }
         }
         out
+    }
+
+    /// Шаги префикс-скана сетки тетов. Параллельный вариант: частичные суммы
+    /// по блокам 64 потоками, префикс по 256 суммам, развёртка по блокам.
+    /// Старый однопоточный проход оставлен под VF_SCAN=serial для сверки.
+    fn scan_steps(&self, push: Push) -> Vec<Step> {
+        if !self.par_scan {
+            return vec![Step {
+                pipe: P_TETSCAN,
+                bufs: vec![self.tetcnt, self.tetstart, self.tetcursor],
+                push,
+                groups: [1, 1, 1],
+            }];
+        }
+        let g = ((self.ncells as u32) + SCAN_BLOCK as u32 - 1) / SCAN_BLOCK as u32;
+        vec![
+            Step {
+                pipe: P_TETBLOCKSUM,
+                bufs: vec![self.tetcnt, self.tetsums],
+                push,
+                groups: [g, 1, 1],
+            },
+            Step {
+                pipe: P_TETBLOCKPREF,
+                bufs: vec![self.tetsums, self.tetstart],
+                push,
+                groups: [1, 1, 1],
+            },
+            Step {
+                pipe: P_TETSCANP,
+                bufs: vec![self.tetcnt, self.tetsums, self.tetstart, self.tetcursor],
+                push,
+                groups: [g, 1, 1],
+            },
+        ]
     }
 
     /// Записать только изменённые тела (спавн/деспавн) — вместо заливки
