@@ -181,6 +181,7 @@ const P_BODYINIT: usize = 23;
 const P_TETBLOCKSUM: usize = 24;
 const P_TETBLOCKPREF: usize = 25;
 const P_TETSCANP: usize = 26;
+const P_TETPAIRSFLAT: usize = 27;
 /// Ячеек на блок в параллельном скане (совпадает с 16 * 64 в шейдере).
 pub const SCAN_BLOCK: usize = 1024;
 /// Потолок изменений тел за одно событие (спавн/деспавн).
@@ -306,6 +307,9 @@ pub struct GpuSim {
     bstage: *mut c_void,
     /// Частичные суммы блоков для параллельного скана сетки тетов.
     tetsums: *mut c_void,
+    /// Генерация пар по записям (равномерно), а не по ячейкам.
+    /// VF_PAIRGEN=cell — старый вариант для сверки.
+    flat_pairs: bool,
     /// Параллельный скан (по умолчанию). VF_SCAN=serial — старый однопоточный.
     par_scan: bool,
     /// AABB тел для префильтра пар (2 vec4 на тело).
@@ -429,7 +433,7 @@ impl GpuSim {
             )
         };
 
-        let names: [(&str, u32); 27] = [
+        let names: [(&str, u32); 28] = [
             ("integrate", 1),
             ("clear", 2),
             ("count", 2),
@@ -457,6 +461,7 @@ impl GpuSim {
             ("tet_blocksum", 2),
             ("tet_blockprefix", 2),
             ("tet_scan_p", 4),
+            ("tet_pairs_flat", 8),
         ];
         let mut pipes = Vec::new();
         for (nm, nb) in names.iter() {
@@ -516,6 +521,7 @@ impl GpuSim {
             /* Параллельный скан — по умолчанию. Сверка probe_scan на одних
              * данных: расхождений 0 и по start, и по ячейкам. VF_SCAN=serial
              * возвращает старый однопоточный проход (для сверки). */
+            flat_pairs: !matches!(std::env::var("VF_PAIRGEN").as_deref(), Ok("cell")),
             par_scan: !matches!(std::env::var("VF_SCAN").as_deref(), Ok("serial")),
             baabb,
             pairs_on_gpu: false,
@@ -1276,7 +1282,7 @@ impl GpuSim {
                 groups: [g_body, 1, 1],
             },
             Step {
-                pipe: P_TETPAIRS,
+                pipe: if self.flat_pairs { P_TETPAIRSFLAT } else { P_TETPAIRS },
                 bufs: vec![
                     self.bodies[0],
                     self.tets,
@@ -1288,7 +1294,18 @@ impl GpuSim {
                     self.baabb,
                 ],
                 push,
-                groups: [g_cells, 1, 1],
+                /* По записям: групп на весь потолок (записей не больше
+                 * MAX_CELL_TETS), лишние invocation выходят первой проверкой.
+                 * По ячейкам: по одной группе на 64 ячейки, как раньше. */
+                groups: [
+                    if self.flat_pairs {
+                        ((MAX_CELL_TETS as u32) + WG - 1) / WG
+                    } else {
+                        g_cells
+                    },
+                    1,
+                    1,
+                ],
             },
         ]);
         let mut keep: Vec<Vec<*mut c_void>> = steps.iter().map(|s| s.bufs.clone()).collect();
