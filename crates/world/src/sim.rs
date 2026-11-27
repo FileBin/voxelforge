@@ -513,10 +513,10 @@ impl GpuSim {
              * 262 144 ячейки каждый такт. VF_SCAN=serial возвращает старый
              * проход — он нужен для сверки в probe_scan. */
             tetsums,
-            /* По умолчанию — старый однопоточный проход: параллельный скан
-             * пока ломает первый такт (тесты live: плита не раскалывается,
-             * осколки дрожат). Включается VF_SCAN=parallel явно. */
-            par_scan: matches!(std::env::var("VF_SCAN").as_deref(), Ok("parallel")),
+            /* Параллельный скан — по умолчанию. Сверка probe_scan на одних
+             * данных: расхождений 0 и по start, и по ячейкам. VF_SCAN=serial
+             * возвращает старый однопоточный проход (для сверки). */
+            par_scan: !matches!(std::env::var("VF_SCAN").as_deref(), Ok("serial")),
             baabb,
             pairs_on_gpu: false,
             pairs,
@@ -1181,13 +1181,21 @@ impl GpuSim {
         };
         self.par_scan = false;
         run(self, self.scan_steps(push));
-        let serial = self.read_tet_grid().0;
+        let (serial, scells) = self.read_tet_grid();
         self.par_scan = true;
         run(self, self.scan_steps(push));
-        let parallel = self.read_tet_grid().0;
+        let (parallel, pcells) = self.read_tet_grid();
         self.par_scan = before;
         assert_eq!(serial.len(), parallel.len());
-        serial.iter().zip(parallel.iter()).filter(|(a, b)| a != b).count()
+        let bad_starts = serial.iter().zip(parallel.iter()).filter(|(a, b)| a != b).count();
+        let bad_cells = scells.iter().zip(pcells.iter()).filter(|(a, b)| a != b).count();
+        if bad_starts + bad_cells > 0 {
+            eprintln!(
+                "скан: расхождений start {bad_starts}, ячеек {bad_cells} из {}",
+                serial.len()
+            );
+        }
+        bad_starts + bad_cells
     }
 
     /// Раскладка по ячейкам (для сверки с CPU). Возвращает (start, cell_tets).
