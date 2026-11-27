@@ -72,8 +72,8 @@ void main() {
              * пересечения диапазонов клеток обоих тетов. Проверять пересечение
              * самих AABB здесь нельзя: это уже узкая фаза, и она выбрасывала
              * бы пары, которые просто делят клетку (310 против 3366 у CPU). */
-            vec3 inflA = abs(b[A.x].vel_m.xyz) * pc.prm0.x * 0.5;
-            vec3 inflB = abs(b[B.x].vel_m.xyz) * pc.prm0.x * 0.5;
+            vec3 inflA = abs(b[A.x].vel_m.xyz) * pc.prm0.x;
+            vec3 inflB = abs(b[B.x].vel_m.xyz) * pc.prm0.x;
             ivec3 ca = clamp(ivec3(floor((alo - inflA - lo_box) / cell)), ivec3(0), dims - ivec3(1));
             ivec3 cb = clamp(ivec3(floor((blo - inflB - lo_box) / cell)), ivec3(0), dims - ivec3(1));
             ivec3 canon3 = max(ca, cb);

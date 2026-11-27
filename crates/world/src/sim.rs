@@ -160,8 +160,11 @@ const P_TETKEY: usize = 15;
 const P_TETSCAN: usize = 16;
 const P_TETFILL: usize = 17;
 const P_TETPAIRS: usize = 18;
+const P_IMPACT: usize = 19;
 /// Потолок записей «тет x ячейка» за такт.
 pub const MAX_CELL_TETS: usize = 262144;
+/// Потолок тел в буферах GPU (совпадает с live::MAX_BODIES).
+pub const MAX_BODIES: usize = 64;
 /// Потолок пар тетраэдров за такт.
 pub const MAX_PAIRS: usize = 262144;
 
@@ -260,6 +263,8 @@ pub struct GpuSim {
     cell_tets: *mut c_void,
     /// Счётчик пар от tet_pairs.
     pair_count: *mut c_void,
+    /// Энергия самого сильного удара на тело (2 vec4 на тело).
+    impact: *mut c_void,
     /// Пары тетраэдров, посчитанные CPU один раз на такт.
     pairs: *mut c_void,
     pub n_pairs: usize,
@@ -320,6 +325,7 @@ impl GpuSim {
         let tetcursor = mk(ncells as usize * 4, false);
         let cell_tets = mk(MAX_CELL_TETS * 8, true);
         let pair_count = mk(4, true);
+        let impact = mk(MAX_BODIES * 32, true);
         let lcount = mk(n * 4, true);
         let cellcnt = mk(ncells as usize * 4, false);
         let starts = mk((ncells as usize + 1) * 4, false);
@@ -339,7 +345,7 @@ impl GpuSim {
             )
         };
 
-        let names: [(&str, u32); 19] = [
+        let names: [(&str, u32); 20] = [
             ("integrate", 1),
             ("clear", 2),
             ("count", 2),
@@ -359,6 +365,7 @@ impl GpuSim {
             ("tet_scan", 3),
             ("tet_fill", 6),
             ("tet_pairs", 7),
+            ("impact", 4),
         ];
         let mut pipes = Vec::new();
         for (nm, nb) in names.iter() {
@@ -405,6 +412,7 @@ impl GpuSim {
             tetcursor,
             cell_tets,
             pair_count,
+            impact,
             pairs,
             n_pairs: 0,
             lcount,
@@ -488,11 +496,20 @@ impl GpuSim {
         let g_body = ((self.n as u32) + WG - 1) / WG;
         let g_pairs = ((self.n_pairs as u32) + WG - 1) / WG;
         let push = self.push(h, g_body);
+        {
+            let zero = vec![0u8; MAX_BODIES * 32];
+            unsafe {
+                check_status(
+                    vf_buffer_write(self.ctx, self.impact, 0, zero.as_ptr() as *const c_void, zero.len()),
+                    "zero_impact",
+                );
+            }
+        }
 
         let mut steps: Vec<Step> = Vec::new();
         let (a, b) = (self.bodies[0], self.bodies[1]);
 
-        for _ in 0..chunks {
+        for chunk in 0..chunks {
             // контакты — раз на кусок
             steps.push(Step {
                 pipe: P_CLEAR,
@@ -518,6 +535,15 @@ impl GpuSim {
                 push,
                 groups: [g_body, 1, 1],
             });
+            /* Энергия удара — по снимку скоростей куска; проход идёт на каждом
+             * куске и копит максимум (снаряд долетает не в первом). */
+            steps.push(Step {
+                pipe: P_IMPACT,
+                bufs: vec![a, self.list, self.lcount, self.impact],
+                push,
+                groups: [g_body, 1, 1],
+            });
+            let _ = chunk;
             steps.push(Step {
                 pipe: P_DEP,
                 bufs: vec![a, self.list, self.lcount],
@@ -865,7 +891,7 @@ impl GpuSim {
 
     /// Сетка тетов целиком: подсчёт → префиксные суммы → раскладка.
     /// Возвращает число разложенных записей.
-    pub fn run_tet_grid(&mut self) -> usize {
+    pub fn run_tet_grid(&mut self, dt: f32) -> usize {
         let zero = vec![0u8; self.ncells as usize * 4];
         unsafe {
             check_status(
@@ -874,7 +900,7 @@ impl GpuSim {
             );
         }
         let g_body = ((self.n as u32) + WG - 1) / WG;
-        let push = self.push(1.0 / 60.0, g_body);
+        let push = self.push(dt, g_body);
         let g_cells = ((self.ncells as u32) + WG - 1) / WG;
         let mut steps = vec![
             Step {
@@ -958,7 +984,7 @@ impl GpuSim {
     }
 
     /// Пары тетов целиком на устройстве: сетка -> пары. Возвращает их число.
-    pub fn run_tet_pairs(&mut self) -> usize {
+    pub fn run_tet_pairs(&mut self, dt: f32) -> usize {
         let zero = vec![0u8; 4];
         unsafe {
             check_status(
@@ -966,9 +992,11 @@ impl GpuSim {
                 "zero_pairs",
             );
         }
-        self.run_tet_grid();
+        /* dt — такт, а не подшаг: от него зависит спекулятивная маржа, и при
+         * жёстко зашитом 1/60 быстрый снаряд не получал пар с плитой. */
+        self.run_tet_grid(dt);
         let g_cells = ((self.ncells as u32) + WG - 1) / WG;
-        let push = self.push(1.0 / 60.0, g_cells);
+        let push = self.push(dt, g_cells);
         let mut steps = vec![Step {
             pipe: P_TETPAIRS,
             bufs: vec![
@@ -1022,6 +1050,18 @@ impl GpuSim {
             );
         }
         out
+    }
+
+    /// События удара: на тело — (энергия, партнёр, нормаль, точка).
+    pub fn read_impact(&self) -> Vec<[f32; 8]> {
+        let mut raw = vec![0f32; MAX_BODIES * 8];
+        unsafe {
+            check_status(
+                vf_buffer_read(self.ctx, self.impact, 0, raw.as_mut_ptr() as *mut c_void, raw.len() * 4),
+                "read_impact",
+            );
+        }
+        raw.chunks(8).map(|c| [c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]).collect()
     }
 
     /// Прогнать только SAT-проход (для сверки с CPU).

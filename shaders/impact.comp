@@ -1,0 +1,62 @@
+#version 450
+#include "common.glsl"
+
+/* Энергия удара ДО солвера — по снимку скоростей (bin), а не после импульса.
+ *
+ * Раньше раскол решался на CPU по скоростям ПОСЛЕ решения контактов: быстрый
+ * снаряд уже остановлен, относительная скорость ~0, и плита не раскалывалась
+ * (измерено: 120 и 240 м/с — 0 трещин, снаряд отскакивает).
+ *
+ * Здесь для каждого тела берётся его самый энергоёмкий контакт:
+ *   e = 0.5 * mu * vn^2,  mu = 1/(1/m_a + 1/m_b),  vn — нормальная скорость
+ * сближения. На CPU уезжает 32 байта на тело вместо списка контактов.
+ */
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) buffer BodiesIn { Body bin[]; };
+layout(std430, set = 0, binding = 1) buffer Lists { C list[]; };
+layout(std430, set = 0, binding = 2) buffer ListCount { uint lc[]; };
+layout(std430, set = 0, binding = 3) buffer Impact { vec4 imp[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.grid.w)) return;
+
+    Body me = bin[i];
+    float im = me.vel_m.w;
+    vec3 v = me.vel_m.xyz;
+
+    float best = 0.0;
+    float jb = -1.0;
+    vec4 bn = vec4(0.0);
+    vec4 bp = vec4(0.0);
+
+    uint n = lc[i];
+    if (n > uint(CAP)) n = uint(CAP);
+    if (im > 0.0) {
+        for (uint k = 0u; k < n; k++) {
+            C c = list[i * uint(CAP) + k];
+            int j = c.meta.x;
+            if (j < 0) continue;
+            Body o = bin[j];
+            float oim = o.vel_m.w;
+            /* статик (пол/стена) — масса бесконечна: mu = 1/im */
+            float mu = (oim > 0.0) ? 1.0 / (im + oim) : 1.0 / im;
+            vec3 d = v - o.vel_m.xyz;
+            float vn = abs(dot(d, c.n_pen.xyz));
+            float e = 0.5 * mu * vn * vn;
+            if (e > best) {
+                best = e;
+                jb = float(j);
+                bn = vec4(c.n_pen.xyz, 0.0);
+                bp = vec4(c.point.xyz, 0.0);
+            }
+        }
+    }
+    /* Проход идёт на КАЖДОМ куске кадра (снаряд долетает не в первом), поэтому
+     * копим максимум, а не перезаписываем. */
+    vec4 prev = imp[i * 2u];
+    if (best > prev.x) {
+        imp[i * 2u] = vec4(best, jb, bn.x, bn.y);
+        imp[i * 2u + 1u] = vec4(bn.z, bp.x, bp.y, bp.z);
+    }
+}

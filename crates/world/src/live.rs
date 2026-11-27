@@ -338,11 +338,20 @@ impl Live {
                 ]
             })
             .collect();
+        /* Геометрию заливаем ДО пары: иначе на такте спавна снаряда пул
+         * ещё пуст, пар нет, и снаряд пролетает сквозь плиту (найдено на
+         * 120 м/с: кадр 0 — 0 пар, кадр 1 — 22976, но уже поздно). */
+        if self.geom_dirty {
+            let local: Vec<Vec<[[f32; 3]; 4]>> = self.bodies.iter().map(|b| b.local_tets().clone()).collect();
+            self.gpu.upload_geometry(&local);
+            self.geom_dirty = false;
+        }
+
         if self.gpu_pairs {
             /* Пары рождаются на устройстве: сетка тетов + испускание пар.
              * На CPU приходит только их число (4 байта) — позиции тел в кадре
              * больше не читаются. */
-            self.gpu.run_tet_pairs();
+            self.gpu.run_tet_pairs(dt);
         } else {
             let shapes: Vec<Vec<[[f32; 3]; 4]>> =
                 self.bodies.iter().map(|b| b.rotated_tets()).collect();
@@ -378,11 +387,6 @@ impl Live {
                 .collect();
             self.gpu.set_pairs(&packed);
         }
-        if self.geom_dirty {
-            let local: Vec<Vec<[[f32; 3]; 4]>> = self.bodies.iter().map(|b| b.local_tets().clone()).collect();
-            self.gpu.upload_geometry(&local);
-            self.geom_dirty = false;
-        }
         /* Та же нарезка, что на CPU: куски по скорости, внутри куска — подшаги
          * с ОДНИМ списком контактов. Иначе поведение кучи расходится. */
         let vmax = self
@@ -401,8 +405,15 @@ impl Live {
          * устройстве. Значит при выключенном расколе читать их обратно не
          * нужно вовсе — минус ~196 КБ за такт. */
         if self.fracture_enabled {
-            let contacts = self.gpu.read_contacts();
-            self.fracture(&contacts);
+            if self.gpu_collide {
+                /* События удара с устройства: 32 байта на тело вместо списка
+                 * контактов, и энергия посчитана ДО солвера. */
+                let imp = self.gpu.read_impact();
+                self.fracture_from_impact(&imp);
+            } else {
+                let contacts = self.gpu.read_contacts();
+                self.fracture(&contacts);
+            }
         }
         let snap = self.gpu.read_bodies();
         for i in 0..self.bodies.len() {
@@ -833,6 +844,45 @@ impl Live {
                 jobs.push((ti, point, e as f32));
             }
         }
+        self.apply_jobs(jobs);
+    }
+
+    /// Раскол по событиям удара С УСТРОЙСТВА: энергия посчитана до солвера,
+    /// поэтому в неё попадает и удар, который солвер тут же погасил.
+    fn fracture_from_impact(&mut self, imp: &[[f32; 8]]) {
+        let mut jobs: Vec<(usize, [f32; 3], f32)> = Vec::new();
+        for (i, rec) in imp.iter().enumerate() {
+            if i >= self.bodies.len() {
+                break;
+            }
+            let (e, partner) = (rec[0], rec[1]);
+            if partner < 0.0 || e < 500.0 || !self.bodies[i].alive {
+                continue;
+            }
+            let j = partner as usize;
+            if j >= self.bodies.len() || !self.bodies[j].alive {
+                continue;
+            }
+            // цель — тот, в кого попали (не снаряд)
+            let ti = match (self.bodies[i].kind == Kind::Bullet, self.bodies[j].kind == Kind::Bullet) {
+                (true, false) => j,
+                (false, true) => i,
+                (true, true) => continue,
+                (false, false) => i,
+            };
+            if self.bodies[ti].kind == Kind::Bullet || self.bodies[ti].tets.len() < MIN_TETS {
+                continue;
+            }
+            if self.frames < self.bodies[ti].crack_after {
+                continue;
+            }
+            jobs.push((ti, [rec[5], rec[6], rec[7]], e));
+        }
+        self.apply_jobs(jobs);
+    }
+
+    /// Общая часть: разложить заявки на раскол с учётом свободных слотов.
+    fn apply_jobs(&mut self, jobs: Vec<(usize, [f32; 3], f32)>) {
         for (ti, point, energy) in jobs {
             if !self.bodies[ti].alive {
                 continue;
