@@ -152,6 +152,30 @@ void main() {
     }
     vec3 point = 0.5 * (va + vb);
 
+    /* Пробуждение НА УСТРОЙСТВЕ: спящее тело, которого коснулся движущийся
+     * сосед, просыпается здесь же. Проход сна обнуляет скорость и убирает
+     * im/ii (они лежат в misc.z / misc.w), поэтому восстанавливаем их и
+     * сбрасываем якорь. Запись идемпотентна — повторы из других вызовов
+     * пишут те же значения. */
+    float sp_a = length(A.vel_m.xyz);
+    float sp_b = length(B.vel_m.xyz);
+    if (A.misc.y > 0.5 && B.misc.y <= 0.5 && sp_b > 0.35) {
+        A.misc.y = 0.0;
+        A.misc.x = 0.0;
+        A.vel_m.w = A.misc.z;
+        A.ang_i.w = A.misc.w;
+        A.anchor = vec4(A.pos_r.xyz, 0.0);
+        bin[ba] = A;
+    }
+    if (B.misc.y > 0.5 && A.misc.y <= 0.5 && sp_a > 0.35) {
+        B.misc.y = 0.0;
+        B.misc.x = 0.0;
+        B.vel_m.w = B.misc.z;
+        B.ang_i.w = B.misc.w;
+        B.anchor = vec4(B.pos_r.xyz, 0.0);
+        bin[bb] = B;
+    }
+
     C ca_c;
     /* y — тетраэдр A в пуле, z — тетраэдр B, w — номер выбранной оси
      * (для отладки: видно, что именно читает шейдер). */
