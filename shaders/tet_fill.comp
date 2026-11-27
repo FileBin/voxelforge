@@ -46,6 +46,11 @@ void main() {
 
         vec3 tlo = min(min(v0, v1), min(v2, v3));
         vec3 thi = max(max(v0, v1), max(v2, v3));
+        /* Спекулятивная маржа: растягиваем AABB на путь за такт, иначе быстрый
+         * снаряд не попадает в клетки, которые пересекает, и проходит сквозь. */
+        vec3 infl = abs(x.vel_m.xyz) * pc.prm0.x * 0.5;
+        tlo -= infl;
+        thi += infl;
 
         ivec3 a = ivec3(floor((tlo - lo_box) / cell));
         ivec3 c = ivec3(floor((thi - lo_box) / cell));
