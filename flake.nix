@@ -75,6 +75,10 @@
             name = "voxelforge-live";
             runtimeInputs = [ pkgs.vulkan-loader pkgs.sdl3 ];
             text = ''
+              # Физика и пары — на устройстве: это быстрый путь, из такта уходят
+              # все чтения (см. docs/plan-sync.md). Переопределяется переменной.
+              export VF_COLLIDE="''${VF_COLLIDE:-gpu}"
+              export VF_PAIRS="''${VF_PAIRS:-gpu}"
               exec ${self.packages.${system}.live}/bin/voxelforge-live \
                 --shaders ${self.packages.${system}.spirv} "$@"
             '' + ''
@@ -109,6 +113,9 @@
             runtimeInputs = [ pkgs.sway-unwrapped pkgs.mesa pkgs.util-linux pkgs.dbus pkgs.coreutils ];
             text = ''
               export VF_SHADERS=${self.packages.${system}.spirv}
+              # То же, что в окне: коллизия и пары на устройстве.
+              export VF_COLLIDE="''${VF_COLLIDE:-gpu}"
+              export VF_PAIRS="''${VF_PAIRS:-gpu}"
               export SWAY_BIN=${pkgs.sway-unwrapped}/bin/sway
               if [ -z "''${VK_ICD_FILENAMES:-}" ]; then
                 for lvp in ${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.*.json; do
