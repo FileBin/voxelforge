@@ -454,11 +454,10 @@ impl Live {
          * Скорость меняется плавно, запаздывание на такт безопасно. */
         let cell = (self.params.cell * 0.5) as f64;
         let chunks = ((vmax * dt as f64 / (cell * 0.35)).ceil() as u32).clamp(2, 12);
-        let per = (substeps / chunks).max(1);
         /* Такт отправляем БЕЗ ожидания: к моменту следующего такта (50 мс) GPU
          * давно свободен, и CPU не стоит ни миллисекунды. Результат прошлого
          * такта читаем здесь же — он уже закрыт. */
-        self.gpu.frame_gpu_contacts_async(dt, chunks, per, iterations);
+        self.gpu.frame_gpu_contacts_async(dt, chunks, substeps, iterations);
         // Контакты нужны и геймплею: раскол и пробуждение по контакту решаются
         // на CPU, поэтому читаем их один раз за такт (73 КБ при 64 телах).
         /* Контакты нужны CPU ТОЛЬКО для раскола: пробуждение делает SAT на

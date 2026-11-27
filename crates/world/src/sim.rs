@@ -563,14 +563,19 @@ impl GpuSim {
     /// ОДИН раз на «кусок», а внутри куска идёт `per` подшагов с тем же
     /// списком. Раньше контакты пересобирались на каждом подшаге, и куча
     /// вела себя иначе, чем на CPU при том же числе подшагов.
-    pub fn frame_gpu_contacts(&mut self, dt: f32, chunks: u32, per: u32, iterations: u32) {
-        self.frame_gpu_contacts_impl(dt, chunks, per, iterations, false)
+    /// `substeps` — ВСЕГО подшагов за такт (не «на кусок»), `groups` — сколько
+    /// раз внутри такта пересобираются контакты. Так число подшагов не зависит
+    /// от скорости: раньше `per = substeps/chunks` терял остаток, и при смене
+    /// числа кусков такт считался за 10 подшагов или за 7 — тело ехало рывками
+    /// (проверено probe_wobble).
+    pub fn frame_gpu_contacts(&mut self, dt: f32, groups: u32, substeps: u32, iterations: u32) {
+        self.frame_gpu_contacts_impl(dt, groups, substeps, iterations, false)
     }
 
     /// Такт без ожидания: CPU отправляет и идёт дальше, а статистику и
     /// события читает на СЛЕДУЮЩЕМ такте (см. `wait_prev`).
-    pub fn frame_gpu_contacts_async(&mut self, dt: f32, chunks: u32, per: u32, iterations: u32) {
-        self.frame_gpu_contacts_impl(dt, chunks, per, iterations, true)
+    pub fn frame_gpu_contacts_async(&mut self, dt: f32, groups: u32, substeps: u32, iterations: u32) {
+        self.frame_gpu_contacts_impl(dt, groups, substeps, iterations, true)
     }
 
     /// Дождаться последнего отправленного такта: перед любой записью тел с
@@ -589,11 +594,16 @@ impl GpuSim {
         &mut self,
         dt: f32,
         chunks: u32,
-        per: u32,
+        substeps: u32,
         iterations: u32,
         async_submit: bool,
     ) {
-        let total = chunks.max(1) * per.max(1);
+        /* Подшагов всегда ровно substeps: от скорости зависит только то, как
+         * часто пересобираются контакты (группы), а не длина шага. */
+        let total = substeps.max(1);
+        let groups = chunks.clamp(1, total);
+        let per_group = (total + groups - 1) / groups;
+        let mut left = total;
         let h = dt / total as f32;
         let g_body = ((self.n as u32) + WG - 1) / WG;
         let g_pairs = if self.pairs_on_gpu {
@@ -635,7 +645,12 @@ impl GpuSim {
             groups: [g_body, 1, 1],
         });
 
-        for chunk in 0..chunks {
+        for _group in 0..groups {
+            let n_steps = per_group.min(left);
+            if n_steps == 0 {
+                break;
+            }
+            left -= n_steps;
             // контакты — раз на кусок
             steps.push(Step {
                 pipe: P_CLEAR,
@@ -669,7 +684,7 @@ impl GpuSim {
                 push,
                 groups: [g_body, 1, 1],
             });
-            let _ = chunk;
+
             steps.push(Step {
                 pipe: P_DEP,
                 bufs: vec![a, self.list, self.lcount],
@@ -677,7 +692,7 @@ impl GpuSim {
                 groups: [g_body, 1, 1],
             });
             // подшаги внутри куска — по тому же списку контактов
-            for _ in 0..per {
+            for _ in 0..n_steps {
                 steps.push(Step {
                     pipe: P_INTEGRATE,
                     bufs: vec![a],

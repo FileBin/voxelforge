@@ -12,7 +12,7 @@ fn main() {
     w.gpu.upload_geometry(&local);
     w.gpu.set_pairs(&[]);
     for k in 0..3 {
-        w.gpu.frame_gpu_contacts(0.05, 6, 1, iters);
+        w.gpu.frame_gpu_contacts(0.05, 6, 6, iters);
         let gb = w.gpu.read_bodies();
         println!("такт {k} (iters={iters}): x={:.3} velx={:.2}", gb[slot].pos_r[0], gb[slot].vel_m[0]);
     }
