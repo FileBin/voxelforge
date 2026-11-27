@@ -5,7 +5,7 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
-voxelforge-world = { path = "../../crates/world" }
+voxelforge-world = { path = "../../crates/world", features = ["cpu-solver"] }
 
 [[bin]]
 name = "vf-ref"

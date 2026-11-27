@@ -127,6 +127,9 @@ unsafe impl Send for Live {}
 pub struct Live {
     pub bodies: Vec<LiveBody>,
     pub gpu: GpuSim,
+    /// Зеркало поз на CPU. Нужно ТОЛЬКО CPU-солверу (эталон в тестах): на
+    /// GPU-пути его больше никто не читает и не пишет. Вынос в отдельный
+    /// модуль за фичу `cpu-solver` — следующая правка.
     pub mirror: Vec<GpuBody>,
     /// Следующий свободный идентификатор тела.
     next_id: u64,
@@ -960,7 +963,6 @@ impl Live {
     /// включение каркаса): в такте позы на CPU больше не нужны.
     fn sync_body(&mut self, i: usize) {
         let Some(g) = self.gpu.read_body(i) else { return };
-        self.mirror[i] = g;
         if i >= self.bodies.len() || !self.bodies[i].alive {
             return;
         }
@@ -997,6 +999,9 @@ impl Live {
         self.sync_all();
     }
 
+    /// Подтянуть ВСЕ позы с устройства. Только по событию (раскол, сброс):
+    /// в такте этого нет. Зеркало обновляется для CPU-солвера — GPU-путь его
+    /// не читает.
     fn sync_all(&mut self) {
         let snap = self.gpu.read_bodies();
         let n = self.mirror.len().min(snap.len());
@@ -1140,8 +1145,9 @@ impl Live {
             };
             body.rebuild();
             body.radius = body.radius_of();
-            let gb = gpu_body(&body);
-            self.mirror[slot] = gb;
+            if !self.gpu_collide {
+                self.mirror[slot] = gpu_body(&body);
+            }
             if slot < self.bodies.len() {
                 self.bodies[slot] = body;
             } else {
@@ -1162,7 +1168,7 @@ impl Live {
             /* Только слоты осколков (первый из них — слот родителя):
              * остальные тела в буфере новее зеркала, их заливать нельзя. */
             let items: Vec<(usize, GpuBody)> =
-                new_slots.iter().map(|&sl| (sl, self.mirror[sl])).collect();
+                new_slots.iter().map(|&sl| (sl, gpu_body(&self.bodies[sl]))).collect();
             self.gpu.write_slots(&items);
             self.bodies[ti].crack_after = self.frames + 30;
         self.geom_dirty = true;
@@ -1189,7 +1195,10 @@ impl Live {
         let parked = Body::new([0.0, -400.0, 0.0], [0.0; 3], 1.0, 0.05);
         let mut g = GpuBody::from_cpu(&parked);
         g.misc[1] = 1.0;
-        self.mirror[slot] = g;
+        if !self.gpu_collide {
+            /* CPU-солверу позы нужны на CPU — там зеркало ещё рабочее. */
+            self.mirror[slot] = g;
+        }
         /* Только этот слот: остальные тела в буфере трогать нельзя, их позы
          * новее зеркала. Ни ожидания, ни полного чтения больше не нужно. */
         self.gpu.write_slots(&[(slot, g)]);
@@ -1241,12 +1250,14 @@ impl Live {
         };
         body.rebuild();
         body.radius = body.radius_of();
-        let gb = gpu_body(&body);
-        self.mirror[slot] = gb;
         if slot < self.bodies.len() {
             self.bodies[slot] = body;
         } else {
             self.bodies.push(body);
+        }
+        let gb = gpu_body(&self.bodies[slot]);
+        if !self.gpu_collide {
+            self.mirror[slot] = gb;
         }
         /* Спавн — запись одного слота; остальные тела в буфере не трогаем. */
         self.gpu.write_slots(&[(slot, gb)]);

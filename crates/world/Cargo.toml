@@ -8,6 +8,10 @@ license.workspace = true
 
 [features]
 live = []
+# CPU-солвер: столкновения, развязка и пробуждение считаются на CPU, плюс
+# зеркало поз на CPU. Нужен только эталонной симуляции в тестах; в движке
+# (nix build .#live) не собирается вовсе.
+cpu-solver = []
 
 [[bin]]
 name = "voxelforge-live"
