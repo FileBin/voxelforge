@@ -1159,7 +1159,11 @@ impl Live {
             // сначала аккуратно расталкиваем новорождённых позициями,
             // и только потом отдаём их солверу
             self.settle_new_shards(&new_slots);
-            self.gpu.write_bodies(&self.mirror);
+            /* Только слоты осколков (первый из них — слот родителя):
+             * остальные тела в буфере новее зеркала, их заливать нельзя. */
+            let items: Vec<(usize, GpuBody)> =
+                new_slots.iter().map(|&sl| (sl, self.mirror[sl])).collect();
+            self.gpu.write_slots(&items);
             self.bodies[ti].crack_after = self.frames + 30;
         self.geom_dirty = true;
         }
@@ -1181,14 +1185,14 @@ impl Live {
         if slot >= self.bodies.len() || !self.bodies[slot].alive {
             return;
         }
-        self.gpu.wait_idle();
-        self.sync_all();
         self.bodies[slot].alive = false;
         let parked = Body::new([0.0, -400.0, 0.0], [0.0; 3], 1.0, 0.05);
         let mut g = GpuBody::from_cpu(&parked);
         g.misc[1] = 1.0;
         self.mirror[slot] = g;
-        self.gpu.write_bodies(&self.mirror);
+        /* Только этот слот: остальные тела в буфере трогать нельзя, их позы
+         * новее зеркала. Ни ожидания, ни полного чтения больше не нужно. */
+        self.gpu.write_slots(&[(slot, g)]);
     }
 
     /// Выстрел из точки from в направлении dir.
@@ -1212,10 +1216,6 @@ impl Live {
             }
         }
         let Some(slot) = self.free_slot() else { return false };
-        /* write_bodies заливает весь буфер: без свежих поз остальные тела
-         * прыгнули бы назад на такт. Это событие, а не такт, — читаем. */
-        self.gpu.wait_idle();
-        self.sync_all();
         // снаряд — гранёный кусок, а не шар
         let ball = TetBody::cube([0.0, 0.0, 0.0], 2, 1);
         let id = self.new_id();
@@ -1248,7 +1248,8 @@ impl Live {
         } else {
             self.bodies.push(body);
         }
-        self.gpu.write_bodies(&self.mirror);
+        /* Спавн — запись одного слота; остальные тела в буфере не трогаем. */
+        self.gpu.write_slots(&[(slot, gb)]);
         self.geom_dirty = true;
         // слот мог остаться в очереди от прошлого снаряда — иначе появляются
         // дубликаты и часть снарядов выпадает из пула навсегда

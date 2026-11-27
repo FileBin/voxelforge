@@ -177,6 +177,9 @@ const P_IMPACT: usize = 19;
 const P_BODYAABB: usize = 20;
 const P_SNAPSHOT: usize = 21;
 const P_STATS: usize = 22;
+const P_BODYINIT: usize = 23;
+/// Потолок изменений тел за одно событие (спавн/деспавн).
+pub const MAX_CHANGES: usize = 64;
 /// Потолок записей «тет x ячейка» за такт.
 pub const MAX_CELL_TETS: usize = 262144;
 /// Потолок тел в буферах GPU (совпадает с live::MAX_BODIES).
@@ -293,6 +296,9 @@ pub struct GpuSim {
     /// (uvec2): x — максимум |v| битами, y — сколько тел бодрствует. 8 байт
     /// за такт вместо чтения всех тел обратно.
     stat: *mut c_void,
+    /// Очередь изменений тел (шаг 3): номера слотов и сами тела.
+    bslots: *mut c_void,
+    bstage: *mut c_void,
     /// AABB тел для префильтра пар (2 vec4 на тело).
     baabb: *mut c_void,
     /// Пары и их число известны только устройству (SAT берёт число из буфера).
@@ -388,6 +394,10 @@ impl GpuSim {
         let impact_ring = mk(MAX_EVENTS * 3 * 16, true);
         let impact_cnt = mk(4, true);
         let stat = mk(8, true);
+        /* Очередь изменений тел: номер слота + само тело. Хост-видимая, чтобы
+         * CPU клал туда только изменённое, а раскладку делал body_init. */
+        let bslots = mk(MAX_CHANGES * 4, true);
+        let bstage = mk(MAX_CHANGES * BODY_BYTES, true);
         let baabb = mk(MAX_BODIES * 32, false);
         let lcount = mk(n * 4, true);
         let cellcnt = mk(ncells as usize * 4, false);
@@ -408,7 +418,7 @@ impl GpuSim {
             )
         };
 
-        let names: [(&str, u32); 23] = [
+        let names: [(&str, u32); 24] = [
             ("integrate", 1),
             ("clear", 2),
             ("count", 2),
@@ -432,6 +442,7 @@ impl GpuSim {
             ("body_aabb", 4),
             ("snapshot", 1),
             ("stats", 2),
+            ("body_init", 3),
         ];
         let mut pipes = Vec::new();
         for (nm, nb) in names.iter() {
@@ -482,6 +493,8 @@ impl GpuSim {
             impact_ring,
             impact_cnt,
             stat,
+            bslots,
+            bstage,
             baabb,
             pairs_on_gpu: false,
             pairs,
@@ -1402,6 +1415,62 @@ impl GpuSim {
             }
         }
         out
+    }
+
+    /// Записать только изменённые тела (спавн/деспавн) — вместо заливки
+    /// всего буфера: CPU кладёт в очередь номер слота и само тело, а
+    /// раскладку делает проход body_init на устройстве.
+    pub fn write_slots(&mut self, items: &[(usize, GpuBody)]) {
+        if items.is_empty() || self.n == 0 {
+            return;
+        }
+        let n = items.len().min(MAX_CHANGES);
+        let mut slots: Vec<u32> = Vec::with_capacity(n);
+        let mut stage: Vec<u8> = Vec::with_capacity(n * BODY_BYTES);
+        for (slot, b) in items.iter().take(n) {
+            slots.push(*slot as u32);
+            let bytes = unsafe {
+                std::slice::from_raw_parts(b as *const GpuBody as *const u8, BODY_BYTES)
+            };
+            stage.extend_from_slice(bytes);
+        }
+        self.bytes_up += (n * BODY_BYTES) as u64;
+        let mut push = self.push(0.0, 0);
+        push.hi[3] = n as f32;
+        unsafe {
+            check_status(
+                vf_buffer_write(
+                    self.ctx,
+                    self.bslots,
+                    0,
+                    slots.as_ptr() as *const c_void,
+                    slots.len() * 4,
+                ),
+                "write_slots/slots",
+            );
+            check_status(
+                vf_buffer_write(
+                    self.ctx,
+                    self.bstage,
+                    0,
+                    stage.as_ptr() as *const c_void,
+                    stage.len(),
+                ),
+                "write_slots/stage",
+            );
+        }
+        let mut bufs = [self.bslots, self.bstage, self.bodies[0]];
+        let mut d = VfDispatch {
+            pipeline: self.pipes[P_BODYINIT],
+            buffers: bufs.as_mut_ptr(),
+            n_buffers: 3,
+            push: &push as *const Push as *const c_void,
+            push_bytes: 80,
+            groups: [((n as u32) + 15) / 16, 1, 1],
+        };
+        unsafe {
+            check_status(vf_run(self.ctx, &mut d, 1), "write_slots");
+        }
     }
 
     pub fn write_bodies(&mut self, bodies: &[GpuBody]) {
