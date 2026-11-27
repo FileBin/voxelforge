@@ -49,8 +49,10 @@ void main() {
     if (e - s < 2u) return;
 
     ivec3 dims = pc.grid.xyz;
-    /* та же клетка, что строит CPU: params.cell * 0.5 */
-    float cell = pc.prm1.w * 0.5;
+    /* Клетка = params.cell (0.16). Мелкая клетка (0.08) утраивала число
+     * ячеек сетки, а скан по ней однопоточный — на реальной карте это и был
+     * главный расход. Кандидатов отсеивает префильтр по AABB тел. */
+    float cell = pc.prm1.w;
     vec3 lo_box = pc.lo.xyz;
 
     for (uint i = s; i < e; i++) {

@@ -167,7 +167,7 @@ pub const MAX_CELL_TETS: usize = 262144;
 /// Потолок тел в буферах GPU (совпадает с live::MAX_BODIES).
 pub const MAX_BODIES: usize = 64;
 /// Потолок пар тетраэдров за такт.
-pub const MAX_PAIRS: usize = 262144;
+pub const MAX_PAIRS: usize = 65536;
 
 /// Контактов на тело. Было 24 — в плотной куче этого мало: часть контактов
 /// просто не попадала в список. Память: 64 тела x 64 контакта x 48 Б ≈ 200 КБ.
