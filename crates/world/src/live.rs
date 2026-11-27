@@ -424,10 +424,22 @@ impl Live {
                 }
                 let si = self.mirror[i].misc[1] > 0.5;
                 let sj = self.mirror[j].misc[1] > 0.5;
-                if si != sj {
-                    self.wake(if si { i } else { j });
-                    woke = true;
+                if si == sj {
+                    continue;
                 }
+                /* Будим, только если бодрствующий сосед РЕАЛЬНО движется.
+                 * Раньше хватало самого факта контакта: в куче один
+                 * шевелящийся осколок будил соседей, те — следующих, и куча
+                 * просыпалась заново каждый такт. Каждое пробуждение ещё и
+                 * заливает все тела на GPU — отсюда «со сном медленнее». */
+                let awake = if si { j } else { i };
+                let g = &self.mirror[awake];
+                let speed = (g.vel_m[0] * g.vel_m[0] + g.vel_m[1] * g.vel_m[1] + g.vel_m[2] * g.vel_m[2]).sqrt();
+                if speed < 0.35 {
+                    continue;
+                }
+                self.wake(if si { i } else { j });
+                woke = true;
             }
         }
         if woke {
