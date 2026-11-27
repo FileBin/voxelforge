@@ -1021,26 +1021,67 @@ impl GpuSim {
                 "zero_pairs",
             );
         }
-        /* dt — такт, а не подшаг: от него зависит спекулятивная маржа, и при
-         * жёстко зашитом 1/60 быстрый снаряд не получал пар с плитой. */
-        self.run_tet_grid(dt);
+        /* Вся сетка и пары — ОДНИМ submit'ом. Раньше было два (сетка, потом
+         * пары), и за такт набегало пять ожиданий конвейера: на реальной карте
+         * это и держало загрузку у 100% на пустом кадре. */
+        let zero_cells = vec![0u8; self.ncells as usize * 4];
+        unsafe {
+            check_status(
+                vf_buffer_write(self.ctx, self.tetcnt, 0, zero_cells.as_ptr() as *const c_void, zero_cells.len()),
+                "zero_cells",
+            );
+        }
+        let g_body = ((self.n as u32) + WG - 1) / WG;
         let g_cells = ((self.ncells as u32) + WG - 1) / WG;
-        let push = self.push(dt, g_cells);
-        let mut steps = vec![Step {
-            pipe: P_TETPAIRS,
-            bufs: vec![
-                self.bodies[0],
-                self.tets,
-                self.span,
-                self.tetstart,
-                self.cell_tets,
-                self.pairs,
-                self.pair_count,
-                self.baabb,
-            ],
-            push,
-            groups: [g_cells, 1, 1],
-        }];
+        let push = self.push(dt, g_body);
+        let mut steps = vec![
+            Step {
+                pipe: P_BODYAABB,
+                bufs: vec![self.bodies[0], self.tets, self.span, self.baabb],
+                push,
+                groups: [g_body, 1, 1],
+            },
+            Step {
+                pipe: P_TETKEY,
+                bufs: vec![self.bodies[0], self.tets, self.span, self.tetcnt],
+                push,
+                groups: [g_body, 1, 1],
+            },
+            Step {
+                pipe: P_TETSCAN,
+                bufs: vec![self.tetcnt, self.tetstart, self.tetcursor],
+                push,
+                groups: [1, 1, 1],
+            },
+            Step {
+                pipe: P_TETFILL,
+                bufs: vec![
+                    self.bodies[0],
+                    self.tets,
+                    self.span,
+                    self.tetstart,
+                    self.tetcursor,
+                    self.cell_tets,
+                ],
+                push,
+                groups: [g_body, 1, 1],
+            },
+            Step {
+                pipe: P_TETPAIRS,
+                bufs: vec![
+                    self.bodies[0],
+                    self.tets,
+                    self.span,
+                    self.tetstart,
+                    self.cell_tets,
+                    self.pairs,
+                    self.pair_count,
+                    self.baabb,
+                ],
+                push,
+                groups: [g_cells, 1, 1],
+            },
+        ];
         let mut keep: Vec<Vec<*mut c_void>> = steps.iter().map(|s| s.bufs.clone()).collect();
         let push_keep: Vec<Push> = steps.iter().map(|s| s.push).collect();
         let mut ds: Vec<VfDispatch> = steps
@@ -1058,14 +1099,12 @@ impl GpuSim {
         unsafe {
             check_status(vf_run(self.ctx, ds.as_mut_ptr(), ds.len() as u32), "run_tet_pairs");
         }
-        /* Счётчик пад не читаем: он нужен только диспатчу SAT, а тот берёт
-         * число из буфера. На CPU при этом не остаётся ни байта состояния. */
+        /* Счётчик не читаем: SAT берёт число пар из буфера. */
         self.pairs_on_gpu = true;
         self.n_pairs = MAX_PAIRS;
         self.n_pairs
     }
 
-    /// Считать пары обратно (для сверки).
     pub fn read_pairs(&self) -> Vec<[u32; 2]> {
         let n = self.n_pairs.max(1);
         let mut out = vec![[0u32; 2]; n];
