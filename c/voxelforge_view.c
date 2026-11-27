@@ -366,8 +366,39 @@ static int make_swapchain(vf_view *v) {
         v->extent.height = (uint32_t)h;
     }
 
-    uint32_t want = caps.minImageCount + 1;
+    /* Минимальное число образов, которое даёт драйвер. Меньше нельзя —
+     * Vulkan требует imageCount >= minImageCount. Один образ не создастся,
+     * поэтому «не копить кадры» решается режимом показа, а не числом образов. */
+    uint32_t want = caps.minImageCount;
     if (caps.maxImageCount > 0 && want > caps.maxImageCount) want = caps.maxImageCount;
+
+    /* Режим показа: MAILBOX — очередь не копится, показывается самый свежий
+     * кадр (без разрывов); IMMEDIATE — вообще без ожидания вертикальной
+     * синхронизации. FIFO оставляем последним: он как раз и держит очередь в
+     * N кадров, из-за чего картинка отстаёт от физики. */
+    uint32_t pm_n = 0;
+    vkGetPhysicalDeviceSurfacePresentModesKHR(v->phys, v->surf, &pm_n, NULL);
+    VkPresentModeKHR modes[16];
+    if (pm_n > 16) pm_n = 16;
+    if (pm_n) vkGetPhysicalDeviceSurfacePresentModesKHR(v->phys, v->surf, &pm_n, modes);
+    int has_mailbox = 0, has_immediate = 0;
+    for (uint32_t i = 0; i < pm_n; i++) {
+        if (modes[i] == VK_PRESENT_MODE_MAILBOX_KHR) has_mailbox = 1;
+        if (modes[i] == VK_PRESENT_MODE_IMMEDIATE_KHR) has_immediate = 1;
+    }
+    VkPresentModeKHR pm = VK_PRESENT_MODE_FIFO_KHR;
+    const char *pm_name = "FIFO";
+    const char *want_pm = getenv("VF_PRESENT");
+    if (want_pm && !strcmp(want_pm, "immediate") && has_immediate) {
+        pm = VK_PRESENT_MODE_IMMEDIATE_KHR;
+        pm_name = "IMMEDIATE";
+    } else if ((!want_pm || strcmp(want_pm, "fifo")) && has_mailbox) {
+        pm = VK_PRESENT_MODE_MAILBOX_KHR;
+        pm_name = "MAILBOX";
+    } else if (!want_pm && has_immediate) {
+        pm = VK_PRESENT_MODE_IMMEDIATE_KHR;
+        pm_name = "IMMEDIATE";
+    }
 
     VkSwapchainCreateInfoKHR ci = {VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     ci.surface = v->surf;
@@ -380,9 +411,10 @@ static int make_swapchain(vf_view *v) {
     ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ci.preTransform = caps.currentTransform;
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    ci.presentMode = pm;
     ci.clipped = VK_TRUE;
     if (!ok(vkCreateSwapchainKHR(v->dev, &ci, NULL, &v->sc), "swapchain")) return 0;
+    fprintf(stderr, "[view] swapchain: %u образов, режим %s\n", want, pm_name);
 
     v->sc_n = 0;
     vkGetSwapchainImagesKHR(v->dev, v->sc, &v->sc_n, NULL);
