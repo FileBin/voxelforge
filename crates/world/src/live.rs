@@ -6,7 +6,7 @@ use crate::tet::{node_pos, Tet, TetBody};
 use crate::types::Body;
 use crate::vfw::Shape;
 
-pub const MAX_BODIES: usize = 64;
+pub const MAX_BODIES: usize = 512;
 pub const DENSITY: f64 = 420.0;
 pub const MIN_TETS: usize = 20;
 /// Сколько снарядов живёт одновременно; дальше самый старый уходит из мира.

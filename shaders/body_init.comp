@@ -18,6 +18,7 @@ void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= uint(pc.hi.w)) return;
     uint s = slot[i];
-    if (s >= 64u) return;
+    /* Ёмкость буфера тел приходит в pc.lo.w (в этом проходе lo не используется). */
+    if (s >= uint(pc.lo.w)) return;
     b[s] = staged[i];
 }

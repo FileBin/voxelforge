@@ -189,7 +189,10 @@ pub const MAX_CHANGES: usize = 64;
 /// Потолок записей «тет x ячейка» за такт.
 pub const MAX_CELL_TETS: usize = 262144;
 /// Потолок тел в буферах GPU (совпадает с live::MAX_BODIES).
-pub const MAX_BODIES: usize = 64;
+/// Ёмкость буферов под тела. Число ДЕЙСТВУЮЩИХ тел приходит в pc.grid.w и
+/// может быть любым до этой ёмкости: шейдеры уже масштабируются по n, ни
+/// вариантов шейдеров, ни повторных запусков не нужно.
+pub const MAX_BODIES: usize = 512;
 /// Потолок событий раскола в кольце за такт (совпадает с MAX_EVENTS в common.glsl).
 pub const MAX_EVENTS: usize = 128;
 /// Порог энергии раскола, Дж. Финальное слово — у шейдера (pc.lo.w), CPU
@@ -1552,6 +1555,7 @@ impl GpuSim {
         self.bytes_up += (n * BODY_BYTES) as u64;
         let mut push = self.push(0.0, 0);
         push.hi[3] = n as f32;
+        push.lo[3] = MAX_BODIES as f32;
         unsafe {
             check_status(
                 vf_buffer_write(
