@@ -159,6 +159,7 @@ const P_SELECT: usize = 14;
 const P_TETKEY: usize = 15;
 const P_TETSCAN: usize = 16;
 const P_TETFILL: usize = 17;
+const P_TETPAIRS: usize = 18;
 /// Потолок записей «тет x ячейка» за такт.
 pub const MAX_CELL_TETS: usize = 262144;
 /// Потолок пар тетраэдров за такт.
@@ -257,6 +258,8 @@ pub struct GpuSim {
     tetcursor: *mut c_void,
     /// Раскладка: (тело, индекс тета в пуле) по ячейкам.
     cell_tets: *mut c_void,
+    /// Счётчик пар от tet_pairs.
+    pair_count: *mut c_void,
     /// Пары тетраэдров, посчитанные CPU один раз на такт.
     pairs: *mut c_void,
     pub n_pairs: usize,
@@ -316,6 +319,7 @@ impl GpuSim {
         let tetstart = mk((ncells as usize + 1) * 4, true);
         let tetcursor = mk(ncells as usize * 4, false);
         let cell_tets = mk(MAX_CELL_TETS * 8, true);
+        let pair_count = mk(4, true);
         let lcount = mk(n * 4, true);
         let cellcnt = mk(ncells as usize * 4, false);
         let starts = mk((ncells as usize + 1) * 4, false);
@@ -335,7 +339,7 @@ impl GpuSim {
             )
         };
 
-        let names: [(&str, u32); 18] = [
+        let names: [(&str, u32); 19] = [
             ("integrate", 1),
             ("clear", 2),
             ("count", 2),
@@ -354,6 +358,7 @@ impl GpuSim {
             ("tet_key", 4),
             ("tet_scan", 3),
             ("tet_fill", 6),
+            ("tet_pairs", 7),
         ];
         let mut pipes = Vec::new();
         for (nm, nb) in names.iter() {
@@ -399,6 +404,7 @@ impl GpuSim {
             tetstart,
             tetcursor,
             cell_tets,
+            pair_count,
             pairs,
             n_pairs: 0,
             lcount,
@@ -949,6 +955,73 @@ impl GpuSim {
             );
         }
         (starts, cell_tets)
+    }
+
+    /// Пары тетов целиком на устройстве: сетка -> пары. Возвращает их число.
+    pub fn run_tet_pairs(&mut self) -> usize {
+        let zero = vec![0u8; 4];
+        unsafe {
+            check_status(
+                vf_buffer_write(self.ctx, self.pair_count, 0, zero.as_ptr() as *const c_void, 4),
+                "zero_pairs",
+            );
+        }
+        self.run_tet_grid();
+        let g_cells = ((self.ncells as u32) + WG - 1) / WG;
+        let push = self.push(1.0 / 60.0, g_cells);
+        let mut steps = vec![Step {
+            pipe: P_TETPAIRS,
+            bufs: vec![
+                self.bodies[0],
+                self.tets,
+                self.span,
+                self.tetstart,
+                self.cell_tets,
+                self.pairs,
+                self.pair_count,
+            ],
+            push,
+            groups: [g_cells, 1, 1],
+        }];
+        let mut keep: Vec<Vec<*mut c_void>> = steps.iter().map(|s| s.bufs.clone()).collect();
+        let push_keep: Vec<Push> = steps.iter().map(|s| s.push).collect();
+        let mut ds: Vec<VfDispatch> = steps
+            .iter_mut()
+            .enumerate()
+            .map(|(k, s)| VfDispatch {
+                pipeline: self.pipes[s.pipe],
+                buffers: keep[k].as_mut_ptr(),
+                n_buffers: keep[k].len() as u32,
+                push: &push_keep[k] as *const Push as *const c_void,
+                push_bytes: 80,
+                groups: s.groups,
+            })
+            .collect();
+        unsafe {
+            check_status(vf_run(self.ctx, ds.as_mut_ptr(), ds.len() as u32), "run_tet_pairs");
+        }
+        let mut n = [0u32; 1];
+        unsafe {
+            check_status(
+                vf_buffer_read(self.ctx, self.pair_count, 0, n.as_mut_ptr() as *mut c_void, 4),
+                "read_pair_count",
+            );
+        }
+        self.n_pairs = n[0] as usize;
+        self.n_pairs
+    }
+
+    /// Считать пары обратно (для сверки).
+    pub fn read_pairs(&self) -> Vec<[u32; 2]> {
+        let n = self.n_pairs.max(1);
+        let mut out = vec![[0u32; 2]; n];
+        unsafe {
+            check_status(
+                vf_buffer_read(self.ctx, self.pairs, 0, out.as_mut_ptr() as *mut c_void, n * 8),
+                "read_pairs",
+            );
+        }
+        out
     }
 
     /// Прогнать только SAT-проход (для сверки с CPU).

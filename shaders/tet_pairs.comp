@@ -1,0 +1,84 @@
+#version 450
+#include "common.glsl"
+
+/* Пары тетов по сетке — так же, как их строит CPU: один вызов на ЯЧЕЙКУ,
+ * внутри пары записей этой ячейки. Дедуп: пару испускаем только в ячейке
+ * минимального угла ПЕРЕСЕЧЕНИЯ AABB пары, поэтому тет, лежащий в нескольких
+ * клетках, не даёт дубликатов.
+ */
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) buffer Bodies { Body b[]; };
+layout(std430, set = 0, binding = 1) buffer Pool { vec4 tets[]; };
+layout(std430, set = 0, binding = 2) buffer Span { uvec2 span[]; };
+layout(std430, set = 0, binding = 3) buffer Starts { uint start[]; };
+layout(std430, set = 0, binding = 4) buffer CellTets { uvec2 cell_tets[]; };
+layout(std430, set = 0, binding = 5) buffer Pairs { uvec2 pairs[]; };
+layout(std430, set = 0, binding = 6) buffer PairCount { uint pcnt[]; };
+
+const uint MAX_PAIRS = 262144u;
+
+vec3 qrot(vec4 q, vec3 v) {
+    vec3 u = q.yzw;
+    float w = q.x;
+    vec3 t = 2.0 * cross(u, v);
+    return v + w * t + cross(u, t);
+}
+
+void aabb(uint body, uint tet_in_body, out vec3 lo, out vec3 hi, out bool ok) {
+    ok = false;
+    Body x = b[body];
+    if (tet_in_body >= span[body].y) return;
+    uint idx = (span[body].x + tet_in_body) * 4u;
+    vec3 v0 = qrot(x.quat, tets[idx + 0u].xyz) + x.pos_r.xyz;
+    vec3 v1 = qrot(x.quat, tets[idx + 1u].xyz) + x.pos_r.xyz;
+    vec3 v2 = qrot(x.quat, tets[idx + 2u].xyz) + x.pos_r.xyz;
+    vec3 v3 = qrot(x.quat, tets[idx + 3u].xyz) + x.pos_r.xyz;
+    lo = min(min(v0, v1), min(v2, v3));
+    hi = max(max(v0, v1), max(v2, v3));
+    ok = true;
+}
+
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    uint nc = uint(pc.grid.x * pc.grid.y * pc.grid.z);
+    if (c >= nc) return;
+
+    uint s = start[c];
+    uint e = start[c + 1u];
+    if (e - s < 2u) return;
+
+    ivec3 dims = pc.grid.xyz;
+    float cell = pc.prm1.w;
+    vec3 lo_box = pc.lo.xyz;
+
+    for (uint i = s; i < e; i++) {
+        uvec2 A = cell_tets[i];
+        for (uint j = i + 1u; j < e; j++) {
+            uvec2 B = cell_tets[j];
+            if (A.x == B.x) continue;
+
+            /* A хранит (тело, индекс тета в пуле) — переводим в индекс внутри тела */
+            uint ta = A.y - span[A.x].x;
+            uint tb = B.y - span[B.x].x;
+
+            vec3 alo, ahi, blo, bhi;
+            bool oka, okb;
+            aabb(A.x, ta, alo, ahi, oka);
+            aabb(B.x, tb, blo, bhi, okb);
+            if (!oka || !okb) continue;
+
+            vec3 ilo = max(alo, blo);
+            vec3 ihi = min(ahi, bhi);
+            if (any(greaterThan(ilo, ihi))) continue; /* AABB не пересекаются */
+
+            /* дедуп: испускаем только в ячейке минимального угла пересечения */
+            ivec3 ci = clamp(ivec3(floor((ilo - lo_box) / cell)), ivec3(0), dims - ivec3(1));
+            int canon = (ci.z * dims.y + ci.y) * dims.x + ci.x;
+            if (uint(canon) != c) continue;
+
+            uint k = atomicAdd(pcnt[0], 1u);
+            if (k >= MAX_PAIRS) continue;
+            pairs[k] = uvec2((A.x << 20) | ta, (B.x << 20) | tb);
+        }
+    }
+}
