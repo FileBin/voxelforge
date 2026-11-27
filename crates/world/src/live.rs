@@ -132,6 +132,9 @@ pub struct Live {
     /// Контакты считает GPU (VF_COLLIDE=gpu). Пока сверка SAT не сошлась с
     /// CPU, по умолчанию выключено: включается флагом окружения.
     pub gpu_collide: bool,
+    /// Пары тетов строит устройство (VF_PAIRS=gpu): тогда из кадра уходит и
+    /// заливка пар, и чтение позиций тел.
+    pub gpu_pairs: bool,
     /// Геометрия изменилась (спавн/раскол/сброс) — нужно перезалить пул.
     geom_dirty: bool,
     /// Пробуждение по контакту на CPU — только для пути, где коллизию
@@ -216,6 +219,7 @@ impl Live {
             frames: 0,
             bullets: std::collections::VecDeque::new(),
             gpu_collide: std::env::var("VF_COLLIDE").map(|v| v == "gpu").unwrap_or(false),
+            gpu_pairs: std::env::var("VF_PAIRS").map(|v| v == "gpu").unwrap_or(false),
             geom_dirty: true,
             wake_on_contact: true,
             fracture_enabled: true,
@@ -321,12 +325,6 @@ impl Live {
     /// Такт полностью на GPU: CPU один раз строит пары и заливает их, дальше
     /// всё считает устройство, а тела читаются один раз в конце.
     fn step_gpu(&mut self, dt: f32, substeps: u32, iterations: u32) {
-        let shapes: Vec<Vec<[[f32; 3]; 4]>> = self.bodies.iter().map(|b| b.rotated_tets()).collect();
-        let pos: Vec<[f32; 3]> = self
-            .mirror
-            .iter()
-            .map(|b| [b.pos_r[0], b.pos_r[1], b.pos_r[2]])
-            .collect();
         // растягиваем AABB на путь за такт: иначе быстрый снаряд проскакивает
         let inflate: Vec<[f32; 3]> = self
             .bodies
@@ -340,19 +338,46 @@ impl Live {
                 ]
             })
             .collect();
-        let pairs = collide::build_pairs_swept(
-            &shapes,
-            &pos,
-            (self.params.lo, self.params.hi),
-            self.params.cell * 0.5,
-            &inflate,
-        );
-        let packed: Vec<(u32, u32)> = pairs
-            .iter()
-            .take(crate::sim::MAX_PAIRS)
-            .map(|(b1, t1, b2, t2)| ((b1 << 20) | t1, (b2 << 20) | t2))
-            .collect();
-        self.gpu.set_pairs(&packed);
+        if self.gpu_pairs {
+            /* Пары рождаются на устройстве: сетка тетов + испускание пар.
+             * На CPU приходит только их число (4 байта) — позиции тел в кадре
+             * больше не читаются. */
+            self.gpu.run_tet_pairs();
+        } else {
+            let shapes: Vec<Vec<[[f32; 3]; 4]>> =
+                self.bodies.iter().map(|b| b.rotated_tets()).collect();
+            let pos: Vec<[f32; 3]> = self
+                .mirror
+                .iter()
+                .map(|b| [b.pos_r[0], b.pos_r[1], b.pos_r[2]])
+                .collect();
+            // растягиваем AABB на путь за такт: иначе быстрый снаряд проскакивает
+            let inflate: Vec<[f32; 3]> = self
+                .bodies
+                .iter()
+                .map(|b| {
+                    let r = (dt.abs() * 0.5) as f64;
+                    [
+                        (b.vel[0].abs() * r) as f32,
+                        (b.vel[1].abs() * r) as f32,
+                        (b.vel[2].abs() * r) as f32,
+                    ]
+                })
+                .collect();
+            let pairs = collide::build_pairs_swept(
+                &shapes,
+                &pos,
+                (self.params.lo, self.params.hi),
+                self.params.cell * 0.5,
+                &inflate,
+            );
+            let packed: Vec<(u32, u32)> = pairs
+                .iter()
+                .take(crate::sim::MAX_PAIRS)
+                .map(|(b1, t1, b2, t2)| ((b1 << 20) | t1, (b2 << 20) | t2))
+                .collect();
+            self.gpu.set_pairs(&packed);
+        }
         if self.geom_dirty {
             let local: Vec<Vec<[[f32; 3]; 4]>> = self.bodies.iter().map(|b| b.local_tets().clone()).collect();
             self.gpu.upload_geometry(&local);

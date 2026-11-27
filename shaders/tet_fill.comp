@@ -34,7 +34,8 @@ void main() {
     if (cnt == 0u) return;
     uint base = span[body].x;
 
-    float cell = pc.prm1.w;
+    /* та же клетка, что строит CPU: params.cell * 0.5 */
+    float cell = pc.prm1.w * 0.5;
     vec3 lo_box = pc.lo.xyz;
 
     for (uint t = 0u; t < cnt; t++) {

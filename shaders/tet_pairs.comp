@@ -48,7 +48,8 @@ void main() {
     if (e - s < 2u) return;
 
     ivec3 dims = pc.grid.xyz;
-    float cell = pc.prm1.w;
+    /* та же клетка, что строит CPU: params.cell * 0.5 */
+    float cell = pc.prm1.w * 0.5;
     vec3 lo_box = pc.lo.xyz;
 
     for (uint i = s; i < e; i++) {
