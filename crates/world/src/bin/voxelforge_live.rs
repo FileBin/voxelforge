@@ -312,11 +312,12 @@ fn snap_of(live: &Live, prev: &[([f64; 3], [f64; 4])]) -> Vec<BSnap> {
 }
 
 impl Sim {
-    fn direct(live: Live, lines_on: bool, sleep_on: bool, fracture_on: bool) -> Self {
+    fn direct(live: Live, lines_on: bool, sleep_on: bool, fracture_on: bool, wake_on_contact: bool) -> Self {
         let mut live = live;
         live.lines_on = lines_on;
         live.set_sleep(sleep_on);
         live.set_fracture(fracture_on);
+        live.set_wake_on_contact(wake_on_contact);
         Sim::Direct(Box::new(live))
     }
 
@@ -326,6 +327,7 @@ impl Sim {
         lines_on: bool,
         sleep_on: bool,
         fracture_on: bool,
+        wake_on_contact: bool,
         substeps: u32,
         iterations: u32,
     ) -> Result<Self, String> {
@@ -350,6 +352,8 @@ impl Sim {
             live.lines_on = lines_on;
             live.set_sleep(sleep_on);
             live.set_fracture(fracture_on);
+            live.set_wake_on_contact(wake_on_contact);
+        live.set_wake_on_contact(wake_on_contact);
             let start = std::time::Instant::now();
             let mut last = std::time::Instant::now();
             let mut acc = 0.0f32;
@@ -526,6 +530,7 @@ fn main() {
     // Раскол включён по умолчанию; --no-fracture выключает его для отладки
     // столкновений: с цельной целью видно, останавливает ли контакт снаряд.
     let mut fracture_on = true;
+    let mut wake_on_contact = true;
     // Подшаги и итерации солвера: раньше были жёстко 10 и 18, и на кучу это
     // ложилось тяжело (6 подпроходов x 18 итераций на такт).
     let mut substeps_arg: u32 = 10;
@@ -540,6 +545,7 @@ fn main() {
             "--tick" => tick_arg = it.next().and_then(|v| v.parse::<f32>().ok()),
             "--no-sleep" => sleep_on = false,
             "--no-fracture" => fracture_on = false,
+            "--no-wake" => wake_on_contact = false,
             "--substeps" => substeps_arg = it.next().and_then(|v| v.parse().ok()).unwrap_or(10),
             "--iterations" => iterations_arg = it.next().and_then(|v| v.parse().ok()).unwrap_or(18),
             "--tets" => tets_at_start = true,
@@ -552,7 +558,7 @@ fn main() {
                     .collect()
             }
             other => {
-                eprintln!("неизвестный аргумент {other}\n  --shaders DIR --frames N --shots 10,40 [--no-sleep] [--no-fracture] [--substeps N] [--iterations N]");
+                eprintln!("неизвестный аргумент {other}\n  --shaders DIR --frames N --shots 10,40 [--no-sleep] [--no-fracture] [--no-wake] [--substeps N] [--iterations N]");
                 std::process::exit(2);
             }
         }
@@ -583,9 +589,9 @@ fn main() {
     // В интерактивном режиме физика уходит в свой поток; в скриптовом
     // (--frames) она остаётся здесь, чтобы прогон был воспроизводимым.
     let mut sim = if max_frames > 0 {
-        Sim::direct(Live::new(&shaders), tets_at_start, sleep_on, fracture_on)
+        Sim::direct(Live::new(&shaders), tets_at_start, sleep_on, fracture_on, wake_on_contact)
     } else {
-        match Sim::threaded(&shaders, tick, tets_at_start, sleep_on, fracture_on, substeps_arg, iterations_arg) {
+        match Sim::threaded(&shaders, tick, tets_at_start, sleep_on, fracture_on, wake_on_contact, substeps_arg, iterations_arg) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("физика не запустилась: {e}");

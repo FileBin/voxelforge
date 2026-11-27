@@ -134,6 +134,10 @@ pub struct Live {
     pub gpu_collide: bool,
     /// Геометрия изменилась (спавн/раскол/сброс) — нужно перезалить пул.
     geom_dirty: bool,
+    /// Пробуждение по контакту на CPU. Если выключено — сон решает только
+    /// GPU, а CPU будит тела пачкой при выстреле. Это убирает дёрганье
+    /// «уснул — разбудили — уснул», из-за которого со сном работало медленнее.
+    pub wake_on_contact: bool,
     /// Раскол включён. В отладке столкновений его выключают: иначе не видно,
     /// останавливает ли контакт снаряд вообще, или он проходит насквозь.
     pub fracture_enabled: bool,
@@ -214,6 +218,7 @@ impl Live {
             bullets: std::collections::VecDeque::new(),
             gpu_collide: std::env::var("VF_COLLIDE").map(|v| v == "gpu").unwrap_or(false),
             geom_dirty: true,
+            wake_on_contact: true,
             fracture_enabled: true,
             sleep_enabled: true,
             bodies: vec![body],
@@ -369,7 +374,9 @@ impl Live {
         // Контакты нужны и геймплею: раскол и пробуждение по контакту решаются
         // на CPU, поэтому читаем их один раз за такт (73 КБ при 64 телах).
         let contacts = self.gpu.read_contacts();
-        self.wake_on_contact(&contacts);
+        if self.wake_on_contact {
+            self.wake_on_contact_pass(&contacts);
+        }
         if self.fracture_enabled {
             self.fracture(&contacts);
         }
@@ -411,7 +418,7 @@ impl Live {
     /// Спит одно тело пары, а другое — нет: будим спящее. Спящая куча сама
     /// себя не будит (все её члены спят), а пуля или ползущий осколок будит
     /// соседа сразу, как только коснулся.
-    fn wake_on_contact(&mut self, contacts: &[Vec<collide::Contact>]) {
+    fn wake_on_contact_pass(&mut self, contacts: &[Vec<collide::Contact>]) {
         let mut woke = false;
         for i in 0..self.bodies.len().min(contacts.len()) {
             for c in &contacts[i] {
@@ -445,6 +452,11 @@ impl Live {
         if woke {
             self.gpu.write_bodies(&self.mirror);
         }
+    }
+
+    /// Включить или выключить контактное пробуждение на CPU.
+    pub fn set_wake_on_contact(&mut self, on: bool) {
+        self.wake_on_contact = on;
     }
 
     /// Включить или выключить раскол.
@@ -565,7 +577,9 @@ impl Live {
         }
         if timing { t_collide += t0.elapsed().as_secs_f64(); }
             let t1 = std::time::Instant::now();
-            self.wake_on_contact(&contacts);
+            if self.wake_on_contact {
+                self.wake_on_contact_pass(&contacts);
+            }
             self.depenetrate(&contacts);
             if timing { t_dep += t1.elapsed().as_secs_f64(); }
             let t2 = std::time::Instant::now();
@@ -1029,6 +1043,14 @@ impl Live {
             self.bodies[slot] = body;
         } else {
             self.bodies.push(body);
+        }
+        if !self.wake_on_contact {
+            // выключено контактное пробуждение — будим всё пачкой на выстрел
+            for i in 0..self.bodies.len() {
+                if self.bodies[i].alive {
+                    self.wake(i);
+                }
+            }
         }
         self.gpu.write_bodies(&self.mirror);
         self.geom_dirty = true;
