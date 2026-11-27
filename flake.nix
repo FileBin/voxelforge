@@ -89,14 +89,54 @@
               out="''${OUT_DIR:-demos/out}"
               mkdir -p "$out"
               if [ -z "''${VK_ICD_FILENAMES:-}" ]; then
-                lvp="$(ls ${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.*.json 2>/dev/null | head -n1)"
-                [ -n "$lvp" ] && export VK_ICD_FILENAMES="$lvp"
+                for lvp in ${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.*.json; do
+                  [ -e "$lvp" ] && export VK_ICD_FILENAMES="$lvp" && break
+                done
               fi
               ${engine}/bin/voxelforge \
                 --shaders ${self.packages.${system}.spirv} \
                 --out "$out/world.vfw" "$@"
               echo ""
               echo "смотреть: nix run .#viewer → перетащить $out/world.vfw"
+            '';
+          };
+
+          # Живое окно под виртуальным композитором (sway headless + lavapipe):
+          # то же, что check `live-headless`, но обычной командой.
+          #   nix run .#headless -- 200 20,60,120
+          headless = pkgs.writeShellApplication {
+            name = "voxelforge-headless";
+            runtimeInputs = [ pkgs.sway-unwrapped pkgs.mesa pkgs.util-linux pkgs.dbus pkgs.coreutils ];
+            text = ''
+              export VF_SHADERS=${self.packages.${system}.spirv}
+              export SWAY_BIN=${pkgs.sway-unwrapped}/bin/sway
+              if [ -z "''${VK_ICD_FILENAMES:-}" ]; then
+                for lvp in ${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.*.json; do
+                  [ -e "$lvp" ] && export VK_ICD_FILENAMES="$lvp" && break
+                done
+              fi
+              exec bash ${./scripts/headless-run.sh} ${self.packages.${system}.live}/bin/voxelforge-live "$@"
+            '';
+          };
+
+          # Разведочные примеры: nix run .#probe -- probe_time
+          probe = pkgs.writeShellApplication {
+            name = "voxelforge-probe";
+            runtimeInputs = [ pkgs.mesa pkgs.vulkan-loader pkgs.coreutils ];
+            text = ''
+              if [ $# -lt 1 ]; then
+                echo "voxelforge-probe <имя> [аргументы], есть:"
+                for f in ${self.packages.${system}.probes}/bin/*; do echo "  $(basename "$f")"; done
+                exit 0
+              fi
+              probe_name="$1"; shift
+              export VF_SHADERS=${self.packages.${system}.spirv}
+              if [ -z "''${VK_ICD_FILENAMES:-}" ]; then
+                for lvp in ${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.*.json; do
+                  [ -e "$lvp" ] && export VK_ICD_FILENAMES="$lvp" && break
+                done
+              fi
+              exec ${self.packages.${system}.probes}/bin/"$probe_name" "$@"
             '';
           };
         in
@@ -106,6 +146,8 @@
           world = { type = "app"; program = "${world}/bin/voxelforge-world"; };
           viewer = { type = "app"; program = "${viewer}/bin/voxelforge-viewer"; };
           live = { type = "app"; program = "${live}/bin/voxelforge-live"; };
+          headless = { type = "app"; program = "${headless}/bin/voxelforge-headless"; };
+          probe = { type = "app"; program = "${probe}/bin/voxelforge-probe"; };
           ref = { type = "app"; program = "${engine}/bin/vf-ref"; };
         });
 
@@ -157,6 +199,34 @@
           nativeBuildInputs = [ pkgs.gcc pkgs.pkg-config ];
           buildInputs = [ pkgs.vulkan-headers pkgs.vulkan-loader pkgs.sdl3 ];
           meta.mainProgram = "voxelforge-live";
+        };
+
+        # Разведочные примеры (probe_time, probe_fastshot, ...) отдельной
+        # сборкой: `nix run .#probe -- probe_time`.
+        probes = pkgs.rustPlatform.buildRustPackage {
+          pname = "voxelforge-probes";
+          version = "0.0.0";
+          src = pkgs.lib.cleanSourceWith {
+            src = ./.;
+            filter = path: type:
+              let base = baseNameOf (toString path);
+              in !(builtins.elem base [ "target" "result" "demos" ".direnv" ]);
+          };
+          cargoLock.lockFile = ./Cargo.lock;
+          cargoBuildFlags = [ "-p" "voxelforge-refsim" "--examples" ];
+          doCheck = false;
+          nativeBuildInputs = [ pkgs.gcc ];
+          buildInputs = [ pkgs.vulkan-headers pkgs.vulkan-loader ];
+          # buildRustPackage складывает только main-бинарь — забираем примеры сами.
+          installPhase = ''
+            mkdir -p $out/bin
+            for f in $(find target -type f -name 'probe_*' ! -name 'probe_*-*' -perm -u+x); do
+              cp "$f" $out/bin/
+            done
+            for f in $(find target -type f -name 'water_probe' -perm -u+x); do
+              cp "$f" $out/bin/
+            done
+          '';
         };
       });
 
