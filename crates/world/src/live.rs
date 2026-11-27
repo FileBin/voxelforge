@@ -547,7 +547,9 @@ impl Live {
             self.depenetrate(&contacts);
             if timing { t_dep += t1.elapsed().as_secs_f64(); }
             let t2 = std::time::Instant::now();
-            self.fracture(&contacts);
+            if self.fracture_enabled {
+                self.fracture(&contacts);
+            }
             if timing { t_frac += t2.elapsed().as_secs_f64(); }
 
             let t3 = std::time::Instant::now();
