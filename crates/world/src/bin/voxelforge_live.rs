@@ -658,6 +658,7 @@ fn main() {
     // интерполирует между двумя последними состояниями симуляции.
     let mut acc = 0.0f32;
 
+    let mut frame_t0 = std::time::Instant::now();
     loop {
         // Реальная дельта кадра: камера должна идти по времени, а не по
         // фиксированному 1/60 — иначе на просевшем FPS она двигается медленнее.
@@ -851,6 +852,23 @@ fn main() {
                 }
             }
             vf_view_end(view);
+        }
+
+        /* С MAILBOX вертикальной синхронизации нет, и цикл без ограничителя
+         * молотит сотни кадров в секунду: GPU забит, такт физики ждёт всю эту
+         * очередь, и картинка проседает рывками. Держим кадр на частоте
+         * экрана; VF_FPS переопределяет. */
+        if max_frames == 0 {
+            let want = std::env::var("VF_FPS")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(60.0)
+                .max(5.0);
+            let target = std::time::Duration::from_secs_f32(1.0 / want);
+            if let Some(rest) = target.checked_sub(frame_t0.elapsed()) {
+                std::thread::sleep(rest);
+            }
+            frame_t0 = std::time::Instant::now();
         }
 
         frames += 1;

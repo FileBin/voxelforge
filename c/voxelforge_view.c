@@ -369,7 +369,11 @@ static int make_swapchain(vf_view *v) {
     /* Минимальное число образов, которое даёт драйвер. Меньше нельзя —
      * Vulkan требует imageCount >= minImageCount. Один образ не создастся,
      * поэтому «не копить кадры» решается режимом показа, а не числом образов. */
-    uint32_t want = caps.minImageCount;
+    uint32_t want = caps.minImageCount + 1;
+    if (getenv("VF_SWAP")) {
+        uint32_t n = (uint32_t)atoi(getenv("VF_SWAP"));
+        if (n >= caps.minImageCount) want = n;
+    }
     if (caps.maxImageCount > 0 && want > caps.maxImageCount) want = caps.maxImageCount;
 
     /* Режим показа: MAILBOX — очередь не копится, показывается самый свежий
