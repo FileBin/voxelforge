@@ -8,6 +8,8 @@ fn main() {
         let p = w.bodies[0].pos;
         w.shoot([p[0] - 4.0, p[1], p[2]], [1.0, 0.0, 0.0], speed);
         for _ in 0..40 { w.step(1.0 / 20.0, 10, 18); }
+        // в такте позы на CPU не читаются — проба просит их явно
+        w.refresh_poses();
         let far = w.bodies.iter().filter(|b| b.alive).map(|b| b.pos[0]).fold(f64::MIN, f64::max);
         println!("скорость {speed:5.0}: тел {:2}, трещин {}, дальше всех x = {far:.2}", w.bodies.iter().filter(|b| b.alive).count(), w.cracks);
         if speed >= 120.0 {
