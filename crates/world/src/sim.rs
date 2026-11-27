@@ -156,6 +156,7 @@ const P_SOLVE_APPLY: usize = 11;
 const P_SAT: usize = 12;
 const P_DEP: usize = 13;
 const P_SELECT: usize = 14;
+const P_TETKEY: usize = 15;
 /// Потолок пар тетраэдров за такт.
 pub const MAX_PAIRS: usize = 262144;
 
@@ -245,6 +246,8 @@ pub struct GpuSim {
     tets: *mut c_void,
     /// На тело: смещение в пуле и число тетраэдров.
     span: *mut c_void,
+    /// Счётчики сетки тетов (host-visible, для раскладки и сверки).
+    tetcnt: *mut c_void,
     /// Пары тетраэдров, посчитанные CPU один раз на такт.
     pairs: *mut c_void,
     pub n_pairs: usize,
@@ -300,6 +303,7 @@ impl GpuSim {
         let tets = mk(MAX_POOL_TETS * 64, true);
         let span = mk(n * 8, true);
         let pairs = mk(MAX_PAIRS * 8, true);
+        let tetcnt = mk(ncells as usize * 4, true);
         let lcount = mk(n * 4, true);
         let cellcnt = mk(ncells as usize * 4, false);
         let starts = mk((ncells as usize + 1) * 4, false);
@@ -319,7 +323,7 @@ impl GpuSim {
             )
         };
 
-        let names: [(&str, u32); 15] = [
+        let names: [(&str, u32); 16] = [
             ("integrate", 1),
             ("clear", 2),
             ("count", 2),
@@ -335,6 +339,7 @@ impl GpuSim {
             ("sat", 6),
             ("depenetrate", 3),
             ("contact_select", 2),
+            ("tet_key", 4),
         ];
         let mut pipes = Vec::new();
         for (nm, nb) in names.iter() {
@@ -376,6 +381,7 @@ impl GpuSim {
             imp,
             tets,
             span,
+            tetcnt,
             pairs,
             n_pairs: 0,
             lcount,
@@ -787,6 +793,51 @@ impl GpuSim {
                 "set_pairs",
             );
         }
+    }
+
+    /// Подсчёт тетов по ячейкам (шаг 1 GPU-broadphase). Возвращает общее
+    /// число записей «тет × ячейка» — столько будет после раскладки.
+    pub fn run_tet_count(&mut self) -> usize {
+        let zero = vec![0u8; self.ncells as usize * 4];
+        unsafe {
+            check_status(
+                vf_buffer_write(self.ctx, self.tetcnt, 0, zero.as_ptr() as *const c_void, zero.len()),
+                "zero_cells",
+            );
+        }
+        let g_body = ((self.n as u32) + WG - 1) / WG;
+        let push = self.push(1.0 / 60.0, g_body);
+        let mut steps = vec![Step {
+            pipe: P_TETKEY,
+            bufs: vec![self.bodies[0], self.tets, self.span, self.tetcnt],
+            push,
+            groups: [g_body, 1, 1],
+        }];
+        let mut keep: Vec<Vec<*mut c_void>> = steps.iter().map(|s| s.bufs.clone()).collect();
+        let push_keep: Vec<Push> = steps.iter().map(|s| s.push).collect();
+        let mut ds: Vec<VfDispatch> = steps
+            .iter_mut()
+            .enumerate()
+            .map(|(k, s)| VfDispatch {
+                pipeline: self.pipes[s.pipe],
+                buffers: keep[k].as_mut_ptr(),
+                n_buffers: keep[k].len() as u32,
+                push: &push_keep[k] as *const Push as *const c_void,
+                push_bytes: 80,
+                groups: s.groups,
+            })
+            .collect();
+        unsafe {
+            check_status(vf_run(self.ctx, ds.as_mut_ptr(), ds.len() as u32), "run_tet_count");
+        }
+        let mut counts = vec![0u32; self.ncells as usize];
+        unsafe {
+            check_status(
+                vf_buffer_read(self.ctx, self.tetcnt, 0, counts.as_mut_ptr() as *mut c_void, counts.len() * 4),
+                "read_cells",
+            );
+        }
+        counts.iter().map(|c| *c as usize).sum()
     }
 
     /// Прогнать только SAT-проход (для сверки с CPU).
