@@ -14,6 +14,7 @@ layout(std430, set = 0, binding = 3) buffer Starts { uint start[]; };
 layout(std430, set = 0, binding = 4) buffer CellTets { uvec2 cell_tets[]; };
 layout(std430, set = 0, binding = 5) buffer Pairs { uvec2 pairs[]; };
 layout(std430, set = 0, binding = 6) buffer PairCount { uint pcnt[]; };
+layout(std430, set = 0, binding = 7) buffer BodyAabb { vec4 baabb[]; };
 
 const uint MAX_PAIRS = 262144u;
 
@@ -57,6 +58,13 @@ void main() {
         for (uint j = i + 1u; j < e; j++) {
             uvec2 B = cell_tets[j];
             if (A.x == B.x) continue;
+
+            /* Префильтр по AABB тел: иначе в пары попадают тела, которые лишь
+             * делят клетку, и SAT считает их вхолостую (у CPU это делал
+             * allow[]). */
+            vec3 alo_p = baabb[A.x * 2u].xyz, ahi_p = baabb[A.x * 2u + 1u].xyz;
+            vec3 blo_p = baabb[B.x * 2u].xyz, bhi_p = baabb[B.x * 2u + 1u].xyz;
+            if (any(greaterThan(alo_p, bhi_p)) || any(greaterThan(blo_p, ahi_p))) continue;
 
             /* A хранит (тело, индекс тета в пуле) — переводим в индекс внутри тела */
             uint ta = A.y - span[A.x].x;

@@ -161,6 +161,7 @@ const P_TETSCAN: usize = 16;
 const P_TETFILL: usize = 17;
 const P_TETPAIRS: usize = 18;
 const P_IMPACT: usize = 19;
+const P_BODYAABB: usize = 20;
 /// Потолок записей «тет x ячейка» за такт.
 pub const MAX_CELL_TETS: usize = 262144;
 /// Потолок тел в буферах GPU (совпадает с live::MAX_BODIES).
@@ -265,6 +266,8 @@ pub struct GpuSim {
     pair_count: *mut c_void,
     /// Энергия самого сильного удара на тело (2 vec4 на тело).
     impact: *mut c_void,
+    /// AABB тел для префильтра пар (2 vec4 на тело).
+    baabb: *mut c_void,
     /// Пары тетраэдров, посчитанные CPU один раз на такт.
     pairs: *mut c_void,
     pub n_pairs: usize,
@@ -326,6 +329,7 @@ impl GpuSim {
         let cell_tets = mk(MAX_CELL_TETS * 8, true);
         let pair_count = mk(4, true);
         let impact = mk(MAX_BODIES * 32, true);
+        let baabb = mk(MAX_BODIES * 32, false);
         let lcount = mk(n * 4, true);
         let cellcnt = mk(ncells as usize * 4, false);
         let starts = mk((ncells as usize + 1) * 4, false);
@@ -345,7 +349,7 @@ impl GpuSim {
             )
         };
 
-        let names: [(&str, u32); 20] = [
+        let names: [(&str, u32); 21] = [
             ("integrate", 1),
             ("clear", 2),
             ("count", 2),
@@ -364,8 +368,9 @@ impl GpuSim {
             ("tet_key", 4),
             ("tet_scan", 3),
             ("tet_fill", 6),
-            ("tet_pairs", 7),
+            ("tet_pairs", 8),
             ("impact", 4),
+            ("body_aabb", 4),
         ];
         let mut pipes = Vec::new();
         for (nm, nb) in names.iter() {
@@ -413,6 +418,7 @@ impl GpuSim {
             cell_tets,
             pair_count,
             impact,
+            baabb,
             pairs,
             n_pairs: 0,
             lcount,
@@ -904,6 +910,12 @@ impl GpuSim {
         let g_cells = ((self.ncells as u32) + WG - 1) / WG;
         let mut steps = vec![
             Step {
+                pipe: P_BODYAABB,
+                bufs: vec![self.bodies[0], self.tets, self.span, self.baabb],
+                push,
+                groups: [g_body, 1, 1],
+            },
+            Step {
                 pipe: P_TETKEY,
                 bufs: vec![self.bodies[0], self.tets, self.span, self.tetcnt],
                 push,
@@ -1007,6 +1019,7 @@ impl GpuSim {
                 self.cell_tets,
                 self.pairs,
                 self.pair_count,
+                self.baabb,
             ],
             push,
             groups: [g_cells, 1, 1],

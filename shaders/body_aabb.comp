@@ -1,0 +1,43 @@
+#version 450
+#include "common.glsl"
+
+/* AABB тела для префильтра пар: один вызов на тело, цикл по его тетам.
+ * Без этого tet_pairs отдаёт пары тел, которые вообще не соприкасаются
+ * (просто делят клетку), и SAT тратит на них время. */
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) buffer Bodies { Body b[]; };
+layout(std430, set = 0, binding = 1) buffer Pool { vec4 tets[]; };
+layout(std430, set = 0, binding = 2) buffer Span { uvec2 span[]; };
+layout(std430, set = 0, binding = 3) buffer Aabb { vec4 aabb[]; };
+
+vec3 qrot(vec4 q, vec3 v) {
+    vec3 u = q.yzw;
+    float w = q.x;
+    vec3 t = 2.0 * cross(u, v);
+    return v + w * t + cross(u, t);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.grid.w)) return;
+
+    Body x = b[i];
+    uint cnt = span[i].y;
+    uint base = span[i].x;
+    vec3 lo = vec3(1e30);
+    vec3 hi = vec3(-1e30);
+    float infl = length(x.vel_m.xyz) * pc.prm0.x;
+
+    for (uint t = 0u; t < cnt; t++) {
+        for (uint v = 0u; v < 4u; v++) {
+            vec3 p = qrot(x.quat, tets[(base + t) * 4u + v].xyz) + x.pos_r.xyz;
+            lo = min(lo, p);
+            hi = max(hi, p);
+        }
+    }
+    if (cnt == 0u) { lo = vec3(0.0); hi = vec3(0.0); }
+    lo -= vec3(infl);
+    hi += vec3(infl);
+    aabb[i * 2u] = vec4(lo, 0.0);
+    aabb[i * 2u + 1u] = vec4(hi, 0.0);
+}
