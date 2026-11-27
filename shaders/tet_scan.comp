@@ -1,0 +1,22 @@
+#version 450
+#include "common.glsl"
+
+/* Префиксные суммы по ячейкам сетки тетов — тем же приёмом, что scan.comp для
+ * сетки тел: один поток, линейный проход. Сетка плотная (112x72x112), но
+ * проход копеечный, зато без иерархий и лишних проходов.
+ * Заодно обнуляет курсоры для прохода раскладки. */
+layout(local_size_x = 1) in;
+layout(std430, set = 0, binding = 0) buffer Cells { uint cellcnt[]; };
+layout(std430, set = 0, binding = 1) buffer Starts { uint start[]; };
+layout(std430, set = 0, binding = 2) buffer Cursors { uint cursor[]; };
+
+void main() {
+    uint nc = uint(pc.grid.x * pc.grid.y * pc.grid.z);
+    uint sum = 0u;
+    for (uint i = 0u; i < nc; i++) {
+        start[i] = sum;
+        cursor[i] = 0u;
+        sum += cellcnt[i];
+    }
+    start[nc] = sum;
+}

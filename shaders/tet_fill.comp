@@ -1,0 +1,65 @@
+#version 450
+#include "common.glsl"
+
+/* Раскладка: индексы тетов по ячейкам. Один вызов на тело, внутри цикл по его
+ * тетам — так же, как считается tet_key, чтобы диапазоны ячеек совпадали
+ * бит в бит. */
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) buffer Bodies { Body b[]; };
+layout(std430, set = 0, binding = 1) buffer Pool { vec4 tets[]; };
+layout(std430, set = 0, binding = 2) buffer Span { uvec2 span[]; };
+layout(std430, set = 0, binding = 3) buffer Starts { uint start[]; };
+layout(std430, set = 0, binding = 4) buffer Cursors { uint cursor[]; };
+layout(std430, set = 0, binding = 5) buffer CellTets { uvec2 cell_tets[]; };
+
+const uint MAX_ENTRIES = 262144u;
+
+vec3 qrot(vec4 q, vec3 v) {
+    vec3 u = q.yzw;
+    float w = q.x;
+    vec3 t = 2.0 * cross(u, v);
+    return v + w * t + cross(u, t);
+}
+
+int cell_index(ivec3 c) {
+    return (c.z * pc.grid.y + c.y) * pc.grid.x + c.x;
+}
+
+void main() {
+    uint body = gl_GlobalInvocationID.x;
+    if (body >= uint(pc.grid.w)) return;
+
+    Body x = b[body];
+    uint cnt = span[body].y;
+    if (cnt == 0u) return;
+    uint base = span[body].x;
+
+    float cell = pc.prm1.w;
+    vec3 lo_box = pc.lo.xyz;
+
+    for (uint t = 0u; t < cnt; t++) {
+        vec3 v0 = qrot(x.quat, tets[(base + t) * 4u + 0u].xyz) + x.pos_r.xyz;
+        vec3 v1 = qrot(x.quat, tets[(base + t) * 4u + 1u].xyz) + x.pos_r.xyz;
+        vec3 v2 = qrot(x.quat, tets[(base + t) * 4u + 2u].xyz) + x.pos_r.xyz;
+        vec3 v3 = qrot(x.quat, tets[(base + t) * 4u + 3u].xyz) + x.pos_r.xyz;
+
+        vec3 tlo = min(min(v0, v1), min(v2, v3));
+        vec3 thi = max(max(v0, v1), max(v2, v3));
+
+        ivec3 a = ivec3(floor((tlo - lo_box) / cell));
+        ivec3 c = ivec3(floor((thi - lo_box) / cell));
+        a = clamp(a, ivec3(0), pc.grid.xyz - ivec3(1));
+        c = clamp(c, ivec3(0), pc.grid.xyz - ivec3(1));
+
+        for (int z = a.z; z <= c.z; z++) {
+            for (int y = a.y; y <= c.y; y++) {
+                for (int xx = a.x; xx <= c.x; xx++) {
+                    int ci = cell_index(ivec3(xx, y, z));
+                    uint slot = atomicAdd(cursor[ci], 1u);
+                    uint at = start[ci] + slot;
+                    if (at < MAX_ENTRIES) cell_tets[at] = uvec2(body, base + t);
+                }
+            }
+        }
+    }
+}
