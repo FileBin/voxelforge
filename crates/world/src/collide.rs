@@ -305,17 +305,15 @@ pub fn build_pairs_swept(
     cell: f32,
     inflate: &[[f32; 3]],
 ) -> Vec<(u32, u32, u32, u32)> {
-    let pad = 2.0 * cell;
-    let origin = [walls.0[0] - pad, walls.0[1] - pad, walls.0[2] - pad];
-    let extent = [
-        (walls.1[0] - walls.0[0] + 2.0 * pad).max(cell),
-        (walls.1[1] - walls.0[1] + 2.0 * pad).max(cell),
-        (walls.1[2] - walls.0[2] + 2.0 * pad).max(cell),
-    ];
+    /* Сетка ДОЛЖНА совпадать с той, что считают шейдеры (tet_key/tet_pairs):
+     * начало — угол ящика (без запаса), размеры — ceil((hi-lo)/cell).
+     * Раньше здесь был запас 2 клетки, и номера ячеек расходились с GPU,
+     * из-за чего наборы пар не совпадали (310 против 3366). */
+    let origin = walls.0;
     let dim = [
-        ((extent[0] / cell).ceil() as i32 + 1).max(1),
-        ((extent[1] / cell).ceil() as i32 + 1).max(1),
-        ((extent[2] / cell).ceil() as i32 + 1).max(1),
+        (((walls.1[0] - walls.0[0]) / cell).ceil() as i32).max(1),
+        (((walls.1[1] - walls.0[1]) / cell).ceil() as i32).max(1),
+        (((walls.1[2] - walls.0[2]) / cell).ceil() as i32).max(1),
     ];
     let n_cells = (dim[0] * dim[1] * dim[2]) as usize;
     let cell_of = |p: [f32; 3]| -> [i32; 3] {
