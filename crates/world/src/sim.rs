@@ -26,6 +26,11 @@ pub struct VfDispatch {
 
 unsafe extern "C" {
     pub fn vf_init(out: *mut *mut c_void) -> VfStatus;
+    /// Ядро само включает surface-расширения, какие есть в драйвере, и
+    /// создаёт девайс с графикой и swapchain — под окно.
+    pub fn vf_init_for_window(out: *mut *mut c_void) -> VfStatus;
+    pub fn vf_buffer_handle(b: *mut c_void) -> *mut c_void;
+    pub fn vf_idle(c: *mut c_void) -> VfStatus;
     pub fn vf_shutdown(c: *mut c_void);
     pub fn vf_device_info(c: *mut c_void, name: *mut c_char, len: usize, api: *mut u32) -> VfStatus;
     pub fn vf_buffer_new(c: *mut c_void, bytes: usize, host: i32, out: *mut *mut c_void) -> VfStatus;
@@ -55,6 +60,9 @@ unsafe extern "C" {
     ) -> VfStatus;
     pub fn vf_pipeline_free(c: *mut c_void, p: *mut c_void);
     pub fn vf_run(c: *mut c_void, list: *mut VfDispatch, count: u32) -> VfStatus;
+    /// Отправить такт и не ждать: результат читается на следующем.
+    pub fn vf_run_async(c: *mut c_void, list: *mut VfDispatch, count: u32) -> VfStatus;
+    pub fn vf_wait_back(c: *mut c_void, back: u32) -> VfStatus;
 }
 
 pub fn check_status(s: VfStatus, what: &str) {
@@ -64,7 +72,7 @@ pub fn check_status(s: VfStatus, what: &str) {
     }
 }
 
-/// Раскладка должна совпадать с `Body` в shaders/common.glsl — 112 байт.
+/// Раскладка должна совпадать с `Body` в shaders/common.glsl — 144 байта.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
 pub struct GpuBody {
@@ -78,6 +86,9 @@ pub struct GpuBody {
     pub anchor: [f32; 4],
     /// Полуразмеры и код формы: 0 — сфера, 1 — коробка.
     pub half_shape: [f32; 4],
+    /// Поза на начало такта — от неё рендер интерполирует между кадрами.
+    pub prev_pos_r: [f32; 4],
+    pub prev_quat: [f32; 4],
 }
 
 impl GpuBody {
@@ -100,6 +111,8 @@ impl GpuBody {
             misc: [0.0, 0.0, im, b.inv_inertia as f32],
             anchor: [b.pos[0] as f32, b.pos[1] as f32, b.pos[2] as f32, 0.0],
             half_shape: [b.half[0] as f32, b.half[1] as f32, b.half[2] as f32, shape],
+            prev_pos_r: [b.pos[0] as f32, b.pos[1] as f32, b.pos[2] as f32, b.radius],
+            prev_quat: [b.rot[0] as f32, b.rot[1] as f32, b.rot[2] as f32, b.rot[3] as f32],
         }
     }
 }
@@ -162,10 +175,17 @@ const P_TETFILL: usize = 17;
 const P_TETPAIRS: usize = 18;
 const P_IMPACT: usize = 19;
 const P_BODYAABB: usize = 20;
+const P_SNAPSHOT: usize = 21;
+const P_STATS: usize = 22;
 /// Потолок записей «тет x ячейка» за такт.
 pub const MAX_CELL_TETS: usize = 262144;
 /// Потолок тел в буферах GPU (совпадает с live::MAX_BODIES).
 pub const MAX_BODIES: usize = 64;
+/// Потолок событий раскола в кольце за такт (совпадает с MAX_EVENTS в common.glsl).
+pub const MAX_EVENTS: usize = 128;
+/// Порог энергии раскола, Дж. Финальное слово — у шейдера (pc.lo.w), CPU
+/// страхует только на всякий случай.
+pub const FRACTURE_ENERGY: f32 = 500.0;
 /// Потолок пар тетраэдров за такт.
 pub const MAX_PAIRS: usize = 65536;
 
@@ -173,7 +193,7 @@ pub const MAX_PAIRS: usize = 65536;
 /// просто не попадала в список. Память: 64 тела x 64 контакта x 48 Б ≈ 200 КБ.
 pub const CAP: usize = 64;
 /// Body = 5 × vec4.
-pub const BODY_BYTES: usize = 112;
+pub const BODY_BYTES: usize = 144;
 const WG: u32 = 64;
 pub const BODY_WG: u32 = 64;
 
@@ -266,6 +286,13 @@ pub struct GpuSim {
     pair_count: *mut c_void,
     /// Энергия самого сильного удара на тело (2 vec4 на тело).
     impact: *mut c_void,
+    /// Кольцо событий раскола (3 vec4 на событие) и его счётчик — CPU
+    /// читает 4 Б и только при изменении сами события.
+    impact_ring: *mut c_void,
+    impact_cnt: *mut c_void,
+    /// (uvec2): x — максимум |v| битами, y — сколько тел бодрствует. 8 байт
+    /// за такт вместо чтения всех тел обратно.
+    stat: *mut c_void,
     /// AABB тел для префильтра пар (2 vec4 на тело).
     baabb: *mut c_void,
     /// Пары и их число известны только устройству (SAT берёт число из буфера).
@@ -282,14 +309,41 @@ pub struct GpuSim {
 }
 
 impl GpuSim {
-    pub fn new(
+    /// Девайс ядра наружу: окно рендерит на нём же, иначе буфер тел
+    /// физически недоступен графике (шаг 0 — один общий девайс).
+    pub fn ctx(&self) -> *mut c_void {
+        self.ctx
+    }
+
+    /// Буфер тел (`bodies[0]`) как VkBuffer: из него шейдер окна читает позу,
+    /// поэтому CPU не присылает матрицы и не гоняет тела обратно.
+    pub fn body_buffer(&self) -> *mut c_void {
+        unsafe { vf_buffer_handle(self.bodies[0]) }
+    }
+
+    /// Мир без окна: девайс только под compute (тесты, демки, headless).
+    pub fn new(bodies: Vec<GpuBody>, shader_dir: &Path, params: Params) -> Self {
+        Self::create(bodies, shader_dir, params, false)
+    }
+
+    /// Мир с окном: instance сразу с surface-расширениями, девайс — с
+    /// графической очередью и swapchain. Окно потом работает на нём же.
+    pub fn new_windowed(bodies: Vec<GpuBody>, shader_dir: &Path, params: Params) -> Self {
+        Self::create(bodies, shader_dir, params, true)
+    }
+
+    fn create(
         mut bodies: Vec<GpuBody>,
         shader_dir: &Path,
         params: Params,
+        windowed: bool,
     ) -> Self {
         let n = bodies.len();
         let mut ctx: *mut c_void = std::ptr::null_mut();
-        unsafe { check_status(vf_init(&mut ctx), "vf_init") };
+        unsafe {
+            let st = if windowed { vf_init_for_window(&mut ctx) } else { vf_init(&mut ctx) };
+            check_status(st, "vf_init");
+        };
 
         let mut namebuf = [0i8; 256];
         let mut api = 0u32;
@@ -331,6 +385,9 @@ impl GpuSim {
         let cell_tets = mk(MAX_CELL_TETS * 8, true);
         let pair_count = mk(4, true);
         let impact = mk(MAX_BODIES * 32, true);
+        let impact_ring = mk(MAX_EVENTS * 3 * 16, true);
+        let impact_cnt = mk(4, true);
+        let stat = mk(8, true);
         let baabb = mk(MAX_BODIES * 32, false);
         let lcount = mk(n * 4, true);
         let cellcnt = mk(ncells as usize * 4, false);
@@ -351,7 +408,7 @@ impl GpuSim {
             )
         };
 
-        let names: [(&str, u32); 21] = [
+        let names: [(&str, u32); 23] = [
             ("integrate", 1),
             ("clear", 2),
             ("count", 2),
@@ -371,8 +428,10 @@ impl GpuSim {
             ("tet_scan", 3),
             ("tet_fill", 6),
             ("tet_pairs", 8),
-            ("impact", 4),
+            ("impact", 6),
             ("body_aabb", 4),
+            ("snapshot", 1),
+            ("stats", 2),
         ];
         let mut pipes = Vec::new();
         for (nm, nb) in names.iter() {
@@ -420,6 +479,9 @@ impl GpuSim {
             cell_tets,
             pair_count,
             impact,
+            impact_ring,
+            impact_cnt,
+            stat,
             baabb,
             pairs_on_gpu: false,
             pairs,
@@ -440,7 +502,9 @@ impl GpuSim {
             prm0: [h, p.gravity, p.ang_damp, p.friction],
             prm1: [p.beta, p.max_push, p.margin, p.cell],
             grid: [self.dims[0], self.dims[1], self.dims[2], self.n as i32],
-            lo: [p.lo[0], p.lo[1], p.lo[2], 0.0],
+            /* lo.w — порог энергии раскола: отдельного vec4 в push-константах
+             * нет (128 Б — гарантированный минимум), а это поле пустовало. */
+            lo: [p.lo[0], p.lo[1], p.lo[2], FRACTURE_ENERGY],
             hi: [p.hi[0], p.hi[1], p.hi[2], 0.0],
         }
     }
@@ -500,6 +564,35 @@ impl GpuSim {
     /// списком. Раньше контакты пересобирались на каждом подшаге, и куча
     /// вела себя иначе, чем на CPU при том же числе подшагов.
     pub fn frame_gpu_contacts(&mut self, dt: f32, chunks: u32, per: u32, iterations: u32) {
+        self.frame_gpu_contacts_impl(dt, chunks, per, iterations, false)
+    }
+
+    /// Такт без ожидания: CPU отправляет и идёт дальше, а статистику и
+    /// события читает на СЛЕДУЮЩЕМ такте (см. `wait_prev`).
+    pub fn frame_gpu_contacts_async(&mut self, dt: f32, chunks: u32, per: u32, iterations: u32) {
+        self.frame_gpu_contacts_impl(dt, chunks, per, iterations, true)
+    }
+
+    /// Дождаться последнего отправленного такта: перед любой записью тел с
+    /// CPU (спавн, раскол, сброс) — иначе побежим по буферу, который считает GPU.
+    pub fn wait_idle(&mut self) {
+        unsafe { check_status(vf_wait_back(self.ctx, 0), "vf_wait_back") };
+    }
+
+    /// Дождаться такта, отправленного предыдущим (к этому моменту он обычно
+    /// уже закрыт — физика идёт раз в 50 мс).
+    pub fn wait_prev(&mut self) {
+        unsafe { check_status(vf_wait_back(self.ctx, 1), "vf_wait_back") };
+    }
+
+    fn frame_gpu_contacts_impl(
+        &mut self,
+        dt: f32,
+        chunks: u32,
+        per: u32,
+        iterations: u32,
+        async_submit: bool,
+    ) {
         let total = chunks.max(1) * per.max(1);
         let h = dt / total as f32;
         let g_body = ((self.n as u32) + WG - 1) / WG;
@@ -516,11 +609,31 @@ impl GpuSim {
                     vf_buffer_write(self.ctx, self.impact, 0, zero.as_ptr() as *const c_void, zero.len()),
                     "zero_impact",
                 );
+                /* счётчик событий — 4 байта вместо прежних 2 КБ на такт */
+                vf_buffer_write(self.ctx, self.impact_cnt, 0, [0u8; 4].as_ptr() as *const c_void, 4);
+                /* статистика такта: 8 Б на запись и 8 Б на чтение */
+                vf_buffer_write(self.ctx, self.stat, 0, [0u8; 8].as_ptr() as *const c_void, 8);
             }
         }
 
         let mut steps: Vec<Step> = Vec::new();
         let (a, b) = (self.bodies[0], self.bodies[1]);
+
+        /* Поза на начало такта: рендер интерполирует от неё, а не от снимка,
+         * который CPU раньше читал обратно каждые 50 мс. */
+        steps.push(Step {
+            pipe: P_SNAPSHOT,
+            bufs: vec![a],
+            push,
+            groups: [g_body, 1, 1],
+        });
+        /* Максимум скорости и число бодрствующих — для CPU вместо чтения тел. */
+        steps.push(Step {
+            pipe: P_STATS,
+            bufs: vec![a, self.stat],
+            push,
+            groups: [g_body, 1, 1],
+        });
 
         for chunk in 0..chunks {
             // контакты — раз на кусок
@@ -552,7 +665,7 @@ impl GpuSim {
              * куске и копит максимум (снаряд долетает не в первом). */
             steps.push(Step {
                 pipe: P_IMPACT,
-                bufs: vec![a, self.list, self.lcount, self.impact],
+                bufs: vec![a, self.list, self.lcount, self.impact, self.impact_ring, self.impact_cnt],
                 push,
                 groups: [g_body, 1, 1],
             });
@@ -619,7 +732,12 @@ impl GpuSim {
             })
             .collect();
         unsafe {
-            check_status(vf_run(self.ctx, ds.as_mut_ptr(), ds.len() as u32), "frame_gpu_contacts");
+            let st = if async_submit {
+                vf_run_async(self.ctx, ds.as_mut_ptr(), ds.len() as u32)
+            } else {
+                vf_run(self.ctx, ds.as_mut_ptr(), ds.len() as u32)
+            };
+            check_status(st, if async_submit { "vf_run_async" } else { "frame_gpu_contacts" });
         }
     }
 
@@ -1117,7 +1235,38 @@ impl GpuSim {
         out
     }
 
+    /// События раскола из кольца: читаем счётчик 4 Б и, только если он
+    /// изменился, сами события (48 Б на событие). В спокойной сцене из такта
+    /// уходит 4 байта вместо 2 КБ.
+    /// События раскола, накопленные тактом: счётчик 4 Б, и только если он
+    /// ненулевой — сами события (48 Б на событие). Счётчик обнуляется в начале
+    /// каждого такта, поэтому «сколько уже видел» хранить не нужно.
+    pub fn read_impact_events(&mut self) -> Vec<[f32; 12]> {
+        let mut cnt = [0u32; 1];
+        unsafe {
+            check_status(
+                vf_buffer_read(self.ctx, self.impact_cnt, 0, cnt.as_mut_ptr() as *mut c_void, 4),
+                "read_impact_count",
+            );
+        }
+        self.bytes_down += 4; /* единственный обмен в спокойном такте */
+        let n = cnt[0].min(MAX_EVENTS as u32) as usize;
+        if n == 0 {
+            return Vec::new();
+        }
+        let mut raw = vec![0f32; MAX_EVENTS * 12];
+        unsafe {
+            check_status(
+                vf_buffer_read(self.ctx, self.impact_ring, 0, raw.as_mut_ptr() as *mut c_void, raw.len() * 4),
+                "read_impact_ring",
+            );
+        }
+        self.bytes_down += (n * 48) as u64;
+        raw.chunks(12).take(n).map(|c| std::array::from_fn(|k| c[k])).collect()
+    }
+
     /// События удара: на тело — (энергия, партнёр, нормаль, точка).
+    /// Оставлено для сверок; в такте не используется.
     pub fn read_impact(&self) -> Vec<[f32; 8]> {
         let mut raw = vec![0f32; MAX_BODIES * 8];
         unsafe {
@@ -1257,6 +1406,43 @@ impl GpuSim {
         };
     }
 
+    /// Две цифры такта (8 Б): максимум |v| и число бодрствующих тел.
+    /// Заменяет чтение всех тел, когда позы CPU не нужны.
+    pub fn read_stats(&mut self) -> (f32, u32) {
+        let mut raw = [0u32; 2];
+        self.bytes_down += 8;
+        unsafe {
+            check_status(
+                vf_buffer_read(self.ctx, self.stat, 0, raw.as_mut_ptr() as *mut c_void, 8),
+                "read_stats",
+            );
+        }
+        (f32::from_bits(raw[0]), raw[1])
+    }
+
+    /// Одно тело обратно — только по событию (раскол, включение каркаса),
+    /// а не в такте.
+    pub fn read_body(&mut self, i: usize) -> Option<GpuBody> {
+        if i >= self.n {
+            return None;
+        }
+        let mut out = GpuBody::default();
+        self.bytes_down += BODY_BYTES as u64;
+        unsafe {
+            check_status(
+                vf_buffer_read(
+                    self.ctx,
+                    self.bodies[0],
+                    i * BODY_BYTES,
+                    &mut out as *mut GpuBody as *mut c_void,
+                    BODY_BYTES,
+                ),
+                "read_body",
+            );
+        }
+        Some(out)
+    }
+
     pub fn read_bodies(&mut self) -> Vec<GpuBody> {
         self.bytes_down += (self.n * BODY_BYTES) as u64;
         let mut out = vec![GpuBody::default(); self.n];
@@ -1303,6 +1489,10 @@ impl GpuSim {
 impl Drop for GpuSim {
     fn drop(&mut self) {
         unsafe {
+            /* Такт отправляется асинхронно: сначала дождаться, потом трогать
+             * буферы. Без этого драйвер падал на втором мире в одном процессе
+             * (segfault в probe_fastshot после первого прогона). */
+            check_status(vf_idle(self.ctx), "vf_idle");
             for p in &self.pipes {
                 vf_pipeline_free(self.ctx, *p);
             }
@@ -1315,6 +1505,20 @@ impl Drop for GpuSim {
                 self.starts,
                 self.cursor,
                 self.cbody,
+                self.imp,
+                self.tets,
+                self.span,
+                self.pairs,
+                self.tetcnt,
+                self.tetstart,
+                self.tetcursor,
+                self.cell_tets,
+                self.pair_count,
+                self.impact,
+                self.impact_ring,
+                self.impact_cnt,
+                self.stat,
+                self.baabb,
             ] {
                 vf_buffer_free(self.ctx, b);
             }

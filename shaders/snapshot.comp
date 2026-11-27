@@ -1,0 +1,14 @@
+#version 450
+#include "common.glsl"
+
+/* Начало такта: запомнить позу, от которой рендер будет интерполировать.
+ * Раньше это делал CPU, читая тела обратно в каждом такте. */
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) buffer Bodies { Body b[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.grid.w)) return;
+    b[i].prev_pos_r = b[i].pos_r;
+    b[i].prev_quat = b[i].quat;
+}

@@ -1,0 +1,20 @@
+#version 450
+#include "common.glsl"
+
+/* Две цифры, которые CPU раньше доставал, читая все тела обратно (9 КБ/такт):
+ * максимальную скорость (от неё зависит нарезка такта на куски) и число
+ * бодрствующих тел (решать, шагать ли такт вообще). Обе — 4 байта. */
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) buffer Bodies { Body b[]; };
+layout(std430, set = 0, binding = 1) buffer Stat { uvec2 st[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.grid.w)) return;
+    Body x = b[i];
+    float v = sqrt(dot(x.vel_m.xyz, x.vel_m.xyz));
+    /* Скорость неотрицательна — порядок IEEE-битов совпадает с порядком чисел,
+     * поэтому atomicMax по uint даёт максимум честно. */
+    atomicMax(st[0].x, floatBitsToUint(v));
+    if (x.misc.y <= 0.5) atomicAdd(st[0].y, 1u);
+}

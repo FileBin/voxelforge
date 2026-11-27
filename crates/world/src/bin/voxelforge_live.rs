@@ -45,12 +45,14 @@ struct VfInput {
 }
 
 unsafe extern "C" {
+    /// Окно живёт на девайсе ядра (core: *mut vf_ctx).
     fn vf_view_new(
+        out: *mut *mut c_void,
+        core: *mut c_void,
         w: i32,
         h: i32,
         title: *const c_char,
         shader_dir: *const c_char,
-        out: *mut *mut c_void,
     ) -> VfStatus;
     fn vf_view_free(v: *mut c_void);
     fn vf_view_poll(v: *mut c_void, input: *mut VfInput) -> i32;
@@ -65,7 +67,9 @@ unsafe extern "C" {
     ) -> i32;
     fn vf_view_add_lines(v: *mut c_void, pts: *const f32, n_lines: u32) -> i32;
     fn vf_view_begin(v: *mut c_void, r: f32, g: f32, b: f32);
-    fn vf_view_draw(v: *mut c_void, mesh: i32, model: *const f32, tint: *const f32);
+    fn vf_view_set_bodies(v: *mut c_void, buffer: *mut c_void, count: u32);
+    /// Поза не передаётся: body — номер тела в буфере, alpha — сглаживание.
+    fn vf_view_draw(v: *mut c_void, mesh: i32, body: u32, alpha: f32, tint: *const f32);
     fn vf_view_draw_lines(v: *mut c_void, lines: i32, model: *const f32, tint: *const f32);
     fn vf_view_end(v: *mut c_void);
 }
@@ -217,6 +221,9 @@ struct MeshData {
 }
 
 struct Shared {
+    /// VkBuffer буфера тел, как число: сброс мира создаёт новый буфер, и окну
+    /// нужно перепривязать дескриптор.
+    body_buf: u64,
     bodies: Vec<BSnap>,
     pending: Vec<(u64, MeshData)>,
     tick: f32,
@@ -237,6 +244,7 @@ enum Cmd {
 }
 
 struct SnapOut {
+    body_buf: u64,
     bodies: Vec<BSnap>,
     pending: Vec<(u64, MeshData)>,
     tick: f32,
@@ -321,7 +329,7 @@ impl Sim {
     }
 
     fn threaded(
-        shaders: &std::path::Path,
+        live: Live,
         tick: f32,
         lines_on: bool,
         sleep_on: bool,
@@ -330,6 +338,7 @@ impl Sim {
         iterations: u32,
     ) -> Result<Self, String> {
         let shared = std::sync::Arc::new(std::sync::Mutex::new(Shared {
+            body_buf: 0,
             bodies: Vec::new(),
             pending: Vec::new(),
             tick,
@@ -343,10 +352,11 @@ impl Sim {
             log: String::new(),
         }));
         let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
-        let shaders = shaders.to_path_buf();
         let sh = shared.clone();
         std::thread::spawn(move || {
-            let mut live = Live::new(&shaders);
+            // Мир с его девайсом уже создан в главном потоке и переехал сюда
+            // целиком: девайс один на физику и окно.
+            let mut live = live;
             live.lines_on = lines_on;
             live.set_sleep(sleep_on);
             live.set_fracture(fracture_on);
@@ -366,7 +376,7 @@ impl Sim {
                 let now = std::time::Instant::now();
                 let dt = now.duration_since(last).as_secs_f32().clamp(0.0005, 0.25);
                 last = now;
-                let awake = live.mirror.iter().any(|g| g.misc[1] <= 0.5);
+                let awake = live.awake();
                 let mut fresh: Vec<(u64, MeshData)> = Vec::new();
                 if awake {
                     acc += dt;
@@ -387,6 +397,7 @@ impl Sim {
                         }
                         let bodies = snap_of(&live, &prev);
                         let mut g = sh.lock().unwrap();
+                        g.body_buf = live.gpu.body_buffer() as usize as u64;
                         g.bodies = bodies;
                         g.pending.append(&mut fresh);
                         g.t_pub = start.elapsed().as_secs_f64();
@@ -477,6 +488,7 @@ impl Sim {
                     }
                 }
                 SnapOut {
+                    body_buf: l.gpu.body_buffer() as usize as u64,
                     bodies: snap_of(l, &prev),
                     pending,
                     tick,
@@ -500,6 +512,7 @@ impl Sim {
                     1.0
                 };
                 SnapOut {
+                    body_buf: g.body_buf,
                     bodies: g.bodies.clone(),
                     pending: std::mem::take(&mut g.pending),
                     tick: g.tick,
@@ -562,9 +575,20 @@ fn main() {
     let shaders_c = CString::new(shaders.display().to_string()).unwrap();
     let title = CString::new("voxelforge — WASD полёт, мышь обзор, клик/пробел выстрел").unwrap();
 
+    // Мир (и вместе с ним девайс Vulkan) создаётся ДО окна: окно рендерит на
+    // том же девайсе, иначе буферы тел физически недоступны графике.
+    let live = Live::new_windowed(&shaders);
+    let body_buf0 = live.gpu.body_buffer();
     let mut view: *mut c_void = std::ptr::null_mut();
     unsafe {
-        let st = vf_view_new(1280, 800, title.as_ptr(), shaders_c.as_ptr(), &mut view);
+        let st = vf_view_new(
+            &mut view,
+            live.ctx(),
+            1280,
+            800,
+            title.as_ptr(),
+            shaders_c.as_ptr(),
+        );
         if st.code != 0 {
             eprintln!("окно не открылось: код {} {}", st.code, if st.msg.is_null() {
                 "".into()
@@ -575,6 +599,11 @@ fn main() {
         }
     }
 
+    // Окно читает позы прямо из буфера физики: дескриптор привязывается один
+    // раз, а после сброса мира (R) — заново, потому что буфер новый.
+    unsafe { vf_view_set_bodies(view, body_buf0, voxelforge_world::sim::MAX_BODIES as u32) };
+    let mut seen_body_buf = body_buf0 as usize as u64;
+
     // Такт физики (по умолчанию 20 Гц): рендер интерполирует между тактами.
     let tick_hz: f32 = tick_arg.unwrap_or(20.0).clamp(5.0, 240.0);
     let tick: f32 = 1.0 / tick_hz;
@@ -583,9 +612,9 @@ fn main() {
     // В интерактивном режиме физика уходит в свой поток; в скриптовом
     // (--frames) она остаётся здесь, чтобы прогон был воспроизводимым.
     let mut sim = if max_frames > 0 {
-        Sim::direct(Live::new(&shaders), tets_at_start, sleep_on, fracture_on)
+        Sim::direct(live, tets_at_start, sleep_on, fracture_on)
     } else {
-        match Sim::threaded(&shaders, tick, tets_at_start, sleep_on, fracture_on, substeps_arg, iterations_arg) {
+        match Sim::threaded(live, tick, tets_at_start, sleep_on, fracture_on, substeps_arg, iterations_arg) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("физика не запустилась: {e}");
@@ -724,6 +753,17 @@ fn main() {
         // (или шагнула здесь, если режим скриптовый).
         let out = sim.frame(tick, max_frames > 0, substeps_arg, iterations_arg);
 
+        if out.body_buf != 0 && out.body_buf != seen_body_buf {
+            seen_body_buf = out.body_buf;
+            unsafe {
+                vf_view_set_bodies(
+                    view,
+                    seen_body_buf as usize as *mut c_void,
+                    voxelforge_world::sim::MAX_BODIES as u32,
+                )
+            };
+        }
+
         // новые формы (появились осколки) — залить в окно
         for (id, m) in out.pending.iter() {
             let mesh_id = unsafe {
@@ -780,19 +820,6 @@ fn main() {
                 let Some(&(mesh_id, line_id)) = meshes.get(&b.id) else {
                     continue;
                 };
-                let (rpos, rquat) = if out.alpha < 0.999 {
-                    (
-                        [
-                            b.prev[0] + (b.pos[0] - b.prev[0]) * out.alpha as f64,
-                            b.prev[1] + (b.pos[1] - b.prev[1]) * out.alpha as f64,
-                            b.prev[2] + (b.pos[2] - b.prev[2]) * out.alpha as f64,
-                        ],
-                        slerp(b.prevq, b.quat, out.alpha as f64),
-                    )
-                } else {
-                    (b.pos, b.quat)
-                };
-                let m = model_matrix(rpos, rquat);
                 let tint = match b.kind {
                     2 => [0.95, 0.62, 0.28, 1.0],
                     0 => [0.74, 0.70, 0.62, 1.0],
@@ -802,8 +829,24 @@ fn main() {
                         [k + 0.06, k + 0.035, k, 1.0]
                     }
                 };
-                vf_view_draw(view, mesh_id, m.as_ptr(), tint.as_ptr());
+                /* Меш: позу и сглаживание считает шейдер из буфера тел. */
+                vf_view_draw(view, mesh_id, i as u32, out.alpha, tint.as_ptr());
                 if lines_on && line_id >= 0 {
+                    /* Каркас тетраэдров — отладка: ему по-прежнему нужна
+                     * матрица, её считаем на CPU из того же снимка. */
+                    let (rpos, rquat) = if out.alpha < 0.999 {
+                        (
+                            [
+                                b.prev[0] + (b.pos[0] - b.prev[0]) * out.alpha as f64,
+                                b.prev[1] + (b.pos[1] - b.prev[1]) * out.alpha as f64,
+                                b.prev[2] + (b.pos[2] - b.prev[2]) * out.alpha as f64,
+                            ],
+                            slerp(b.prevq, b.quat, out.alpha as f64),
+                        )
+                    } else {
+                        (b.pos, b.quat)
+                    };
+                    let m = model_matrix(rpos, rquat);
                     vf_view_draw_lines(view, line_id, m.as_ptr(), [0.35, 0.42, 0.5, 0.0].as_ptr());
                 }
             }

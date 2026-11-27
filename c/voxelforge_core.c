@@ -9,12 +9,16 @@
 
 #include "voxelforge_core.h"
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <vulkan/vulkan.h>
 
 #define VF_MAX_BINDINGS 16
+/* Сколько тактов может быть в полёте. 3 — с запасом: CPU успевает прочитать
+ * статистику прошлого такта, пока считаются следующие один-два. */
+#define VF_FRAMES 3
 #define VF_MAX_SETS 8192
 
 #define OK ((vf_status){0, "ok"})
@@ -42,10 +46,17 @@ struct vf_ctx {
     VkQueue queue;
     uint32_t family;
     VkCommandPool pool;
-    VkCommandBuffer cb;
-    VkFence fence;
+    /* Кольцо на VF_FRAMES тактов: CPU отправляет такт и НЕ ждёт его, а
+     * следующее чтение берёт с прошлого такта. Слот переиспользуется, только
+     * когда его fence закрыт. */
+    VkCommandBuffer cb[VF_FRAMES];
+    VkFence fence[VF_FRAMES];
+    uint32_t submitted;
     VkDescriptorPool desc_pool;
     VkPhysicalDeviceMemoryProperties memp;
+    /* Очередь одна и на физику, и на кадр: submit'ы из двух потоков
+     * взаимоисключающие. Fence ждём вне замка. */
+    pthread_mutex_t lock;
     char name[256];
     uint32_t api;
 };
@@ -60,9 +71,34 @@ static uint32_t pick_memory(const vf_ctx *c, uint32_t bits, VkMemoryPropertyFlag
     return UINT32_MAX;
 }
 
-vf_status vf_init(vf_ctx **out) {
+static int has_instance_ext(const char *name) {
+    uint32_t n = 0;
+    vkEnumerateInstanceExtensionProperties(NULL, &n, NULL);
+    VkExtensionProperties *list = calloc(n ? n : 1, sizeof(*list));
+    vkEnumerateInstanceExtensionProperties(NULL, &n, list);
+    int found = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (strcmp(list[i].extensionName, name) == 0) { found = 1; break; }
+    }
+    free(list);
+    return found;
+}
+
+vf_status vf_init(vf_ctx **out) { return vf_init_ext(out, NULL, 0, 0); }
+
+vf_status vf_init_ext(vf_ctx **out, const char **inst_ext, uint32_t n_ext,
+                      int windowed) {
     vf_ctx *c = calloc(1, sizeof(*c));
     if (!c) return ERR(-1, "vmf: нет памяти под контекст");
+    pthread_mutex_init(&c->lock, NULL);
+
+    for (uint32_t i = 0; i < n_ext; i++) {
+        if (!has_instance_ext(inst_ext[i])) {
+            pthread_mutex_destroy(&c->lock);
+            free(c);
+            return ERR(-9, "vulkan: драйвер не умеет нужное окну расширение");
+        }
+    }
 
     VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "voxelforge";
@@ -70,7 +106,10 @@ vf_status vf_init(vf_ctx **out) {
 
     VkInstanceCreateInfo ici = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
+    ici.enabledExtensionCount = n_ext;
+    ici.ppEnabledExtensionNames = n_ext ? inst_ext : NULL;
     if (vkCreateInstance(&ici, NULL, &c->instance) != VK_SUCCESS) {
+        pthread_mutex_destroy(&c->lock);
         free(c);
         return ERR(-2, "vulkan: не удалось создать instance (нет ICD?)");
     }
@@ -85,14 +124,16 @@ vf_status vf_init(vf_ctx **out) {
     VkPhysicalDevice *devs = calloc(n, sizeof(*devs));
     vkEnumeratePhysicalDevices(c->instance, &n, devs);
 
-    /* Первое устройство с очередью compute. */
+    /* Первое устройство с очередью compute (окну — ещё и с графикой). */
+    VkQueueFlags want = VK_QUEUE_COMPUTE_BIT;
+    if (windowed) want |= VK_QUEUE_GRAPHICS_BIT;
     for (uint32_t i = 0; i < n && !c->phys; i++) {
         uint32_t qn = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(devs[i], &qn, NULL);
         VkQueueFamilyProperties *qf = calloc(qn, sizeof(*qf));
         vkGetPhysicalDeviceQueueFamilyProperties(devs[i], &qn, qf);
         for (uint32_t q = 0; q < qn; q++) {
-            if (qf[q].queueFlags & VK_QUEUE_COMPUTE_BIT) {
+            if ((qf[q].queueFlags & want) == want) {
                 c->phys = devs[i];
                 c->family = q;
                 break;
@@ -103,8 +144,9 @@ vf_status vf_init(vf_ctx **out) {
     free(devs);
     if (!c->phys) {
         vkDestroyInstance(c->instance, NULL);
+        pthread_mutex_destroy(&c->lock);
         free(c);
-        return ERR(-4, "vulkan: нет устройства с compute-очередью");
+        return ERR(-4, "vulkan: нет устройства с нужной очередью (compute, окну — плюс graphics)");
     }
 
     VkPhysicalDeviceProperties props;
@@ -126,8 +168,14 @@ vf_status vf_init(vf_ctx **out) {
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
+    const char *dev_ext[1] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    if (windowed) {
+        dci.enabledExtensionCount = 1;
+        dci.ppEnabledExtensionNames = dev_ext;
+    }
     if (vkCreateDevice(c->phys, &dci, NULL, &c->dev) != VK_SUCCESS) {
         vkDestroyInstance(c->instance, NULL);
+        pthread_mutex_destroy(&c->lock);
         free(c);
         return ERR(-5, "vulkan: не удалось создать логическое устройство");
     }
@@ -141,11 +189,11 @@ vf_status vf_init(vf_ctx **out) {
     VkCommandBufferAllocateInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     cbi.commandPool = c->pool;
     cbi.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cbi.commandBufferCount = 1;
-    vkAllocateCommandBuffers(c->dev, &cbi, &c->cb);
+    cbi.commandBufferCount = VF_FRAMES;
+    vkAllocateCommandBuffers(c->dev, &cbi, c->cb);
 
     VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    vkCreateFence(c->dev, &fci, NULL, &c->fence);
+    for (int i = 0; i < VF_FRAMES; i++) vkCreateFence(c->dev, &fci, NULL, &c->fence[i]);
 
     VkDescriptorPoolSize sz = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VF_MAX_SETS * VF_MAX_BINDINGS};
     VkDescriptorPoolCreateInfo dpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -165,12 +213,52 @@ void vf_shutdown(vf_ctx *c) {
     if (!c) return;
     if (c->dev) vkDeviceWaitIdle(c->dev);
     if (c->desc_pool) vkDestroyDescriptorPool(c->dev, c->desc_pool, NULL);
-    if (c->fence) vkDestroyFence(c->dev, c->fence, NULL);
+    for (int i = 0; i < VF_FRAMES; i++) {
+        if (c->fence[i]) vkDestroyFence(c->dev, c->fence[i], NULL);
+    }
     if (c->pool) vkDestroyCommandPool(c->dev, c->pool, NULL);
     if (c->dev) vkDestroyDevice(c->dev, NULL);
     if (c->instance) vkDestroyInstance(c->instance, NULL);
+    pthread_mutex_destroy(&c->lock);
     free(c);
 }
+
+vf_status vf_init_for_window(vf_ctx **out) {
+    /* Окно нуждается в VK_KHR_surface и в расширении своей оконной системы.
+     * Берём те, что реально есть в драйвере: на чистом Wayland нет xcb. */
+    /* Имена строками, а не макросами: макросы оконных расширений требуют
+     * VK_USE_PLATFORM_*_KHR и тянут заголовки Wayland/X11 в ядро. */
+    static const char *want[] = {
+        "VK_KHR_surface",
+        "VK_KHR_wayland_surface",
+        "VK_KHR_xcb_surface",
+        "VK_KHR_xlib_surface",
+    };
+    const char *ext[4];
+    uint32_t n = 0;
+    int surface = 0;
+    for (int i = 0; i < 4; i++) {
+        if (!has_instance_ext(want[i])) continue;
+        if (i == 0) surface = 1;
+        ext[n++] = want[i];
+    }
+    if (!surface) return ERR(-10, "vulkan: нет VK_KHR_surface — окно невозможно");
+    return vf_init_ext(out, ext, n, 1);
+}
+
+vf_status vf_idle(vf_ctx *c) {
+    if (!c || !c->dev) return OK;
+    if (vkDeviceWaitIdle(c->dev) != VK_SUCCESS) return ERR(-11, "vulkan: устройство не затихло");
+    return OK;
+}
+
+void *vf_ctx_instance(vf_ctx *c) { return c->instance; }
+void *vf_ctx_phys(vf_ctx *c) { return c->phys; }
+void *vf_ctx_device(vf_ctx *c) { return c->dev; }
+void *vf_ctx_queue(vf_ctx *c) { return c->queue; }
+uint32_t vf_ctx_family(vf_ctx *c) { return c->family; }
+void vf_ctx_lock(vf_ctx *c) { pthread_mutex_lock(&c->lock); }
+void vf_ctx_unlock(vf_ctx *c) { pthread_mutex_unlock(&c->lock); }
 
 vf_status vf_device_info(vf_ctx *c, char *name, size_t name_len, uint32_t *api_version) {
     if (!c) return ERR(-1, "нет контекста");
@@ -233,6 +321,8 @@ vf_status vf_buffer_new(vf_ctx *c, size_t bytes, int host_visible, vf_buffer **o
     *out = b;
     return OK;
 }
+
+void *vf_buffer_handle(vf_buffer *b) { return b ? b->buf : NULL; }
 
 void vf_buffer_free(vf_ctx *c, vf_buffer *b) {
     if (!b) return;
@@ -338,16 +428,22 @@ void vf_pipeline_free(vf_ctx *c, vf_pipeline *p) {
     free(p);
 }
 
-vf_status vf_run(vf_ctx *c, vf_dispatch *list, uint32_t count) {
-    if (!c) return ERR(-1, "нет контекста");
-    if (count == 0) return OK;
+/* Записать пачку dispatch'ей в слот кольца и отправить. wait_now != 0 —
+ * дождаться ЭТОГО такта (режим тестов: прочитал и сразу проверяй). */
+static vf_status submit(vf_ctx *c, vf_dispatch *list, uint32_t count, int wait_now) {
+    uint32_t slot = c->submitted % VF_FRAMES;
+    if (c->submitted >= VF_FRAMES) {
+        /* Слот занят прошлым тактом — ждём его, а не текущий. */
+        if (vkWaitForFences(c->dev, 1, &c->fence[slot], VK_TRUE, UINT64_MAX) != VK_SUCCESS)
+            return ERR(-8, "vulkan: fence слота не дождались");
+    }
 
     vkResetDescriptorPool(c->dev, c->desc_pool, 0);
-    vkResetCommandBuffer(c->cb, 0);
+    vkResetCommandBuffer(c->cb[slot], 0);
 
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (vkBeginCommandBuffer(c->cb, &bi) != VK_SUCCESS)
+    if (vkBeginCommandBuffer(c->cb[slot], &bi) != VK_SUCCESS)
         return ERR(-2, "vulkan: command buffer не начался");
 
     for (uint32_t d = 0; d < count; d++) {
@@ -380,32 +476,65 @@ vf_status vf_run(vf_ctx *c, vf_dispatch *list, uint32_t count) {
         }
         vkUpdateDescriptorSets(c->dev, dp->n_buffers, writes, 0, NULL);
 
-        vkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, dp->pipeline->pipe);
-        vkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, dp->pipeline->layout,
+        vkCmdBindPipeline(c->cb[slot], VK_PIPELINE_BIND_POINT_COMPUTE, dp->pipeline->pipe);
+        vkCmdBindDescriptorSets(c->cb[slot], VK_PIPELINE_BIND_POINT_COMPUTE, dp->pipeline->layout,
                                 0, 1, &set, 0, NULL);
         if (dp->push_bytes)
-            vkCmdPushConstants(c->cb, dp->pipeline->layout, VK_SHADER_STAGE_COMPUTE_BIT,
+            vkCmdPushConstants(c->cb[slot], dp->pipeline->layout, VK_SHADER_STAGE_COMPUTE_BIT,
                                0, dp->push_bytes, dp->push);
-        vkCmdDispatch(c->cb, dp->groups[0], dp->groups[1], dp->groups[2]);
+        vkCmdDispatch(c->cb[slot], dp->groups[0], dp->groups[1], dp->groups[2]);
 
         /* Шейдерная запись → шейдерное чтение следующего прохода. */
         VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
         mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-        vkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        vkCmdPipelineBarrier(c->cb[slot], VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     }
 
-    if (vkEndCommandBuffer(c->cb) != VK_SUCCESS)
+    if (vkEndCommandBuffer(c->cb[slot]) != VK_SUCCESS)
         return ERR(-6, "vulkan: command buffer не закрылся");
 
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
-    si.pCommandBuffers = &c->cb;
-    vkResetFences(c->dev, 1, &c->fence);
-    if (vkQueueSubmit(c->queue, 1, &si, c->fence) != VK_SUCCESS)
+    si.pCommandBuffers = &c->cb[slot];
+    /* Очередь общая с окном: submit — под замком, ожидание — вне его,
+     * иначе кадр стоит, пока считается такт. */
+    vf_ctx_lock(c);
+    vkResetFences(c->dev, 1, &c->fence[slot]);
+    VkResult sres = vkQueueSubmit(c->queue, 1, &si, c->fence[slot]);
+    vf_ctx_unlock(c);
+    if (sres != VK_SUCCESS)
         return ERR(-7, "vulkan: submit провалился");
-    if (vkWaitForFences(c->dev, 1, &c->fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
+    c->submitted++;
+    if (wait_now) {
+        if (vkWaitForFences(c->dev, 1, &c->fence[slot], VK_TRUE, UINT64_MAX) != VK_SUCCESS)
+            return ERR(-8, "vulkan: fence не дождались");
+    }
+    return OK;
+}
+
+vf_status vf_run(vf_ctx *c, vf_dispatch *list, uint32_t count) {
+    if (!c) return ERR(-1, "нет контекста");
+    if (count == 0) return OK;
+    return submit(c, list, count, 1);
+}
+
+/* Не ждать: результат этого такта читается на следующем (см. vf_wait_back). */
+vf_status vf_run_async(vf_ctx *c, vf_dispatch *list, uint32_t count) {
+    if (!c) return ERR(-1, "нет контекста");
+    if (count == 0) return OK;
+    return submit(c, list, count, 0);
+}
+
+/* Дождаться такта, отправленного `back` submit'ов назад (1 — предыдущий).
+ * К моменту, когда физика просит статистику (такт раз в 50 мс), он обычно
+ * уже закрыт, и ожидание стоит ноль. */
+vf_status vf_wait_back(vf_ctx *c, uint32_t back) {
+    if (!c || c->submitted == 0) return OK;
+    if (back + 1 > c->submitted) back = c->submitted - 1;
+    uint32_t slot = (c->submitted - 1 - back) % VF_FRAMES;
+    if (vkWaitForFences(c->dev, 1, &c->fence[slot], VK_TRUE, UINT64_MAX) != VK_SUCCESS)
         return ERR(-8, "vulkan: fence не дождались");
     return OK;
 }

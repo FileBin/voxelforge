@@ -36,6 +36,34 @@ typedef struct {
 } vf_dispatch;
 
 vf_status vf_init(vf_ctx **out);
+
+/* Ядро владеет девайсом: окно работает на нём же, поэтому буферы тел,
+ * контактов и геометрии видны и compute, и графике. inst_ext — расширения
+ * instance, нужные окну (VK_KHR_surface + wayland/xcb); windowed != 0 просит
+ * семейство очереди с графикой и включает VK_KHR_swapchain. */
+vf_status vf_init_ext(vf_ctx **out, const char **inst_ext, uint32_t n_ext,
+                      int windowed);
+
+/* Для окна: instance с VK_KHR_surface и расширением оконной системы (какие
+ * есть в драйвере), девайс с графикой и swapchain. */
+vf_status vf_init_for_window(vf_ctx **out);
+
+/* Девайс наружу — для окна (шаг 0: один Vulkan-девайс на всё). */
+void *vf_ctx_instance(vf_ctx *c);
+void *vf_ctx_phys(vf_ctx *c);
+void *vf_ctx_device(vf_ctx *c);
+void *vf_ctx_queue(vf_ctx *c);
+uint32_t vf_ctx_family(vf_ctx *c);
+
+/* Очередь одна на всех: submit'ы из разных потоков обязаны быть
+ * взаимоисключающими. Ждать fence нужно ВНЕ замка. */
+/* Дождаться, пока GPU закончит ВСЁ. Обязательно перед освобождением буферов
+ * и девайса: такт отправляется асинхронно и может ещё считаться. */
+vf_status vf_idle(vf_ctx *c);
+
+void vf_ctx_lock(vf_ctx *c);
+void vf_ctx_unlock(vf_ctx *c);
+
 void vf_shutdown(vf_ctx *c);
 vf_status vf_device_info(vf_ctx *c, char *name, size_t name_len,
                          uint32_t *api_version);
@@ -44,6 +72,8 @@ vf_status vf_device_info(vf_ctx *c, char *name, size_t name_len,
 vf_status vf_buffer_new(vf_ctx *c, size_t bytes, int host_visible,
                         vf_buffer **out);
 void vf_buffer_free(vf_ctx *c, vf_buffer *b);
+/* Сам VkBuffer (void*) — окну, чтобы читать буфер тел на том же девайсе. */
+void *vf_buffer_handle(vf_buffer *b);
 vf_status vf_buffer_write(vf_ctx *c, vf_buffer *b, size_t offset,
                           const void *src, size_t bytes);
 vf_status vf_buffer_read(vf_ctx *c, vf_buffer *b, size_t offset, void *dst,
@@ -58,6 +88,11 @@ void vf_pipeline_free(vf_ctx *c, vf_pipeline *p);
  * Между dispatch'ами ставится барьер «запись шейдера → чтение шейдером»,
  * иначе следующий проход читает недописанные данные. */
 vf_status vf_run(vf_ctx *c, vf_dispatch *list, uint32_t count);
+
+/* То же, но без ожидания: такт уходит, CPU идёт дальше. Результат такого
+ * такта читается следующим — после vf_wait_back(c, 1). */
+vf_status vf_run_async(vf_ctx *c, vf_dispatch *list, uint32_t count);
+vf_status vf_wait_back(vf_ctx *c, uint32_t back);
 
 #ifdef __cplusplus
 }

@@ -2,10 +2,9 @@
 #pragma once
 #include <stdint.h>
 
-typedef struct vf_status {
-    int32_t code;
-    const char *msg;
-} vf_status;
+/* vf_status и vf_ctx живут в ядре: окно работает на девайсе ядра (шаг 0),
+ * поэтому буферы тел видны и compute, и графике без копирования. */
+#include "voxelforge_core.h"
 
 typedef struct vf_view vf_view;
 
@@ -24,7 +23,8 @@ typedef struct vf_input {
     int shift, ctrl;
 } vf_input;
 
-vf_status vf_view_new(int w, int h, const char *title, const char *shader_dir, vf_view **out);
+vf_status vf_view_new(vf_view **out, vf_ctx *core, int w, int h, const char *title,
+                      const char *shader_dir);
 void vf_view_free(vf_view *v);
 
 // Опросить события. Возвращает 0, если окно закрыто.
@@ -38,8 +38,12 @@ int32_t vf_view_add_mesh(vf_view *v, const float *pos, const float *nrm, uint32_
                          const uint32_t *idx, uint32_t ni);
 int32_t vf_view_add_lines(vf_view *v, const float *pts, uint32_t n_lines);
 
-// Кадр.
+// Буфер тел физики: поза читается шейдером прямо оттуда (тот же девайс).
+void vf_view_set_bodies(vf_view *v, void *buffer, uint32_t count);
+
+// Кадр. Поза не передаётся: body — номер тела в буфере, alpha — сглаживание
+// между прошлым тактом и текущим.
 void vf_view_begin(vf_view *v, float r, float g, float b);
-void vf_view_draw(vf_view *v, int32_t mesh, const float *model, const float *tint);
+void vf_view_draw(vf_view *v, int32_t mesh, uint32_t body, float alpha, const float *tint);
 void vf_view_draw_lines(vf_view *v, int32_t lines, const float *model, const float *tint);
 void vf_view_end(vf_view *v);

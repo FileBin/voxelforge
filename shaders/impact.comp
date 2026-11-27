@@ -15,7 +15,13 @@ layout(local_size_x = 64) in;
 layout(std430, set = 0, binding = 0) buffer BodiesIn { Body bin[]; };
 layout(std430, set = 0, binding = 1) buffer Lists { C list[]; };
 layout(std430, set = 0, binding = 2) buffer ListCount { uint lc[]; };
+/* imp — максимум за такт на тело: по нему же гасим дубли, чтобы одно и то же
+ * сближение не породило два события (проход идёт на каждом куске кадра). */
 layout(std430, set = 0, binding = 3) buffer Impact { vec4 imp[]; };
+/* Кольцо событий раскола: (энергия, тело, партнёр), (нормаль), (точка).
+ * CPU читает счётчик 4 Б и только при изменении — сами события. */
+layout(std430, set = 0, binding = 4) buffer Events { vec4 ev[]; };
+layout(std430, set = 0, binding = 5) buffer EventCount { uint nevents; };
 
 void main() {
     uint i = gl_GlobalInvocationID.x;
@@ -53,10 +59,16 @@ void main() {
         }
     }
     /* Проход идёт на КАЖДОМ куске кадра (снаряд долетает не в первом), поэтому
-     * копим максимум, а не перезаписываем. */
+     * копим максимум, а не перезаписываем. Порог — в pc.lo.w: событие пишется
+     * уже отфильтрованным, CPU не видит мелочь. */
     vec4 prev = imp[i * 2u];
-    if (best > prev.x) {
-        imp[i * 2u] = vec4(best, jb, bn.x, bn.y);
-        imp[i * 2u + 1u] = vec4(bn.z, bp.x, bp.y, bp.z);
-    }
+    if (best <= prev.x || best < pc.lo.w) return;
+    imp[i * 2u] = vec4(best, jb, bn.x, bn.y);
+    imp[i * 2u + 1u] = vec4(bn.z, bp.x, bp.y, bp.z);
+
+    uint slot = atomicAdd(nevents, 1u);
+    if (slot >= uint(MAX_EVENTS)) return;
+    ev[slot * 3u] = vec4(best, float(i), jb, 0.0);
+    ev[slot * 3u + 1u] = vec4(bn.xyz, 0.0);
+    ev[slot * 3u + 2u] = vec4(bp.xyz, 0.0);
 }

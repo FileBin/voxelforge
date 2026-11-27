@@ -21,6 +21,7 @@ typedef struct gpu_shape {
 } gpu_shape;
 
 struct vf_view {
+    vf_ctx *core;   /* девайс ядра — единственный на всё */
     SDL_Window *win;
     VkInstance inst;
     VkSurfaceKHR surf;
@@ -50,6 +51,8 @@ struct vf_view {
     VkDescriptorSetLayout dsl;
     VkDescriptorPool dpool;
     VkDescriptorSet dset;
+    VkBuffer body_buf;   /* буфер тел физики (тот же девайс) */
+    uint32_t body_n;
     VkBuffer ubo;
     VkDeviceMemory ubo_mem;
     void *ubo_ptr;
@@ -149,48 +152,6 @@ static void free_buffer(vf_view *v, VkBuffer buf, VkDeviceMemory mem) {
 
 // ---------------------------------------------------------------- инициализация
 
-static int pick_device(vf_view *v) {
-    uint32_t n = 0;
-    vkEnumeratePhysicalDevices(v->inst, &n, NULL);
-    if (n == 0) {
-        fprintf(stderr, "[view] нет Vulkan-устройств\n");
-        return 0;
-    }
-    VkPhysicalDevice *list = malloc(sizeof(VkPhysicalDevice) * n);
-    vkEnumeratePhysicalDevices(v->inst, &n, list);
-    int chosen = -1;
-    for (uint32_t i = 0; i < n && chosen < 0; i++) {
-        uint32_t qn = 0;
-        vkGetPhysicalDeviceQueueFamilyProperties(list[i], &qn, NULL);
-        VkQueueFamilyProperties *q = malloc(sizeof(VkQueueFamilyProperties) * qn);
-        vkGetPhysicalDeviceQueueFamilyProperties(list[i], &qn, q);
-        int gfx = -1, pres = -1;
-        for (uint32_t k = 0; k < qn; k++) {
-            if ((q[k].queueFlags & VK_QUEUE_GRAPHICS_BIT) && gfx < 0) gfx = (int)k;
-            VkBool32 sup = 0;
-            vkGetPhysicalDeviceSurfaceSupportKHR(list[i], k, v->surf, &sup);
-            if (sup && pres < 0) pres = (int)k;
-        }
-        free(q);
-        uint32_t fmt_n = 0, mode_n = 0;
-        vkGetPhysicalDeviceSurfaceFormatsKHR(list[i], v->surf, &fmt_n, NULL);
-        vkGetPhysicalDeviceSurfacePresentModesKHR(list[i], v->surf, &mode_n, NULL);
-        if (gfx >= 0 && pres >= 0 && fmt_n > 0 && mode_n > 0) {
-            v->phys = list[i];
-            v->qfam = (uint32_t)gfx;
-            chosen = (int)i;
-        }
-    }
-    free(list);
-    if (chosen < 0) {
-        fprintf(stderr, "[view] нет устройства с графикой и поверхностью\n");
-        return 0;
-    }
-    VkPhysicalDeviceProperties p;
-    vkGetPhysicalDeviceProperties(v->phys, &p);
-    snprintf(v->gpu_name, sizeof(v->gpu_name), "%s", p.deviceName);
-    return 1;
-}
 
 static int make_swapchain(vf_view *v);
 static int make_swapchain_shaders(vf_view *v);
@@ -455,70 +416,73 @@ static void drop_swapchain(vf_view *v) {
     v->sc = VK_NULL_HANDLE;
 }
 
-vf_status vf_view_new(int w, int h, const char *title, const char *shader_dir, vf_view **out) {
+vf_status vf_view_new(vf_view **out, vf_ctx *core, int w, int h, const char *title,
+                      const char *shader_dir) {
     *out = NULL;
+    if (!core) return st(1, "окно без девайса ядра");
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         fprintf(stderr, "[view] SDL_Init: %s\n", SDL_GetError());
         return st(1, "SDL_Init failed");
     }
     vf_view *v = calloc(1, sizeof(vf_view));
+    v->core = core;
     v->shader_dir = shader_dir;
+    /* Девайс, очередь и семейство — ядра. Ядро уже создало instance с
+     * расширениями окна (vf_init_ext), поэтому surface делается на нём же:
+     * буферы тел, контактов и геометрии видны и compute, и графике. */
+    v->inst = (VkInstance)vf_ctx_instance(core);
+    v->phys = (VkPhysicalDevice)vf_ctx_phys(core);
+    v->dev = (VkDevice)vf_ctx_device(core);
+    v->queue = (VkQueue)vf_ctx_queue(core);
+    v->qfam = vf_ctx_family(core);
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(v->phys, &props);
+    snprintf(v->gpu_name, sizeof(v->gpu_name), "%s", props.deviceName);
+
     v->win = SDL_CreateWindow(title, w, h, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
     if (!v->win) {
         fprintf(stderr, "[view] SDL_CreateWindow: %s\n", SDL_GetError());
         free(v);
         return st(2, "SDL_CreateWindow failed");
     }
-
-    uint32_t ext_n = 0;
-    const char **ext = SDL_Vulkan_GetInstanceExtensions(&ext_n);
-    VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO};
-    app.pApplicationName = "voxelforge";
-    app.apiVersion = VK_API_VERSION_1_1;
-    VkInstanceCreateInfo ici = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
-    ici.pApplicationInfo = &app;
-    ici.enabledExtensionCount = ext_n;
-    ici.ppEnabledExtensionNames = ext;
-    if (!ok(vkCreateInstance(&ici, NULL, &v->inst), "vkCreateInstance")) {
-        return st(3, "vkCreateInstance failed");
-    }
-    VkSurfaceKHR surf = VK_NULL_HANDLE;
-    if (!SDL_Vulkan_CreateSurface(v->win, v->inst, NULL, &surf)) {
+    if (!SDL_Vulkan_CreateSurface(v->win, v->inst, NULL, &v->surf)) {
         fprintf(stderr, "[view] SDL_Vulkan_CreateSurface: %s\n", SDL_GetError());
         return st(4, "surface failed");
     }
-    v->surf = surf;
-    if (!pick_device(v)) return st(5, "no device");
 
-    float prio = 1.0f;
-    VkDeviceQueueCreateInfo qi = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
-    qi.queueFamilyIndex = v->qfam;
-    qi.queueCount = 1;
-    qi.pQueuePriorities = &prio;
-    const char *dev_ext[1] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
-    VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
-    dci.queueCreateInfoCount = 1;
-    dci.pQueueCreateInfos = &qi;
-    dci.enabledExtensionCount = 1;
-    dci.ppEnabledExtensionNames = dev_ext;
-    if (!ok(vkCreateDevice(v->phys, &dci, NULL, &v->dev), "vkCreateDevice")) return st(6, "device");
-    vkGetDeviceQueue(v->dev, v->qfam, 0, &v->queue);
+    /* Одна очередь на физику и на кадр: present обязан поддерживаться именно
+     * семейством ядра, иначе окно пришлось бы вешать на другой девайс и весь
+     * смысл общего девайса пропадал. */
+    VkBool32 sup = VK_FALSE;
+    vkGetPhysicalDeviceSurfaceSupportKHR(v->phys, v->qfam, v->surf, &sup);
+    if (!sup) {
+        fprintf(stderr, "[view] семейство очереди %u не умеет present\n", v->qfam);
+        return st(5, "queue family cannot present");
+    }
 
     if (!make_swapchain(v)) return st(7, "swapchain");
 
-    // дескриптор кадра
-    VkDescriptorSetLayoutBinding b = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
-                                      VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
+    // дескриптор кадра: 0 — UBO кадра, 1 — буфер тел физики (шаг 1: поза
+    // приходит на устройство, а не матрицей из CPU)
+    VkDescriptorSetLayoutBinding b[2] = {
+        {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
+         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+         VK_SHADER_STAGE_VERTEX_BIT, NULL},
+    };
     VkDescriptorSetLayoutCreateInfo dl = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dl.bindingCount = 1;
-    dl.pBindings = &b;
+    dl.bindingCount = 2;
+    dl.pBindings = b;
     if (!ok(vkCreateDescriptorSetLayout(v->dev, &dl, NULL, &v->dsl), "dsl")) return st(8, "dsl");
 
-    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4};
+    VkDescriptorPoolSize ps[2] = {
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4},
+    };
     VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpi.maxSets = 4;
-    dpi.poolSizeCount = 1;
-    dpi.pPoolSizes = &ps;
+    dpi.poolSizeCount = 2;
+    dpi.pPoolSizes = ps;
     if (!ok(vkCreateDescriptorPool(v->dev, &dpi, NULL, &v->dpool), "dpool")) return st(9, "dpool");
 
     VkDescriptorSetAllocateInfo da = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -607,9 +571,8 @@ void vf_view_free(vf_view *v) {
     if (v->sem_done) vkDestroySemaphore(v->dev, v->sem_done, NULL);
     if (v->fence) vkDestroyFence(v->dev, v->fence, NULL);
     if (v->cmd_pool) vkDestroyCommandPool(v->dev, v->cmd_pool, NULL);
-    if (v->dev) vkDestroyDevice(v->dev, NULL);
+    /* девайс и instance принадлежат ядру — здесь только своё */
     if (v->surf) vkDestroySurfaceKHR(v->inst, v->surf, NULL);
-    if (v->inst) vkDestroyInstance(v->inst, NULL);
     if (v->win) SDL_DestroyWindow(v->win);
     SDL_Quit();
     free(v);
@@ -758,6 +721,14 @@ void vf_view_begin(vf_view *v, float r, float g, float b) {
 
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     vkBeginCommandBuffer(v->cmd, &bi);
+    /* Физика отправляет такт асинхронно и не ждёт его: без барьера
+     * вершинный шейдер может прочитать буфер тел, не увидев записи compute. */
+    VkMemoryBarrier body_barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    body_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    body_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(v->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, 0, 1, &body_barrier, 0,
+                         NULL, 0, NULL);
     VkClearValue clear[2];
     memset(clear, 0, sizeof(clear));
     clear[0].color.float32[0] = r;
@@ -781,15 +752,33 @@ void vf_view_begin(vf_view *v, float r, float g, float b) {
     v->recording = 1;
 }
 
-void vf_view_draw(vf_view *v, int32_t mesh, const float *model, const float *tint) {
+void vf_view_set_bodies(vf_view *v, void *buffer, uint32_t count) {
+    if (!v || !buffer) return;
+    v->body_buf = (VkBuffer)buffer;
+    v->body_n = count;
+    VkDescriptorBufferInfo dbi = {v->body_buf, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet wd = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    wd.dstSet = v->dset;
+    wd.dstBinding = 1;
+    wd.descriptorCount = 1;
+    wd.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    wd.pBufferInfo = &dbi;
+    vf_ctx_lock(v->core);
+    vkUpdateDescriptorSets(v->dev, 1, &wd, 0, NULL);
+    vf_ctx_unlock(v->core);
+}
+
+void vf_view_draw(vf_view *v, int32_t mesh, uint32_t body, float alpha, const float *tint) {
     if (!v->recording || mesh < 0 || mesh >= v->n_shapes) return;
     gpu_shape *g = &v->shapes[mesh];
     if (g->is_lines) return;
     vkCmdBindPipeline(v->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v->pipe_mesh);
+    /* поза — в буфере тел, здесь только «какое тело» и alpha сглаживания */
+    float pick[4] = {(float)body, alpha, 0.0f, 0.0f};
     vkCmdPushConstants(v->cmd, v->lay_mesh, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                       0, 64, model);
+                       0, 16, tint);
     vkCmdPushConstants(v->cmd, v->lay_mesh, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                       64, 16, tint);
+                       16, 16, pick);
     VkDeviceSize off = 0;
     vkCmdBindVertexBuffers(v->cmd, 0, 1, &g->vbuf, &off);
     vkCmdBindIndexBuffer(v->cmd, g->ibuf, 0, VK_INDEX_TYPE_UINT32);
@@ -824,7 +813,12 @@ void vf_view_end(vf_view *v) {
     si.pCommandBuffers = &v->cmd;
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores = &v->sem_done;
-    vkQueueSubmit(v->queue, 1, &si, v->fence);
+    /* Очередь общая с физикой: submit и present — под замком ядра.
+     * Fence ждём вне замка (см. vf_view_begin). */
+    vf_ctx_lock(v->core);
+    VkResult sres = vkQueueSubmit(v->queue, 1, &si, v->fence);
+    vf_ctx_unlock(v->core);
+    if (sres != VK_SUCCESS) return;
     VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.waitSemaphoreCount = 1;
     pi.pWaitSemaphores = &v->sem_done;
@@ -833,7 +827,9 @@ void vf_view_end(vf_view *v) {
     // pImageIndices обязателен: без него драйвер разыменовывает NULL и падает
     // в wsi_common_queue_present.
     pi.pImageIndices = &v->cur_img;
+    vf_ctx_lock(v->core);
     VkResult pr = vkQueuePresentKHR(v->queue, &pi);
+    vf_ctx_unlock(v->core);
     if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) {
         vkDeviceWaitIdle(v->dev);
         drop_swapchain(v);

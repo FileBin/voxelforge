@@ -2,9 +2,9 @@
 layout(location = 0) in vec3 vN;
 layout(location = 1) in vec3 vW;
 
-layout(push_constant) uniform Model {
-    mat4 m;
+layout(push_constant) uniform Pick {
     vec4 tint;
+    vec4 pick;   /* x — номер тела, y — alpha интерполяции */
 } pc;
 
 layout(set = 0, binding = 0) uniform Frame {

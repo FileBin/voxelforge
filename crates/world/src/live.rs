@@ -119,6 +119,11 @@ pub fn model_matrix(pos: [f64; 3], quat: [f64; 4]) -> [f32; 16] {
     ]
 }
 
+/* Live владеет девайсом Vulkan и его буферами (сырые указатели) и переезжает
+ * в поток физики целиком: одновременно им пользуется ровно один поток, а
+ * окно на том же девайсе ходит в ядро через собственные объекты. */
+unsafe impl Send for Live {}
+
 pub struct Live {
     pub bodies: Vec<LiveBody>,
     pub gpu: GpuSim,
@@ -154,65 +159,101 @@ pub struct Live {
     pub lines_on: bool,
     pub near: f32,
     pub far: f32,
+    /// Статистика прошлого такта: максимум |v| и число бодрствующих тел.
+    /// Вместо чтения всех тел обратно (9 КБ/такт) — 8 Б.
+    pub last_vmax: f32,
+    pub last_awake: u32,
+    /// Скорость, которую CPU узнал от события (выстрел, осколки). Статистика
+    /// прошлого такта её не знает — на один такт берём максимум из двух.
+    pending_vmax: f32,
+}
+
+/// Плита на полу и пул спящих тел — исходная сцена мира. Нужна и
+/// конструктору, и сбросу (R), который раньше создавал новый Live: теперь
+/// девайс один на всё, поэтому сброс только пересобирает состояние.
+fn scene_plate() -> (Params, LiveBody, Vec<GpuBody>) {
+    // Плита сразу лежит на полу: центр на высоте полуразмера, иначе она
+    // падает с 1.2 м и к первому выстрелу оказывается не там, куда целятся.
+    let plate0 = TetBody::cube([0.0, 0.0, 0.0], 4, 0);
+    let (lo0, hi0) = plate0.bounds();
+    let rest_y = 0.5 * (hi0[1] - lo0[1]) + 0.001;
+    let plate = TetBody::cube([0.0, rest_y, 0.0], 4, 0);
+    let params = Params {
+        lo: [-8.0, 0.0, -8.0],
+        hi: [8.0, 10.0, 8.0],
+        cell: 0.30,
+        friction: 0.45,
+        max_push: 0.55,
+        ..Params::default()
+    };
+
+    let mut body = LiveBody {
+        id: 1,
+        crack_after: 0,
+        pos: [0.0, rest_y as f64, 0.0],
+        quat: [1.0, 0.0, 0.0, 0.0],
+        vel: [0.0; 3],
+        mass: DENSITY * plate.volume(),
+        radius: 0.5,
+        tets: plate.tets.clone(),
+        origin: plate.origin,
+        level_cap: plate.level_cap,
+        local: Vec::new(),
+        mesh: -1,
+        lines: -1,
+        kind: Kind::Target,
+        alive: true,
+    };
+    body.rebuild();
+    // Ставим плиту ровно на пол по ЛОКАЛЬНЫМ тетраэдрам (это и есть
+    // коллайдер). bounds() считает в другой системе, из-за него плита
+    // стартовала вдвое выше, падала на 28 см и подпрыгивала.
+    let mut lowest_local = f32::MAX;
+    for t in &body.local {
+        for v in t {
+            lowest_local = lowest_local.min(v[1]);
+        }
+    }
+    if lowest_local.is_finite() {
+        body.pos[1] = (-lowest_local) as f64 + 0.001;
+    }
+
+    let mut gpu_bodies: Vec<GpuBody> = Vec::with_capacity(MAX_BODIES);
+    gpu_bodies.push(gpu_body(&body));
+    for _ in 1..MAX_BODIES {
+        let parked = Body::new([0.0, -400.0, 0.0], [0.0; 3], 1.0, 0.05);
+        let mut g = GpuBody::from_cpu(&parked);
+        g.misc[1] = 1.0;
+        gpu_bodies.push(g);
+    }
+    (params, body, gpu_bodies)
 }
 
 impl Live {
+    /// Девайс ядра: окно рендерит на нём же (один Vulkan-девайс на всё).
+    pub fn ctx(&self) -> *mut std::ffi::c_void {
+        self.gpu.ctx()
+    }
+
+    /// Мир без окна (тесты, пробы, headless-демки).
     pub fn new(shader_dir: &std::path::Path) -> Live {
-        // Плита сразу лежит на полу: центр на высоте полуразмера, иначе она
-        // падает с 1.2 м и к первому выстрелу оказывается не там, куда целятся.
-        let plate0 = TetBody::cube([0.0, 0.0, 0.0], 4, 0);
-        let (lo0, hi0) = plate0.bounds();
-        let rest_y = 0.5 * (hi0[1] - lo0[1]) + 0.001;
-        let plate = TetBody::cube([0.0, rest_y, 0.0], 4, 0);
-        let params = Params {
-            lo: [-8.0, 0.0, -8.0],
-            hi: [8.0, 10.0, 8.0],
-            cell: 0.30,
-            friction: 0.45,
-            max_push: 0.55,
-            ..Params::default()
-        };
+        Self::with_window(shader_dir, false)
+    }
 
-        let mut body = LiveBody {
-            id: 1,
-            crack_after: 0,
-            pos: [0.0, rest_y as f64, 0.0],
-            quat: [1.0, 0.0, 0.0, 0.0],
-            vel: [0.0; 3],
-            mass: DENSITY * plate.volume(),
-            radius: 0.5,
-            tets: plate.tets.clone(),
-            origin: plate.origin,
-            level_cap: plate.level_cap,
-            local: Vec::new(),
-            mesh: -1,
-            lines: -1,
-            kind: Kind::Target,
-            alive: true,
-        };
-        body.rebuild();
-        // Ставим плиту ровно на пол по ЛОКАЛЬНЫМ тетраэдрам (это и есть
-        // коллайдер). bounds() считает в другой системе, из-за него плита
-        // стартовала вдвое выше, падала на 28 см и подпрыгивала.
-        let mut lowest_local = f32::MAX;
-        for t in &body.local {
-            for v in t {
-                lowest_local = lowest_local.min(v[1]);
-            }
-        }
-        if lowest_local.is_finite() {
-            body.pos[1] = (-lowest_local) as f64 + 0.001;
-        }
+    /// Мир под живое окно: девайс сразу создаётся с surface-расширениями и
+    /// swapchain, чтобы окно жило на нём же (шаг 0 — один девайс).
+    pub fn new_windowed(shader_dir: &std::path::Path) -> Live {
+        Self::with_window(shader_dir, true)
+    }
 
-        let mut gpu_bodies: Vec<GpuBody> = Vec::with_capacity(MAX_BODIES);
-        gpu_bodies.push(gpu_body(&body));
-        for _ in 1..MAX_BODIES {
-            let parked = Body::new([0.0, -400.0, 0.0], [0.0; 3], 1.0, 0.05);
-            let mut g = GpuBody::from_cpu(&parked);
-            g.misc[1] = 1.0;
-            gpu_bodies.push(g);
-        }
-        let gpu = GpuSim::new(gpu_bodies.clone(), shader_dir, params);
+    fn with_window(shader_dir: &std::path::Path, windowed: bool) -> Live {
+        let (params, body, gpu_bodies) = scene_plate();
+
+        let gpu = if windowed {
+            GpuSim::new_windowed(gpu_bodies.clone(), shader_dir, params)
+        } else {
+            GpuSim::new(gpu_bodies.clone(), shader_dir, params)
+        };
 
         Live {
             next_id: 1 + (MAX_BODIES as u64),
@@ -235,6 +276,9 @@ impl Live {
             lines_on: false,
             near: 0.0,
             far: 60.0,
+            last_vmax: 0.0,
+            last_awake: 64,
+            pending_vmax: 0.0,
         }
     }
 
@@ -325,19 +369,33 @@ impl Live {
     /// Такт полностью на GPU: CPU один раз строит пары и заливает их, дальше
     /// всё считает устройство, а тела читаются один раз в конце.
     fn step_gpu(&mut self, dt: f32, substeps: u32, iterations: u32) {
-        // растягиваем AABB на путь за такт: иначе быстрый снаряд проскакивает
-        let inflate: Vec<[f32; 3]> = self
-            .bodies
-            .iter()
-            .map(|b| {
-                let r = (dt.abs() * 0.5) as f64;
-                [
-                    (b.vel[0].abs() * r) as f32,
-                    (b.vel[1].abs() * r) as f32,
-                    (b.vel[2].abs() * r) as f32,
-                ]
-            })
-            .collect();
+        /* Такт N-1 отправлен и давно закрыт: ждём его (это ноль), забираем
+         * статистику и события ПРОШЛОГО такта. Раскол пишет тела с CPU, поэтому
+         * до него GPU обязан быть свободен — иначе пишем по считающемуся буферу. */
+        self.gpu.wait_idle();
+        let (vmax_now, awake_now) = self.gpu.read_stats();
+        /* Статистика прошлого такта + то, что CPU узнал от события: иначе на
+         * такте выстрела chunks считался бы по сцене без снаряда, и снаряд на
+         * 120 м/с перескакивал плиту между подшагами (проверено probe_fastshot). */
+        let vmax = (vmax_now as f64).max(self.pending_vmax as f64);
+        self.pending_vmax = 0.0;
+        self.last_vmax = vmax as f32;
+        self.last_awake = awake_now;
+        if self.fracture_enabled {
+            if self.gpu_collide {
+                /* События удара с устройства: 32 байта на тело вместо списка
+                 * контактов, и энергия посчитана ДО солвера. Кольцо + счётчик:
+                 * в спокойном такте из GPU уходит 4 байта. */
+                let ev = self.gpu.read_impact_events();
+                if !ev.is_empty() {
+                    self.fracture_from_events(&ev);
+                }
+            } else {
+                let contacts = self.gpu.read_contacts();
+                self.fracture(&contacts);
+            }
+        }
+
         /* Геометрию заливаем ДО пары: иначе на такте спавна снаряда пул
          * ещё пуст, пар нет, и снаряд пролетает сквозь плиту (найдено на
          * 120 м/с: кадр 0 — 0 пар, кадр 1 — 22976, но уже поздно). */
@@ -353,6 +411,9 @@ impl Live {
              * больше не читаются. */
             self.gpu.run_tet_pairs(dt);
         } else {
+            /* Пары на CPU — отладочный путь: ему нужны позы, читаем буфер
+             * целиком (в такте этого больше нет). */
+            self.sync_all();
             let shapes: Vec<Vec<[[f32; 3]; 4]>> =
                 self.bodies.iter().map(|b| b.rotated_tets()).collect();
             let pos: Vec<[f32; 3]> = self
@@ -388,45 +449,28 @@ impl Live {
             self.gpu.set_pairs(&packed);
         }
         /* Та же нарезка, что на CPU: куски по скорости, внутри куска — подшаги
-         * с ОДНИМ списком контактов. Иначе поведение кучи расходится. */
-        let vmax = self
-            .bodies
-            .iter()
-            .filter(|b| b.alive)
-            .map(|b| (b.vel[0] * b.vel[0] + b.vel[1] * b.vel[1] + b.vel[2] * b.vel[2]).sqrt())
-            .fold(0.0f64, f64::max);
+         * с ОДНИМ списком контактов. Скорость берём из статистики ПРОШЛОГО
+         * такта: она приходит на устройстве и стоит 8 Б, а не чтения всех тел.
+         * Скорость меняется плавно, запаздывание на такт безопасно. */
         let cell = (self.params.cell * 0.5) as f64;
         let chunks = ((vmax * dt as f64 / (cell * 0.35)).ceil() as u32).clamp(2, 12);
         let per = (substeps / chunks).max(1);
-        self.gpu.frame_gpu_contacts(dt, chunks, per, iterations);
+        /* Такт отправляем БЕЗ ожидания: к моменту следующего такта (50 мс) GPU
+         * давно свободен, и CPU не стоит ни миллисекунды. Результат прошлого
+         * такта читаем здесь же — он уже закрыт. */
+        self.gpu.frame_gpu_contacts_async(dt, chunks, per, iterations);
         // Контакты нужны и геймплею: раскол и пробуждение по контакту решаются
         // на CPU, поэтому читаем их один раз за такт (73 КБ при 64 телах).
         /* Контакты нужны CPU ТОЛЬКО для раскола: пробуждение делает SAT на
          * устройстве. Значит при выключенном расколе читать их обратно не
          * нужно вовсе — минус ~196 КБ за такт. */
-        if self.fracture_enabled {
-            if self.gpu_collide {
-                /* События удара с устройства: 32 байта на тело вместо списка
-                 * контактов, и энергия посчитана ДО солвера. */
-                let imp = self.gpu.read_impact();
-                self.fracture_from_impact(&imp);
-            } else {
-                let contacts = self.gpu.read_contacts();
-                self.fracture(&contacts);
-            }
+        /* Никаких поз обратно: рендер читает их из буфера тел на устройстве,
+         * раскол приходит событиями, статистика — с прошлого такта. */
+        /* Каркас тетраэдров — отладка: ему нужны позы на CPU. Читаем буфер
+         * только когда он включён, и это единственный случай, кроме раскола. */
+        if self.lines_on {
+            self.sync_all();
         }
-        let snap = self.gpu.read_bodies();
-        for i in 0..self.bodies.len() {
-            if !self.bodies[i].alive {
-                continue;
-            }
-            let g = &snap[i];
-            self.bodies[i].pos = [g.pos_r[0] as f64, g.pos_r[1] as f64, g.pos_r[2] as f64];
-            self.bodies[i].quat = [g.quat[0] as f64, g.quat[1] as f64, g.quat[2] as f64, g.quat[3] as f64];
-            self.bodies[i].vel = [g.vel_m[0] as f64, g.vel_m[1] as f64, g.vel_m[2] as f64];
-        }
-        let n = self.bodies.len();
-        self.mirror[..n].copy_from_slice(&snap[..n]);
         self.frames += 1;
     }
 
@@ -504,6 +548,11 @@ impl Live {
         self.sleep_enabled = on;
         self.gpu.skip_sleep = !on;
         if !on {
+            /* Позы на CPU могли устареть: без чтения такт их не обновляет.
+             * Будить тела по устаревшему зеркалу — значит залить на устройство
+             * старые координаты и телепортировать осколки. */
+            self.gpu.wait_idle();
+            self.sync_all();
             for i in 0..self.bodies.len() {
                 if self.bodies[i].alive {
                     self.wake(i);
@@ -849,14 +898,17 @@ impl Live {
 
     /// Раскол по событиям удара С УСТРОЙСТВА: энергия посчитана до солвера,
     /// поэтому в неё попадает и удар, который солвер тут же погасил.
-    fn fracture_from_impact(&mut self, imp: &[[f32; 8]]) {
+    /// Раскол по событиям из кольца на устройстве.
+    /// Событие: (энергия, тело, партнёр), (нормаль), (точка) — 12 float.
+    fn fracture_from_events(&mut self, ev: &[[f32; 12]]) {
         let mut jobs: Vec<(usize, [f32; 3], f32)> = Vec::new();
-        for (i, rec) in imp.iter().enumerate() {
-            if i >= self.bodies.len() {
-                break;
+        for rec in ev {
+            let (e, partner) = (rec[0], rec[2]);
+            let i = rec[1] as usize;
+            if partner < 0.0 || e < crate::sim::FRACTURE_ENERGY {
+                continue;
             }
-            let (e, partner) = (rec[0], rec[1]);
-            if partner < 0.0 || e < 500.0 || !self.bodies[i].alive {
+            if i >= self.bodies.len() || !self.bodies[i].alive {
                 continue;
             }
             let j = partner as usize;
@@ -876,13 +928,21 @@ impl Live {
             if self.frames < self.bodies[ti].crack_after {
                 continue;
             }
-            jobs.push((ti, [rec[5], rec[6], rec[7]], e));
+            jobs.push((ti, [rec[8], rec[9], rec[10]], e));
         }
         self.apply_jobs(jobs);
+        self.refresh_vmax();
     }
 
     /// Общая часть: разложить заявки на раскол с учётом свободных слотов.
     fn apply_jobs(&mut self, jobs: Vec<(usize, [f32; 3], f32)>) {
+        /* split() заливает буфер тел ЦЕЛИКОМ — значит зеркало обязано быть
+         * свежим, иначе остальные тела уедут назад к моменту прошлого чтения.
+         * Раскол — событие, поэтому полное чтение здесь допустимо. */
+        if !jobs.is_empty() {
+            self.gpu.wait_idle();
+            self.sync_all();
+        }
         for (ti, point, energy) in jobs {
             if !self.bodies[ti].alive {
                 continue;
@@ -897,7 +957,72 @@ impl Live {
     }
 
     /// Разбить тело ti в точке point. Число осколков и разлёт — от энергии.
+    /// Подтянуть позу одного тела с устройства. Только по событию (раскол,
+    /// включение каркаса): в такте позы на CPU больше не нужны.
+    fn sync_body(&mut self, i: usize) {
+        let Some(g) = self.gpu.read_body(i) else { return };
+        self.mirror[i] = g;
+        if i >= self.bodies.len() || !self.bodies[i].alive {
+            return;
+        }
+        let b = &mut self.bodies[i];
+        b.pos = [g.pos_r[0] as f64, g.pos_r[1] as f64, g.pos_r[2] as f64];
+        b.quat = [g.quat[0] as f64, g.quat[1] as f64, g.quat[2] as f64, g.quat[3] as f64];
+        b.vel = [g.vel_m[0] as f64, g.vel_m[1] as f64, g.vel_m[2] as f64];
+    }
+
+    /// Пересчитать максимум скорости по CPU-состоянию. Нужен сразу после
+    /// событий (выстрел, осколки): иначе нарезка такта на куски берёт скорость
+    /// прошлого такта, где снаряда ещё не было, chunks остаётся 2 — и быстрый
+    /// снаряд пролетает плиту между подшагами.
+    fn refresh_vmax(&mut self) {
+        let v = self
+            .bodies
+            .iter()
+            .filter(|b| b.alive)
+            .map(|b| (b.vel[0] * b.vel[0] + b.vel[1] * b.vel[1] + b.vel[2] * b.vel[2]).sqrt())
+            .fold(0.0f64, f64::max) as f32;
+        self.pending_vmax = self.pending_vmax.max(v);
+        self.last_vmax = self.last_vmax.max(v);
+    }
+
+    /// Сколько тел бодрствует по последнему такту (для решения «шагать ли»).
+    pub fn awake(&self) -> bool {
+        self.last_awake > 0
+    }
+
+    /// Подтянуть ВСЕ позы с устройства. Только по событию: `write_bodies`
+    /// заливает буфер целиком, и залить устаревшее зеркало — значит
+    /// телепортировать все тела назад. В такте не вызывается.
+    pub fn refresh_poses(&mut self) {
+        self.sync_all();
+    }
+
+    fn sync_all(&mut self) {
+        let snap = self.gpu.read_bodies();
+        let n = self.mirror.len().min(snap.len());
+        self.mirror[..n].copy_from_slice(&snap[..n]);
+        let m = self.bodies.len().min(snap.len());
+        for i in 0..m {
+            self.bodies[i].pos = [snap[i].pos_r[0] as f64, snap[i].pos_r[1] as f64, snap[i].pos_r[2] as f64];
+            self.bodies[i].quat = [
+                snap[i].quat[0] as f64,
+                snap[i].quat[1] as f64,
+                snap[i].quat[2] as f64,
+                snap[i].quat[3] as f64,
+            ];
+            self.bodies[i].vel = [
+                snap[i].vel_m[0] as f64,
+                snap[i].vel_m[1] as f64,
+                snap[i].vel_m[2] as f64,
+            ];
+        }
+    }
+
     pub fn split(&mut self, ti: usize, point: [f32; 3], energy: f32, max_new: usize) {
+        /* Поза цели нужна для точки удара и начального положения осколков:
+         * берём одно тело с устройства, а не весь буфер. */
+        self.sync_body(ti);
         let (tq, tpos, tvel) = {
             let t = &self.bodies[ti];
             (t.quat, t.pos, t.vel)
@@ -1057,6 +1182,8 @@ impl Live {
         if slot >= self.bodies.len() || !self.bodies[slot].alive {
             return;
         }
+        self.gpu.wait_idle();
+        self.sync_all();
         self.bodies[slot].alive = false;
         let parked = Body::new([0.0, -400.0, 0.0], [0.0; 3], 1.0, 0.05);
         let mut g = GpuBody::from_cpu(&parked);
@@ -1086,6 +1213,10 @@ impl Live {
             }
         }
         let Some(slot) = self.free_slot() else { return false };
+        /* write_bodies заливает весь буфер: без свежих поз остальные тела
+         * прыгнули бы назад на такт. Это событие, а не такт, — читаем. */
+        self.gpu.wait_idle();
+        self.sync_all();
         // снаряд — гранёный кусок, а не шар
         let ball = TetBody::cube([0.0, 0.0, 0.0], 2, 1);
         let id = self.new_id();
@@ -1125,22 +1256,31 @@ impl Live {
         self.bullets.retain(|&s| s != slot);
         self.bullets.push_back(slot);
         self.shots += 1;
+        /* снаряд только что родился на CPU — нарезка такта обязана это знать */
+        self.refresh_vmax();
+        self.last_awake = self.last_awake.max(1);
         true
     }
 
     /// Сброс: снова один цельный объект.
     pub fn reset(&mut self) {
-        let fresh = Live::new(
-            std::path::Path::new(
-                std::env::var("VF_SHADERS").unwrap_or_else(|_| "shaders/spv".into()).as_str(),
-            ),
-        );
-        self.bodies = fresh.bodies;
-        self.mirror = fresh.mirror;
-        self.gpu = fresh.gpu;
+        /* ВАЖНО: не создавать новый Live. Девайс теперь один на физику и окно,
+         * и свежий Live означал бы второй девайс, а прежний снёсся бы вместе с
+         * буфером, на который смотрит окно. Сбрасываем состояние на месте. */
+        self.gpu.wait_idle();
+        let (params, body, gpu_bodies) = scene_plate();
+        self.bodies = vec![body];
+        self.mirror = gpu_bodies;
+        self.gpu.write_bodies(&self.mirror);
+        self.geom_dirty = true;
+        self.bullets.clear();
+        self.next_id = 1 + (MAX_BODIES as u64);
         self.cracks = 0;
         self.shards_made = 0;
         self.shots = 0;
+        self.last_vmax = 0.0;
+        self.last_awake = MAX_BODIES as u32;
+        self.pending_vmax = 0.0;
         self.last_log.clear();
     }
 
