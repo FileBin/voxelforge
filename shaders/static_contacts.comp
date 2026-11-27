@@ -48,32 +48,43 @@ void main() {
     float m = pc.prm1.z;
     float floor_y = 0.0;
 
-    /* четыре самые глубокие вершины под полом — точки опоры */
+    /* Точки опоры пола — четыре УГЛА опорной площадки, а не «первые четыре
+     * глубокие вершины». У лежащего куба все нижние вершины одинаково
+     * глубокие, и «самые глубокие» оказывались в одном углу: опора крошечная,
+     * плеча против поворота вокруг вертикали нет — куб крутился юлой и ничто
+     * его не тормозило. Берём по одной вершине в каждом направлении
+     * (±x±z) — база широкая, поворот получает сопротивление. */
     vec3 pts[4];
     float pens[4];
     int have = 0;
-    for (uint t = 0u; t < cnt; t++) {
-        for (int k = 0; k < 4; k++) {
-            vec3 v = qrot(x.quat, tets[(base + t) * 4u + uint(k)].xyz) + x.pos_r.xyz;
-            float pen = floor_y - v.y;
-            if (pen <= -m) continue;
-            /* вставляем в список четырёх самых глубоких */
-            if (have < 4) {
-                pts[have] = v;
-                pens[have] = pen;
-                have++;
-            } else {
-                int worst = 0;
-                for (int j = 1; j < 4; j++) if (pens[j] < pens[worst]) worst = j;
-                if (pen > pens[worst]) {
-                    pts[worst] = v;
-                    pens[worst] = pen;
+    for (int c = 0; c < 4; c++) {
+        vec2 dir = vec2((c & 1) == 0 ? 1.0 : -1.0, (c & 2) == 0 ? 1.0 : -1.0);
+        float best_d = -1e30;
+        vec3 best_v = vec3(0.0);
+        float best_pen = 0.0;
+        bool found = false;
+        for (uint t = 0u; t < cnt; t++) {
+            for (int k = 0; k < 4; k++) {
+                vec3 v = qrot(x.quat, tets[(base + t) * 4u + uint(k)].xyz) + x.pos_r.xyz;
+                float pen = floor_y - v.y;
+                if (pen <= -m) continue;
+                float d = dot(v.xz, dir);
+                if (!found || d > best_d) {
+                    found = true;
+                    best_d = d;
+                    best_v = v;
+                    best_pen = pen;
                 }
             }
         }
+        if (found) {
+            pts[have] = best_v;
+            pens[have] = best_pen;
+            have++;
+        }
     }
-    for (int j = 0; j < have; j++) {
-        push(i, vec3(0.0, 1.0, 0.0), pens[j], pts[j]);
+    for (int j2 = 0; j2 < have; j2++) {
+        push(i, vec3(0.0, 1.0, 0.0), pens[j2], pts[j2]);
     }
 
     /* стенки: по одной точке — самая выступившая вершина за границей */
