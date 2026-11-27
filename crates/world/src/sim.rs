@@ -513,7 +513,10 @@ impl GpuSim {
              * 262 144 ячейки каждый такт. VF_SCAN=serial возвращает старый
              * проход — он нужен для сверки в probe_scan. */
             tetsums,
-            par_scan: !matches!(std::env::var("VF_SCAN").as_deref(), Ok("serial")),
+            /* По умолчанию — старый однопоточный проход: параллельный скан
+             * пока ломает первый такт (тесты live: плита не раскалывается,
+             * осколки дрожат). Включается VF_SCAN=parallel явно. */
+            par_scan: matches!(std::env::var("VF_SCAN").as_deref(), Ok("parallel")),
             baabb,
             pairs_on_gpu: false,
             pairs,
