@@ -134,9 +134,8 @@ pub struct Live {
     pub gpu_collide: bool,
     /// Геометрия изменилась (спавн/раскол/сброс) — нужно перезалить пул.
     geom_dirty: bool,
-    /// Пробуждение по контакту на CPU. Если выключено — сон решает только
-    /// GPU, а CPU будит тела пачкой при выстреле. Это убирает дёрганье
-    /// «уснул — разбудили — уснул», из-за которого со сном работало медленнее.
+    /// Пробуждение по контакту на CPU — только для пути, где коллизию
+    /// считает CPU. На GPU-пути этот проход не вызывается: будит SAT.
     pub wake_on_contact: bool,
     /// Раскол включён. В отладке столкновений его выключают: иначе не видно,
     /// останавливает ли контакт снаряд вообще, или он проходит насквозь.
@@ -374,9 +373,8 @@ impl Live {
         // Контакты нужны и геймплею: раскол и пробуждение по контакту решаются
         // на CPU, поэтому читаем их один раз за такт (73 КБ при 64 телах).
         let contacts = self.gpu.read_contacts();
-        if self.wake_on_contact {
-            self.wake_on_contact_pass(&contacts);
-        }
+        /* Пробуждение делает сам SAT на устройстве, поэтому на GPU-пути
+         * CPU в сон не вмешивается вовсе. */
         if self.fracture_enabled {
             self.fracture(&contacts);
         }
@@ -1043,14 +1041,6 @@ impl Live {
             self.bodies[slot] = body;
         } else {
             self.bodies.push(body);
-        }
-        if !self.wake_on_contact {
-            // выключено контактное пробуждение — будим всё пачкой на выстрел
-            for i in 0..self.bodies.len() {
-                if self.bodies[i].alive {
-                    self.wake(i);
-                }
-            }
         }
         self.gpu.write_bodies(&self.mirror);
         self.geom_dirty = true;
