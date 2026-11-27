@@ -28,4 +28,14 @@ fn main() {
     let only_gpu = g.difference(&cpu).count();
     let only_cpu = cpu.difference(&g).count();
     println!("пар: GPU {n_gpu} (уникальных {}), CPU {} → только на GPU {only_gpu}, только на CPU {only_cpu}", g.len(), cpu.len());
+    // сколько пар даёт одна ячейка: смотрим несколько занятых
+    let (starts2, cells2) = w.gpu.read_tet_grid();
+    let mut shown = 0;
+    for c in 0..(starts2.len() - 1) {
+        let (s2, e2) = (starts2[c] as usize, starts2[c + 1] as usize);
+        if e2 - s2 >= 3 && shown < 5 {
+            println!("ячейка {c}: записей {}, первые {:?}", e2 - s2, &cells2[s2..e2.min(s2 + 3)]);
+            shown += 1;
+        }
+    }
 }
