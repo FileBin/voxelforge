@@ -120,6 +120,8 @@ void main() {
 
     vec3 best_axis = vec3(0.0);
     float best_overlap = 3.4e38;
+    float best_gap = -1.0;
+    vec3 gap_axis = vec3(0.0);
     int best_k = -1;
     for (int k = 0; k < na; k++) {
         vec3 n = axes[k];
@@ -127,12 +129,35 @@ void main() {
         project(a, n, al, ah);
         project(b, n, bl, bh);
         float overlap = min(ah, bh) - max(al, bl);
-        if (overlap <= 0.0) return;
+        if (overlap <= 0.0) {
+            /* Ось разделяет — пересечения нет. Запоминаем НАИМЕНЬШИЙ зазор:
+             * по нему направим спекулятивный контакт. */
+            float gap = -overlap;
+            if (gap > best_gap) {
+                best_gap = gap;
+                gap_axis = (dot(cb - ca, n) < 0.0) ? -n : n;
+            }
+            continue;
+        }
         if (overlap < best_overlap) {
             best_overlap = overlap;
             best_axis = (dot(cb - ca, n) < 0.0) ? -n : n;
             best_k = k;
         }
+    }
+    /* СПЕКУЛЯТИВНАЯ МАРЖА. Если тела ещё не коснулись, но зазор меньше пути,
+     * который они проходят за подшаг, отдаём контакт с ОТРИЦАТЕЛЬНОЙ глубиной.
+     * Солвер по нему только запрещает сближаться быстрее, чем закрывается
+     * зазор: быстрый снаряд останавливается на подлёте, а не проходит сквозь
+     * (иначе на 120 м/с за подшаг он перескакивает всю плиту и перекрытия не
+     * бывает ни разу). */
+    if (best_gap >= 0.0) {
+        float relv = length(B.vel_m.xyz - A.vel_m.xyz);
+        float margin = max(pc.prm1.z, relv * pc.prm0.x);
+        if (best_gap > margin) return;
+        best_overlap = -best_gap;
+        best_axis = gap_axis;
+        best_k = -2;
     }
     if (best_overlap == 3.4e38) return;
 
