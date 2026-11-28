@@ -56,6 +56,26 @@ pub fn node_pos(n: Node, level: u8, origin: [f32; 3]) -> [f32; 3] {
 /// выключаются (см. `GpuSim::upload_sdf`). Берём с запасом.
 const FIELD_NODE_BUDGET: usize = 60000;
 
+/// Бокс поля осколка: тот же кусок мира, но, если влезает в слот SDF, на
+/// более мелкой сетке (см. `shatter_fields`). Возвращает `(шаг, lo, dims)`.
+fn shard_field_box(step: f32, lo: &[i32; 3], dims: &[usize; 3]) -> (f32, [i32; 3], [usize; 3]) {
+    for r in [2.0f32, 1.5, 1.25] {
+        let fs = step / r;
+        let mut f_lo = [0i32; 3];
+        let mut fd = [0usize; 3];
+        for k in 0..3 {
+            let w0 = lo[k] as f32 * step;
+            let w1 = (lo[k] + dims[k] as i32) as f32 * step;
+            f_lo[k] = (w0 / fs).floor() as i32;
+            fd[k] = ((w1 / fs).ceil() as i32 - f_lo[k] + 1) as usize;
+        }
+        if fd[0] * fd[1] * fd[2] <= FIELD_NODE_BUDGET {
+            return (fs, f_lo, fd);
+        }
+    }
+    (step, *lo, *dims)
+}
+
 /// Полуразмер сетки поля на `reach` метров с запасом `pad` узлов: `(n, dim)`,
 /// где сетка — `2n+1` узлов по каждой оси (узел 0 всегда в центре).
 fn field_dims(reach: f32, step: f32, pad: i32) -> (i32, usize) {
@@ -693,21 +713,15 @@ impl TetBody {
         (lo, hi)
     }
 
-    /// Дробление ПО ПОЛЮ: каждый осколок — это поле родителя, отсечённое
-    /// плоскостями Вороного его затравки. Плоскость среза проходит где угодно
-    /// (не по границам тетов), поэтому сколы выходят плавными и точными.
-    pub fn shatter_fields(&self, pts: &[[f32; 3]]) -> Vec<TetBody> {
-        /* Каждому осколку даём лишние слои пустоты по краям: иначе у мелких
-         * кусков марчингу не хватает внешних узлов и срез выходит «впуклым». */
-        let parent = field::expand(self.sdf(), 4);
-        let step = parent.step;
-        let n_nodes = [
-            parent.lo[0], parent.lo[1], parent.lo[2],
-            parent.dims[0] as i32, parent.dims[1] as i32, parent.dims[2] as i32,
-        ];
-        let mut out: Vec<TetBody> = Vec::new();
+    /// Плоскости Вороного по затравкам раскола: для каждого осколка — список
+    /// `(n, d)` в УЗЛАХ ПОЛЯ, где `n·p <= d` — его сторона среза.
+    /// Отдельной функцией, потому что это же геометрическое описание нужно
+    /// тестам и диагностике (проверка «поле = расстояние до этих плоскостей»).
+    pub fn shard_planes(&self, pts: &[[f32; 3]]) -> Vec<Vec<([f32; 3], f32)>> {
+        let step = self.sdf().step;
+        let mut out = Vec::with_capacity(pts.len());
         for (i, si) in pts.iter().enumerate() {
-            let mut f = parent.clone();
+            let mut planes = Vec::with_capacity(pts.len().saturating_sub(1));
             for (j, sj) in pts.iter().enumerate() {
                 if i == j {
                     continue;
@@ -722,7 +736,27 @@ impl TetBody {
                 ];
                 /* узлы в единицах решётки, поэтому и плоскость — в них */
                 let d = n[0] * mid[0] / step + n[1] * mid[1] / step + n[2] * mid[2] / step;
-                f = field::intersect_plane(&f, n, d);
+                planes.push((n, d));
+            }
+            out.push(planes);
+        }
+        out
+    }
+
+    /// Дробление ПО ПОЛЮ: каждый осколок — это поле родителя, отсечённое
+    /// плоскостями Вороного его затравки. Плоскость среза проходит где угодно
+    /// (не по границам тетов), поэтому сколы выходят плавными и точными.
+    pub fn shatter_fields(&self, pts: &[[f32; 3]]) -> Vec<TetBody> {
+        /* Каждому осколку даём лишние слои пустоты по краям: иначе у мелких
+         * кусков марчингу не хватает внешних узлов и срез выходит «впуклым». */
+        let parent = field::expand(self.sdf(), 4);
+        let step = parent.step;
+        let planes = self.shard_planes(pts);
+        let mut out: Vec<TetBody> = Vec::new();
+        for (i, _si) in pts.iter().enumerate() {
+            let mut f = parent.clone();
+            for (n, d) in &planes[i] {
+                f = field::intersect_plane(&f, *n, *d);
             }
             /* Теты БЕРЁМ ИЗ РОДИТЕЛЯ, а не выводим из нового поля: каждый
              * родительский тет отдаём ровно одному осколку (по его центроиду
@@ -798,7 +832,49 @@ impl TetBody {
                 (bhi[1] - blo[1] + 1 + 6) as usize,
                 (bhi[2] - blo[2] + 1 + 6) as usize,
             ];
-            let fc = field::crop(&f, lo, dims);
+            /* ШАГ ПОЛЯ ОСКОЛКА — НАСТОЛЬКО МЕЛКИЙ, НАСКОЛЬКО ВЛЕЗАЕТ.
+             * Зубцы вдоль ребра среза даёт не формула пересечения (она даёт
+             * верный знак и точное расстояние у всех узлов, между которыми
+             * проходит ноль), а ШАГ СЕТКИ МАРЧИНГА: он марчит ячейками по два
+             * узла, то есть один воксель, и на изломе поля (плоскость среза ×
+             * грань тела) линейная интерполяция по длинной диагонали ячейки
+             * мажет вершину почти на воксель. Замер на живой плите (8 осколков,
+             * шаг 0.035): поле на шаг вдвое мельче даёт макс. уход вершин от
+             * истинной поверхности 29.8 → 14.6 мм и «зубцов» (рёбер со сменой
+             * знака) на 1000 вершин 30.5 → 9.1 — при том же мешере, тетах и
+             * законе пересечения. Срез и грани при этом стоят на месте: поле
+             * линейно вдоль рёбер, интерполяция по ним точна.
+             * Цена — вершины меша ×r², узлы поля ×r³, поэтому r ограничен
+             * бюджетом слота SDF: крупные осколки остаются на шаге родителя. */
+            let (fstep, flo, fdims) = shard_field_box(step, &lo, &dims);
+            let fc = if (fstep - step).abs() < 1e-9 {
+                field::crop(&f, lo, dims)
+            } else {
+                /* Родитель пересэмплирован трилинейно (он гладкий, терять
+                 * нечего), срезы считаны заново уже в узлах мелкой сетки —
+                 * плоскость остаётся плоскостью в любом масштабе. */
+                let sc = step / fstep;
+                let mut vals = Vec::with_capacity(fdims[0] * fdims[1] * fdims[2]);
+                for z in 0..fdims[2] {
+                    for y in 0..fdims[1] {
+                        for x in 0..fdims[0] {
+                            let p = [
+                                (flo[0] + x as i32) as f32 / sc,
+                                (flo[1] + y as i32) as f32 / sc,
+                                (flo[2] + z as i32) as f32 / sc,
+                            ];
+                            /* значение родителя — В ЕГО ШАГАХ, а поле осколка
+                             * живёт в мелких: один шаг родителя = `sc` мелких */
+                            vals.push(parent.sample(p) * sc);
+                        }
+                    }
+                }
+                let mut nf = field::NodeField { lo: flo, dims: fdims, val: vals, step: fstep };
+                for (n, d) in &planes[i] {
+                    nf = field::intersect_plane(&nf, *n, *d * sc);
+                }
+                nf
+            };
             let body = TetBody {
                 tets,
                 level_cap: self.level_cap,
@@ -2033,6 +2109,159 @@ mod marching_diag {
 mod sdf_quality_tests {
     use super::*;
 
+    /// ТОЧНЫЙ ЭТАЛОН ДЛЯ ВЫПУКЛОГО ОСКОЛКА. Осколок — пересечение полупространств
+    /// (грани коробки + плоскости срезов). Строим его грани как многоугольники
+    /// (плоскость, отсечённая остальными полупространствами) и считаем настоящее
+    /// расстояние до поверхности: для выпуклого тела граница — это ровно
+    /// объединение таких многоугольников, поэтому расстояние до поверхности =
+    /// минимум расстояний до многоугольников. Годится и внутри, и снаружи.
+    pub(super) struct ConvexShape {
+        /// (плоскость в узлах поля, многоугольник вершинами в узлах поля, номер грани)
+        facets: Vec<([f32; 3], f32, Vec<[f32; 3]>, usize)>,
+        /// сколько первых граней — грани тела (остальные — срезы)
+        n_box: usize,
+    }
+
+    impl ConvexShape {
+        /// `n_box` — сколько первых плоскостей это грани коробки; остальные —
+        /// срезы (по номеру грани тест отделяет «срез» от «грани тела»).
+        pub(super) fn new(planes: &[([f32; 3], f32)], n_box: usize) -> Self {
+            let mut facets = Vec::new();
+            for (i, (n, d)) in planes.iter().enumerate() {
+                /* 2D-базис на плоскости */
+                let a = if n[0].abs() < 0.9 { [1.0f32, 0.0, 0.0] } else { [0.0, 1.0, 0.0] };
+                let u = normalize(cross(*n, a));
+                let v = cross(*n, u);
+                let o = [n[0] * d, n[1] * d, n[2] * d];
+                let big = 1.0e4f32;
+                let mut poly: Vec<[f32; 2]> = vec![
+                    [-big, -big],
+                    [big, -big],
+                    [big, big],
+                    [-big, big],
+                ];
+                for (j, (m, e)) in planes.iter().enumerate() {
+                    if i == j {
+                        continue;
+                    }
+                    /* m·(o + u*a + v*b) <= e  ->  ka*a + kb*b <= c */
+                    let (ka, kb, c) = (dot(*m, u), dot(*m, v), e - dot(*m, o));
+                    poly = clip_halfplane(&poly, ka, kb, c);
+                    if poly.is_empty() {
+                        break;
+                    }
+                }
+                if poly.len() < 3 {
+                    continue;
+                }
+                let pts: Vec<[f32; 3]> = poly
+                    .iter()
+                    .map(|q| [o[0] + u[0] * q[0] + v[0] * q[1], o[1] + u[1] * q[0] + v[1] * q[1], o[2] + u[2] * q[0] + v[2] * q[1]])
+                    .collect();
+                facets.push((*n, *d, pts, i));
+            }
+            Self { facets, n_box }
+        }
+
+        /// Грань — срез (а не грань исходного тела)?
+        pub(super) fn is_cut(&self, tag: usize) -> bool {
+            tag >= self.n_box
+        }
+
+        /// Расстояние от точки до поверхности (в узлах поля).
+        pub(super) fn dist(&self, p: [f32; 3]) -> f32 {
+            self.nearest(p).0
+        }
+
+        /// (расстояние до поверхности, метка ближайшей грани)
+        pub(super) fn nearest(&self, p: [f32; 3]) -> (f32, usize) {
+            let mut best = (f32::MAX, usize::MAX);
+            for (fi, (n, d, poly, tag)) in self.facets.iter().enumerate() {
+                let s = dot(*n, p) - d;
+                let foot = [p[0] - n[0] * s, p[1] - n[1] * s, p[2] - n[2] * s];
+                let inside = poly.iter().enumerate().all(|(k, a)| {
+                    let b = poly[(k + 1) % poly.len()];
+                    /* foot по ту же сторону каждого ребра, что и многоугольник */
+                    let e = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                    let w = [foot[0] - a[0], foot[1] - a[1], foot[2] - a[2]];
+                    cross(e, w).iter().zip(n.iter()).map(|(c, nn)| c * nn).sum::<f32>() >= -1e-6
+                });
+                let d_this = if inside {
+                    s.abs()
+                } else {
+                    let mut m = f32::MAX;
+                    for k in 0..poly.len() {
+                        m = m.min(seg_dist(p, poly[k], poly[(k + 1) % poly.len()]));
+                    }
+                    m
+                };
+                if d_this < best.0 {
+                    best = (d_this, *tag);
+                }
+                let _ = fi;
+            }
+            best
+        }
+
+        /// Знаковое расстояние до плоскости грани с номером `tag`
+        /// (f32::MAX, если такой грани в фигуре нет — её отсекли).
+        pub(super) fn facet_g(&self, tag: usize, p: [f32; 3]) -> f32 {
+            for (n, d, _, t) in &self.facets {
+                if *t == tag {
+                    return dot(*n, p) - d;
+                }
+            }
+            f32::MAX
+        }
+
+        /// Знак по занятости: внутри (все полупространства) — минус.
+        pub(super) fn inside(&self, p: [f32; 3]) -> bool {
+            self.facets
+                .iter()
+                .all(|(n, d, _, _)| dot(*n, p) - d <= 1e-6)
+        }
+    }
+
+    fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+        a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+    }
+    fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    }
+    fn normalize(a: [f32; 3]) -> [f32; 3] {
+        let l = dot(a, a).sqrt().max(1e-12);
+        [a[0] / l, a[1] / l, a[2] / l]
+    }
+    fn seg_dist(p: [f32; 3], a: [f32; 3], b: [f32; 3]) -> f32 {
+        let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let ap = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
+        let t = (dot(ap, ab) / dot(ab, ab).max(1e-20)).clamp(0.0, 1.0);
+        let q = [a[0] + ab[0] * t, a[1] + ab[1] * t, a[2] + ab[2] * t];
+        (0..3).map(|k| (p[k] - q[k]).powi(2)).sum::<f32>().sqrt()
+    }
+    /// Отсечь 2D-многоугольник полуплоскостью `ka*a + kb*b <= c`.
+    fn clip_halfplane(poly: &[[f32; 2]], ka: f32, kb: f32, c: f32) -> Vec<[f32; 2]> {
+        let f = |q: &[f32; 2]| ka * q[0] + kb * q[1] - c;
+        let mut out = Vec::with_capacity(poly.len() + 1);
+        for (i, a) in poly.iter().enumerate() {
+            let b = &poly[(i + 1) % poly.len()];
+            let (fa, fb) = (f(a), f(b));
+            if fa <= 0.0 {
+                out.push(*a);
+            }
+            if (fa < 0.0 && fb > 0.0) || (fa > 0.0 && fb < 0.0) {
+                let t = fa / (fa - fb);
+                out.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]);
+            }
+        }
+        out
+    }
+
+
     /// ДИАГНОСТИКА интерполяции: гистограмма `t` по всем пересечённым рёбрам.
     ///
     /// `t` — доля от узла `a` до нуля поля. У правильной интерполяции по
@@ -2150,11 +2379,18 @@ mod sdf_quality_tests {
         let mut vol_sum = 0.0f64;
         for (i, fr) in frags.iter().enumerate() {
             let f = fr.sdf();
+            /* Шаг поля осколка — тот же или МЕЛЬЧЕ родительского (осколок
+             * влезает в слот SDF, поэтому сетку ему можно взять подробнее:
+             * см. `shard_field_box`), но никогда не грубее. */
             assert!(
-                (f.step - pf.step).abs() < 1e-9,
-                "осколок {i}: шаг поля {} вместо {}",
+                f.step <= pf.step + 1e-9,
+                "осколок {i}: шаг поля {} грубее родительского {}",
                 f.step,
                 pf.step
+            );
+            assert!(
+                f.dims[0] * f.dims[1] * f.dims[2] <= 65536,
+                "осколок {i}: поле не влезает в слот SDF"
             );
             let m = fr.extract_marching();
             assert!(m.positions.len() > 20, "осколок {i}: меш пустой");
@@ -2312,6 +2548,266 @@ mod sdf_quality_tests {
             (vol_sum - parent.volume()).abs() < 1e-4 * parent.volume() as f64,
             "объём осколков не равен объёму родителя"
         );
+    }
+
+    /// ЧИСЛА ПО СРЕЗУ ОСКОЛКА (простой случай: две затравки — одна плоскость).
+    /// Эталон — ТОЧНАЯ геометрия осколка (коробка, отсечённая плоскостью):
+    /// `ConvexShape` считает настоящее расстояние до его поверхности. Эталон
+    /// живёт в узлах РОДИТЕЛЯ, поле осколка может быть мельче — пересчитываем.
+    /// Пороги: срез плашмя ≤ 2 мм, грани тела ≤ 2 мм, меш замкнут, объём сходится.
+    #[test]
+    fn shard_cut_is_flat_and_field_is_true_distance() {
+        let half = 4.0 * node_step(0);
+        let parent = TetBody::cube([0.0; 3], 4, 0);
+        let hp = parent.sdf().step;
+        /* Плоскость среза — НЕ по узлам (как в игре: Вороной в решётку не
+         * попадает), иначе нули поля лягут ровно в узлы и марчинг выродится. */
+        let seeds = [[-0.10f32, 0.0, 0.0], [0.1037, 0.0, 0.0]];
+        let planes = parent.shard_planes(&seeds);
+        let frags = parent.shatter_fields(&seeds);
+        assert_eq!(frags.len(), 2, "два осколка вокруг одной плоскости");
+
+        let mut vol = 0.0f64;
+        for (i, fr) in frags.iter().enumerate() {
+            let f = fr.sdf();
+            let sc = f.step / hp; // узлы поля осколка → узлы родителя (эталон там)
+            let plus = fr.centroid()[0] > 0.0;
+            let bx = (half + 1e-4) / hp;
+            let mut planes_i: Vec<([f32; 3], f32)> = Vec::new();
+            for k in 0..3 {
+                for sgn in [-1.0f32, 1.0] {
+                    let mut n = [0.0f32; 3];
+                    n[k] = sgn;
+                    planes_i.push((n, bx));
+                }
+            }
+            planes_i.extend_from_slice(&planes[i]);
+            let shape = ConvexShape::new(&planes_i, 6);
+
+            /* МЕШ: отклонения вершин от настоящей поверхности, срез и грани
+             * тела отдельно. Вершины у самого ребра среза (рядом две и больше
+             * грани) исключены: на convex-ребре линейная интерполяция поля
+             * ошибается на долю ячейки в любом случае, это не срез. */
+            let m = fr.extract_marching();
+            let (mut cut_devs, mut face_devs) = (Vec::new(), Vec::new());
+            let (mut on_border, nverts) = (0usize, m.positions.len());
+            let hi_n = [
+                f.lo[0] + f.dims[0] as i32 - 1,
+                f.lo[1] + f.dims[1] as i32 - 1,
+                f.lo[2] + f.dims[2] as i32 - 1,
+            ];
+            let mut crease = 0usize;
+            for p in &m.positions {
+                let pn = [p[0] / hp, p[1] / hp, p[2] / hp];
+                let pnn = [pn[0] / sc, pn[1] / sc, pn[2] / sc]; // в узлы поля
+                let (d, tag) = shape.nearest(pn);
+                if (0..3).any(|k| (pnn[k] - f.lo[k] as f32).abs() < 1.5 || (pnn[k] - hi_n[k] as f32).abs() < 1.5) {
+                    on_border += 1;
+                }
+                let close = (0..planes_i.len())
+                    .filter(|k| shape.facet_g(*k, pn).abs() < 2.0 / sc)
+                    .count();
+                if close >= 2 {
+                    crease += 1;
+                    continue;
+                }
+                if shape.is_cut(tag) {
+                    cut_devs.push(d * hp);
+                } else {
+                    face_devs.push(d * hp);
+                }
+            }
+            let stat = |v: &mut Vec<f32>| -> (f32, f32, f32) {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                (v[v.len() / 2], v[v.len() * 99 / 100], v[v.len() - 1])
+            };
+            let (cut50, cut99, cutmax) = stat(&mut cut_devs);
+            let (f50, f99, fmax) = stat(&mut face_devs);
+            /* меш замкнут */
+            let mut edges: std::collections::HashMap<(u32, u32), usize> = Default::default();
+            for t in m.indices.chunks(3) {
+                for k in 0..3 {
+                    let (a, b) = (t[k].min(t[(k + 1) % 3]), t[k].max(t[(k + 1) % 3]));
+                    *edges.entry((a, b)).or_insert(0) += 1;
+                }
+            }
+            let open = edges.values().filter(|c| **c != 2).count();
+            vol += fr.volume();
+            println!(
+                "DIAG осколок {i} ({}): шаг поля {:.4} (родитель {hp:.4}); меш {nverts} вершин, у ребра среза {crease}: СРЕЗ от плоскости — 50% {cut50:.5} 99% {cut99:.5} макс {cutmax:.5} м; грань тела — 50% {f50:.5} 99% {f99:.5} макс {fmax:.5} м; открытых рёбер {open}, на границе поля {on_border}",
+                if plus { "+x" } else { "−x" },
+                f.step
+            );
+            assert_eq!(open, 0, "осколок {i}: меш не замкнут");
+            assert_eq!(on_border, 0, "осколок {i}: поверхность режется о край поля");
+            assert!(cut99 < 0.002, "осколок {i}: срез не плоский: {cut99} м");
+            assert!(cutmax < 0.005, "осколок {i}: вершина среза уехала: {cutmax} м");
+            assert!(f99 < 0.002, "осколок {i}: грань тела не на месте: {f99} м");
+        }
+        println!("DIAG объём: осколки {vol:.6} против родителя {:.6}", parent.volume());
+        assert!((vol - parent.volume()).abs() < 1e-4 * parent.volume() as f64);
+    }
+
+    /// ГДЕ РОЖДАЮТСЯ ЗУБЦЫ У СРЕЗА. Живой сценарий: плита из headless (cube 8,
+    /// level 1, шаг поля 0.035 м) колется Вороным на 8 осколков. Осколок —
+    /// ВЫПУКЛЫЙ многогранник (грани коробки + плоскости срезов), поэтому эталон
+    /// точный (`ConvexShape`): настоящее расстояние до его поверхности.
+    ///
+    /// Тест сравнивает ДВА поля на одном и том же мешере:
+    ///   • поле осколка, как оно считается в движке (`max(родитель, плоскость)`);
+    ///   • ЗАВЕДОМО ПРАВИЛЬНОЕ поле — точное расстояние до геометрии осколка,
+    ///     посчитанное по многоугольникам граней (не по родителю и не по max).
+    /// Числа совпадают (отклонение вершин, счёт «зубцов» = рёбер, у которых
+    /// соседние вершины ушли по разные стороны поверхности). Значит вдоль ребра
+    /// среза виноват НЕ закон пересечения полей, а марчинг: ячейка — два узла
+    /// (шаг сетки марчинга = один воксель), и на изломе поля между плоскостью и
+    /// гранью тела линейная интерполяция по длинной диагонали ячейки ставит
+    /// вершину до вокселя мимо. Это и видно как «квадратные зубцы».
+    #[test]
+    fn shard_teeth_are_mesher_not_field() {
+        let (n_cube, level) = (8i32, 1u8);
+        let half = n_cube as f32 * node_step(level);
+        let parent = TetBody::cube([0.0; 3], n_cube, level);
+        let h = parent.sdf().step;
+        /* затравки как в демо: у места удара гуще */
+        let focus = [0.22f32, 0.12, 0.10];
+        let pts: Vec<[f32; 3]> = {
+            let mut rng = Lcg::new(0xC0FF_EE00_1234);
+            (0..8)
+                .map(|i| {
+                    if i < 5 {
+                        [
+                            focus[0] + (rng.unit() - 0.5) * 0.7,
+                            focus[1] + (rng.unit() - 0.5) * 0.7,
+                            focus[2] + (rng.unit() - 0.5) * 0.7,
+                        ]
+                    } else {
+                        [
+                            (rng.unit() - 0.5) * 1.0,
+                            (rng.unit() - 0.5) * 1.0,
+                            (rng.unit() - 0.5) * 1.0,
+                        ]
+                    }
+                })
+                .collect()
+        };
+        let planes = parent.shard_planes(&pts);
+        let frags = parent.shatter_fields(&pts);
+        assert_eq!(frags.len(), pts.len(), "осколки не должны теряться");
+
+        /* замеры одного меша: (медиана, 90%, 99%, макс) отклонения от поверхности
+         * и число «зубцов» — рёбер, где соседние вершины ушли по разные стороны */
+        fn measure(m: &Mesh, shape: &ConvexShape, h: f32) -> (f32, f32, f32, f32, usize) {
+            let mut vd: Vec<f32> = Vec::with_capacity(m.positions.len());
+            let mut sd: Vec<f32> = Vec::with_capacity(m.positions.len());
+            for p in &m.positions {
+                let pn = [p[0] / h, p[1] / h, p[2] / h];
+                let (d, tag) = shape.nearest(pn);
+                vd.push(d * h);
+                sd.push(shape.facet_g(tag, pn) * h);
+            }
+            let mut teeth = 0usize;
+            let mut seen: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+            for t in m.indices.chunks(3) {
+                for k in 0..3 {
+                    let (a, b) = (t[k].min(t[(k + 1) % 3]), t[k].max(t[(k + 1) % 3]));
+                    if !seen.insert((a, b)) {
+                        continue;
+                    }
+                    let (da, db) = (sd[a as usize], sd[b as usize]);
+                    if da * db < 0.0 && da.abs() + db.abs() > 0.002 {
+                        teeth += 1;
+                    }
+                }
+            }
+            vd.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let pc = |q: f32| vd[((vd.len() as f32 - 1.0) * q) as usize];
+            (pc(0.5), pc(0.9), pc(0.99), vd[vd.len() - 1], teeth)
+        }
+
+        let mut vol = 0.0f64;
+        let (mut teeth_ship, mut teeth_exact) = (0usize, 0usize);
+        let mut worst_ship = 0.0f32;
+        let mut all = 0usize;
+        for (i, fr) in frags.iter().enumerate() {
+            let f = fr.sdf();
+            let bx = (half + 1e-4) / h;
+            let mut planes_i: Vec<([f32; 3], f32)> = Vec::new();
+            for k in 0..3 {
+                for sp in [-1.0f32, 1.0] {
+                    let mut n = [0.0f32; 3];
+                    n[k] = sp;
+                    planes_i.push((n, bx));
+                }
+            }
+            planes_i.extend_from_slice(&planes[i]);
+            let shape = ConvexShape::new(&planes_i, 6);
+
+            /* 1. поле движка */
+            let m = fr.extract_marching();
+            let (a50, a90, a99, amax, at) = measure(&m, &shape, h);
+            let open = {
+                let mut e: std::collections::HashMap<(u32, u32), usize> = Default::default();
+                for t in m.indices.chunks(3) {
+                    for k in 0..3 {
+                        let (u, v) = (t[k].min(t[(k + 1) % 3]), t[k].max(t[(k + 1) % 3]));
+                        *e.entry((u, v)).or_insert(0) += 1;
+                    }
+                }
+                e.values().filter(|c| **c != 2).count()
+            };
+            /* 2. ЗАВЕДОМО ПРАВИЛЬНОЕ поле: точное расстояние до геометрии */
+            let sc = f.step / h; // узлы поля осколка → узлы родителя (эталон там)
+            let mut vals = Vec::with_capacity(f.val.len());
+            for z in 0..f.dims[2] {
+                for y in 0..f.dims[1] {
+                    for x in 0..f.dims[0] {
+                        let p = [
+                            (f.lo[0] + x as i32) as f32 * sc,
+                            (f.lo[1] + y as i32) as f32 * sc,
+                            (f.lo[2] + z as i32) as f32 * sc,
+                        ];
+                        let d = shape.dist(p) / sc;
+                        vals.push(if shape.inside(p) { -d } else { d });
+                    }
+                }
+            }
+            let mut ib = TetBody {
+                tets: fr.tets.clone(),
+                level_cap: fr.level_cap,
+                origin: fr.origin,
+                sdf: Default::default(),
+            };
+            let _ = ib.sdf.set(field::NodeField { lo: f.lo, dims: f.dims, val: vals, step: f.step });
+            let me = ib.extract_marching();
+            let (b50, b90, b99, bmax, bt) = measure(&me, &shape, h);
+            vol += fr.volume();
+            teeth_ship += at;
+            teeth_exact += bt;
+            worst_ship = worst_ship.max(amax);
+            all += m.positions.len();
+            println!(
+                "DIAG осколок {i}: поле движка   — 50% {a50:.4} 90% {a90:.4} 99% {a99:.4} макс {amax:.4} м, зубцов {at}, открытых рёбер {open}"
+            );
+            println!(
+                "DIAG осколок {i}: точное поле   — 50% {b50:.4} 90% {b90:.4} 99% {b99:.4} макс {bmax:.4} м, зубцов {bt}"
+            );
+            assert_eq!(open, 0, "осколок {i}: меш не замкнут");
+            assert!(a99 < 0.02, "осколок {i}: меш ушёл от поверхности: {a99} м");
+        }
+        println!(
+            "DIAG ИТОГО: осколков {}, вершин {all}, зубцов — поле движка {teeth_ship}, точное поле {teeth_exact}, макс уход {worst_ship:.4} м; объём {vol:.6} против {:.6}",
+            frags.len(),
+            parent.volume()
+        );
+        /* Поле движка близко к заведомо правильному (разница — только завышенные
+         * значения у СНАРУЖИ узлов на стыке трёх плоскостей, они и дают лишние
+         * зубцы): значит остаток — шаг сетки марчинга, а не закон пересечения. */
+        assert!(
+            (teeth_ship as f32) < (teeth_exact as f32) * 1.5 + 20.0,
+            "поле осколка заметно хуже точного: зубцов {teeth_ship} против {teeth_exact}"
+        );
+        assert!((vol - parent.volume()).abs() < 1e-4 * parent.volume() as f64);
     }
 
     /// ЧИСТАЯ ЛИНЕЙНАЯ ИНТЕРПОЛЯЦИЯ: вершина меша — ровно точка ребра по
