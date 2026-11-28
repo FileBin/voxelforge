@@ -86,6 +86,16 @@ unsafe extern "C" {
         wait_now: i32,
     ) -> VfStatus;
     pub fn vf_wait_stream(c: *mut c_void, stream: u32, back: u32) -> VfStatus;
+    /// Стадии последнего submit'а потока, мс: запись команд, ожидание замка
+    /// очереди, vkQueueSubmit, ожидание fence.
+    pub fn vf_submit_stats(
+        c: *mut c_void,
+        stream: u32,
+        record_ms: *mut f32,
+        lock_ms: *mut f32,
+        submit_ms: *mut f32,
+        fence_ms: *mut f32,
+    );
     pub fn vf_stream_value(c: *mut c_void, stream: u32) -> u64;
     pub fn vf_wait_timeline(c: *mut c_void, stream: u32, value: u64, timeout_ns: u64) -> i32;
     pub fn vf_split(c: *mut c_void) -> i32;
@@ -484,6 +494,9 @@ pub struct GpuSim {
     baabb: *mut c_void,
     /// Пары и их число известны только устройству (SAT берёт число из буфера).
     pub pairs_on_gpu: bool,
+    /// Пары тетов строятся ВНУТРИ такта (одним submit'ом с ним), а не
+    /// отдельным submit'ом с ожиданием fence. Ставится один раз из `Live`.
+    inline_pairs: bool,
     /// Пары тетраэдров, посчитанные CPU один раз на такт.
     pairs: *mut c_void,
     pub n_pairs: usize,
@@ -774,6 +787,7 @@ impl GpuSim {
             par_scan: !matches!(std::env::var("VF_SCAN").as_deref(), Ok("serial")),
             baabb,
             pairs_on_gpu: false,
+            inline_pairs: false,
             pairs,
             n_pairs: 0,
             sdf_desc,
@@ -1019,6 +1033,44 @@ impl GpuSim {
         self.frame_gpu_contacts_impl(dt, groups, substeps, iterations, true)
     }
 
+    /// Пары тетов — внутрь списка такта (один submit вместо двух). Такт при
+    /// этом не ждёт GPU на построении пар: порядок обеспечивает очередь.
+    pub fn set_inline_pairs(&mut self, on: bool) {
+        self.inline_pairs = on;
+        if on {
+            self.pairs_on_gpu = true;
+            self.n_pairs = MAX_PAIRS;
+        }
+    }
+
+    /// Стадии последнего submit'а такта (мс): запись команд, замок очереди,
+    /// vkQueueSubmit, ожидание fence. Ставит их ядро на пути submit'а.
+    pub fn submit_stats(&self) -> (f32, f32, f32, f32) {
+        let (mut rec, mut lock, mut sub, mut fen) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        unsafe { vf_submit_stats(self.ctx, VF_STREAM_TICK, &mut rec, &mut lock, &mut sub, &mut fen) };
+        (rec, lock, sub, fen)
+    }
+
+    /// Записать фазы такта на CPU в диагностику (F3 / VF_PERF=1).
+    /// `wait` — ожидание прошлого такта, `reads` — чтения обратно, `submit` —
+    /// весь вызов submit'а, `total` — такт целиком на потоке физики.
+    pub fn note_tick_cpu(&mut self, wait: f32, reads: f32, submit: f32, total: f32) {
+        if !self.perf.enabled {
+            return;
+        }
+        let (rec, lock, sub, fen) = self.submit_stats();
+        self.perf.record_cpu(crate::perf::CpuPhases {
+            wait,
+            reads,
+            submit,
+            lock,
+            record: rec,
+            queue_submit: sub,
+            fence: fen,
+            total,
+        });
+    }
+
     /// Дождаться последнего отправленного такта: перед любой записью тел с
     /// CPU (спавн, раскол, сброс) — иначе побежим по буферу, который считает GPU.
     pub fn wait_idle(&mut self) {
@@ -1209,6 +1261,16 @@ impl GpuSim {
 
         let mut steps: Vec<Step> = Vec::new();
         let (a, b) = (self.bodies[0], self.bodies[1]);
+
+        /* Пары тетов — первыми: контакты ниже читают их. Раньше это был
+         * отдельный submit с ожиданием fence, то есть такт на своём же пути
+         * стоял до GPU; теперь всё идёт одним submit'ом, а порядок держит
+         * очередь. */
+        if self.inline_pairs {
+            let push_pairs = self.push(dt, g_body);
+            let mut ps = self.tet_pair_steps(push_pairs);
+            steps.append(&mut ps);
+        }
 
         /* Поза на начало такта: рендер интерполирует от неё, а не от снимка,
          * который CPU раньше читал обратно каждые 50 мс. */
@@ -1999,28 +2061,29 @@ impl GpuSim {
         (starts, cell_tets)
     }
 
-    /// Пары тетов целиком на устройстве: сетка -> пары. Возвращает их число.
-    pub fn run_tet_pairs(&mut self, dt: f32) -> usize {
-        let zero = vec![0u8; 4];
+    /// Список диспатчей «сетка тетов -> пары» для ВСТРАИВАНИЯ в такт.
+    ///
+    /// Раньше это был отдельный submit (`run_tet_pairs`) с ожиданием fence:
+    /// поток физики стоял, пока GPU строил пары, — то есть такт дважды
+    /// дожидался конвейера. Пары нужны только следующему за ними такту, а он
+    /// идёт в ТОЙ ЖЕ очереди, поэтому порядок гарантирует сама очередь: ждать
+    /// fence не нужно вовсе.
+    pub fn tet_pair_steps(&mut self, push: Push) -> Vec<Step> {
+        /* Счётчики — в ноль с хоста: предыдущий такт уже закрыт (wait_idle),
+         * иначе это была бы запись по считающемуся буферу. */
         unsafe {
-            check_status(
-                vf_buffer_write(self.ctx, self.pair_count, 0, zero.as_ptr() as *const c_void, 4),
-                "zero_pairs",
-            );
-        }
-        /* Вся сетка и пары — ОДНИМ submit'ом. Раньше было два (сетка, потом
-         * пары), и за такт набегало пять ожиданий конвейера: на реальной карте
-         * это и держало загрузку у 100% на пустом кадре. */
-        let zero_cells = vec![0u8; self.ncells as usize * 4];
-        unsafe {
-            check_status(
-                vf_buffer_write(self.ctx, self.tetcnt, 0, zero_cells.as_ptr() as *const c_void, zero_cells.len()),
-                "zero_cells",
+            vf_buffer_write(self.ctx, self.pair_count, 0, [0u8; 4].as_ptr() as *const c_void, 4);
+            let zero_cells = vec![0u8; self.ncells as usize * 4];
+            vf_buffer_write(
+                self.ctx,
+                self.tetcnt,
+                0,
+                zero_cells.as_ptr() as *const c_void,
+                zero_cells.len(),
             );
         }
         let g_body = ((self.n as u32) + WG - 1) / WG;
         let g_cells = ((self.ncells as u32) + WG - 1) / WG;
-        let push = self.push(dt, g_body);
         let mut steps = vec![
             Step {
                 pipe: P_BODYAABB,
@@ -2034,53 +2097,63 @@ impl GpuSim {
                 push,
                 groups: [g_body, 1, 1],
             },
-            ];
-            steps.extend(self.scan_steps(push));
-            steps.extend(vec![
-            Step {
-                pipe: P_TETFILL,
-                bufs: vec![
-                    self.bodies[0],
-                    self.tets,
-                    self.span,
-                    self.tetstart,
-                    self.tetcursor,
-                    self.cell_tets,
-                ],
-                push,
-                groups: [g_body, 1, 1],
-            },
-            Step {
-                pipe: if self.flat_pairs { P_TETPAIRSFLAT } else { P_TETPAIRS },
-                bufs: vec![
-                    self.bodies[0],
-                    self.tets,
-                    self.span,
-                    self.tetstart,
-                    self.cell_tets,
-                    self.pairs,
-                    self.pair_count,
-                    self.baabb,
-                ],
-                push,
-                /* По записям: групп на весь потолок (записей не больше
-                 * MAX_CELL_TETS), лишние invocation выходят первой проверкой.
-                 * По ячейкам: по одной группе на 64 ячейки, как раньше. */
-                groups: [
-                    if self.flat_pairs {
-                        ((MAX_CELL_TETS as u32) + WG - 1) / WG
-                    } else {
-                        g_cells
-                    },
-                    1,
-                    1,
-                ],
-            },
-        ]);
+        ];
+        steps.extend(self.scan_steps(push));
+        steps.push(Step {
+            pipe: P_TETFILL,
+            bufs: vec![
+                self.bodies[0],
+                self.tets,
+                self.span,
+                self.tetstart,
+                self.tetcursor,
+                self.cell_tets,
+            ],
+            push,
+            groups: [g_body, 1, 1],
+        });
+        steps.push(Step {
+            pipe: if self.flat_pairs { P_TETPAIRSFLAT } else { P_TETPAIRS },
+            bufs: vec![
+                self.bodies[0],
+                self.tets,
+                self.span,
+                self.tetstart,
+                self.cell_tets,
+                self.pairs,
+                self.pair_count,
+                self.baabb,
+            ],
+            push,
+            /* По записям: групп на весь потолок (записей не больше
+             * MAX_CELL_TETS), лишние invocation выходят первой проверкой.
+             * По ячейкам: по одной группе на 64 ячейки, как раньше. */
+            groups: [
+                if self.flat_pairs {
+                    ((MAX_CELL_TETS as u32) + WG - 1) / WG
+                } else {
+                    g_cells
+                },
+                1,
+                1,
+            ],
+        });
+        self.pairs_on_gpu = true;
+        self.n_pairs = MAX_PAIRS;
+        steps
+    }
+
+    /// Пары тетов целиком на устройстве, отдельным submit'ом с ожиданием.
+    /// В такте НЕ используется (там пары встроены в его список диспатчей) —
+    /// остаётся для проб и тестов, которым нужен готовый буфер пар.
+    pub fn run_tet_pairs(&mut self, dt: f32) -> usize {
+        let g_body = ((self.n as u32) + WG - 1) / WG;
+        let push = self.push(dt, g_body);
+        let steps = self.tet_pair_steps(push);
         let mut keep: Vec<Vec<*mut c_void>> = steps.iter().map(|s| s.bufs.clone()).collect();
         let push_keep: Vec<Push> = steps.iter().map(|s| s.push).collect();
         let mut ds: Vec<VfDispatch> = steps
-            .iter_mut()
+            .iter()
             .enumerate()
             .map(|(k, s)| VfDispatch {
                 pipeline: self.pipes[s.pipe],
@@ -2089,9 +2162,6 @@ impl GpuSim {
                 push: &push_keep[k] as *const Push as *const c_void,
                 push_bytes: 80,
                 groups: s.groups,
-                /* Три прохода контактов со статикой (work/tie/emit) помечаем
-                 * стадией `static_contacts`, чтобы таблица F3/VF_PERF=1
-                 * показывала стадию ОДНОЙ суммой, как при одном диспатче. */
                 stage: if s.pipe >= P_STATWORK {
                     P_STATIC as u32
                 } else {
@@ -2102,9 +2172,6 @@ impl GpuSim {
         unsafe {
             check_status(vf_run(self.ctx, ds.as_mut_ptr(), ds.len() as u32), "run_tet_pairs");
         }
-        /* Счётчик не читаем: SAT берёт число пар из буфера. */
-        self.pairs_on_gpu = true;
-        self.n_pairs = MAX_PAIRS;
         self.n_pairs
     }
 
