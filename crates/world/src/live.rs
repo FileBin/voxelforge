@@ -354,16 +354,14 @@ pub fn model_matrix(pos: [f64; 3], quat: [f64; 4]) -> [f32; 16] {
  * окно на том же девайсе ходит в ядро через собственные объекты. */
 unsafe impl Send for Live {}
 
-/// Разложить тела на СВЯЗНЫЕ части: тело, поле которого распалось на куски,
-/// заменяется своими частями, связное остаётся как есть.
-///
-/// Чистая логика без GPU: её зовёт `Live::split` сразу после раскола, а тест —
-/// напрямую. Теты делятся по центроиду (`TetBody::split_disconnected`), поэтому
-/// сумма объёмов частей равна объёму родителя — масса сохраняется.
+/// Разложить тела на СВЯЗНЫЕ части ЧИСТО НА CPU: эталон для тестов (в кадре
+/// метки считает устройство — `Live::split_fragments_gpu`). Теты делятся по
+/// центроиду, поэтому сумма объёмов частей равна объёму родителя.
+#[cfg(test)]
 fn split_into_parts(frags: Vec<TetBody>, log_id: Option<u64>) -> Vec<TetBody> {
     let mut out = Vec::with_capacity(frags.len());
     for fr in frags {
-        match fr.split_disconnected(1, 3) {
+        match fr.split_disconnected(crate::parts::DEFAULT_ERODE, crate::parts::DEFAULT_PAD) {
             Some(parts) => {
                 if let Some(id) = log_id {
                     println!("тело {id} распалось на {} компонент", parts.len());
@@ -1857,6 +1855,44 @@ impl Live {
         }
     }
 
+    /// Разложить осколки на связные части, МЕТКИ — С УСТРОЙСТВА.
+    ///
+    /// Тяжёлое (разметка связности по узлам поля) считает GPU
+    /// (`components.comp`); если поле на устройстве посчитать не удалось,
+    /// берётся CPU-оракул. Создание тел, боксы и вырезка полей — на CPU: это
+    /// управление, а не счёт по узлам.
+    fn split_fragments_gpu(&mut self, frags: Vec<TetBody>, log_id: Option<u64>) -> Vec<TetBody> {
+        let mut out: Vec<TetBody> = Vec::with_capacity(frags.len());
+        for fr in frags {
+            let lab = {
+                let f = fr.sdf();
+                match self.gpu.run_components(f, crate::parts::DEFAULT_ERODE) {
+                    Some(g) => g.labels,
+                    None => crate::parts::label_field(f, crate::parts::DEFAULT_ERODE),
+                }
+            };
+            let seeds = crate::parts::split_with_labels(&fr, &lab, crate::parts::DEFAULT_PAD);
+            if seeds.len() < 2 {
+                out.push(fr);
+                continue;
+            }
+            if let Some(id) = log_id {
+                println!("тело {id} распалось на {} компонент", seeds.len());
+            }
+            for s in seeds {
+                let b = TetBody {
+                    tets: s.tets,
+                    level_cap: fr.level_cap,
+                    origin: fr.origin,
+                    sdf: Default::default(),
+                };
+                let _ = b.sdf.set(s.sdf);
+                out.push(b);
+            }
+        }
+        out
+    }
+
     /// Разложить ВСЕ живые тела на связные части: инициализация, загрузка и
     /// ручной вызов. Возвращает число созданных новых тел.
     ///
@@ -1891,10 +1927,10 @@ impl Live {
                 }
                 tb
             };
-            let Some(parts) = tb.split_disconnected(1, 3) else {
+            let parts = self.split_fragments_gpu(vec![tb.clone()], Some(id));
+            if parts.len() < 2 {
                 continue;
-            };
-            println!("тело {id} распалось на {} компонент", parts.len());
+            }
             let c = tb.world_centroid();
             for (k, fr) in parts.iter().enumerate() {
                 let slot = if k == 0 {
@@ -2018,7 +2054,8 @@ impl Live {
          * куска. Такие тела раскладываем на отдельные — теты уходят по
          * центроиду, поэтому сумма объёмов (а значит и масса) сохраняется. */
         if self.split_parts {
-            frags = split_into_parts(frags, Some(self.bodies[ti].id));
+            let parent_id = self.bodies[ti].id;
+            frags = self.split_fragments_gpu(frags, Some(parent_id));
         }
         /* Нехватка слотов не должна молча съедать массу: считаем объём до и
          * после обрезки и печатаем потерю, если она есть. */

@@ -544,6 +544,11 @@ pub struct GpuSim {
     pub frame_ms: f32,
     pub frame_submits: u64,
     frame_t0: std::time::Instant,
+    /// Каталог SPIR-V: нужен лениво создаваемым пайплайнам (`components`).
+    shader_dir: std::path::PathBuf,
+    /// Пайплайн разметки компонент связности (`components.spv`), создаётся
+    /// при первом вызове `run_components` — таблицу PIPE_NAMES не трогаем.
+    components_pipe: *mut c_void,
 }
 
 impl GpuSim {
@@ -815,6 +820,8 @@ impl GpuSim {
             frame_ms: 0.0,
             frame_submits: 0,
             frame_t0: std::time::Instant::now(),
+            shader_dir: shader_dir.to_path_buf(),
+            components_pipe: std::ptr::null_mut(),
         }
     }
 
@@ -2558,6 +2565,9 @@ impl Drop for GpuSim {
             for p in &self.pipes {
                 vf_pipeline_free(self.ctx, *p);
             }
+            if !self.components_pipe.is_null() {
+                vf_pipeline_free(self.ctx, self.components_pipe);
+            }
             for b in [
                 self.bodies[0],
                 self.bodies[1],
@@ -2708,5 +2718,408 @@ impl GpuSim {
             vf_buffer_free(self.ctx, buf);
         }
         back == f.val
+    }
+}
+
+/// Push-константы `components.comp` (32 байта).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PartsPush {
+    /// nx, ny, nz, всего узлов.
+    grid: [u32; 4],
+    /// режим, слоёв эрозии, ёмкость компонент, номер прохода.
+    par: [u32; 4],
+}
+
+/// Проходов распространения в одной пачке `components`: один submit и одно
+/// чтение флага на пачку. Один dispatch на RADV стоит ~0.3 мс, поэтому пачка
+/// важнее точности «до последнего прохода».
+const PARTS_BATCH: u32 = 4;
+
+/// Сколько прыжков по меткам делает ОДИН поток за проход (`label[label[...]]`).
+/// Это локальная работа без синхронизации: метки только убывают, поэтому
+/// цепочка безопасна, а глобальных проходов нужно в `PARTS_JUMPS` раз меньше.
+const PARTS_JUMPS: u32 = 32;
+
+impl GpuSim {
+    /// Разметить компоненты связности поля НА УСТРОЙСТВЕ (`components.comp`).
+    ///
+    /// Вход — поле занятости (`val < 0` внутри), `erode` — слоёв эрозии до
+    /// разметки (0 или 1; глубже считает CPU-оракул `parts::label_field`).
+    /// Алгоритм тот же, что у оракула: ядро → распространение минимума по 6
+    /// соседям с pointer jumping → кожа → остаток без ядра → корни → сжатие →
+    /// плоский список узлов. Хост заливает поле, читает метки и по несколько
+    /// чисел на компоненту; сортировка корней (их единицы-сотни) — на хосте.
+    ///
+    /// `None` — нет `components.spv` или размеры не годятся.
+    pub fn run_components(
+        &mut self,
+        f: &crate::field::NodeField,
+        erode: u32,
+    ) -> Option<crate::parts::GpuParts> {
+        if erode > 1 || f.dims.contains(&0) {
+            return None;
+        }
+        let t0 = std::time::Instant::now();
+        let (nx, ny, nz) = (f.dims[0], f.dims[1], f.dims[2]);
+        let n = nx * ny * nz;
+        if n == 0 {
+            return None;
+        }
+        /* Ёмкость по числу компонент: шумовые области у среза тоже считаются,
+         * поэтому с запасом, но с потолком по памяти. */
+        let cap = (n / 4).clamp(64, 8192);
+        /* Пайплайн создаём лениво: общий цикл сборки и таблицу PIPE_NAMES не
+         * трогаем (правки не должны пересекаться с другим переносом на GPU). */
+        if self.components_pipe.is_null() {
+            let path = self.shader_dir.join("components.spv");
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("components: нет {path:?}: {e}");
+                    return None;
+                }
+            };
+            let cname = std::ffi::CString::new("components").ok()?;
+            let mut p: *mut c_void = std::ptr::null_mut();
+            unsafe {
+                check_status(
+                    vf_pipeline_new(
+                        self.ctx,
+                        bytes.as_ptr() as *const u32,
+                        bytes.len(),
+                        12,
+                        std::mem::size_of::<PartsPush>() as u32,
+                        cname.as_ptr(),
+                        &mut p,
+                    ),
+                    "components",
+                )
+            };
+            self.components_pipe = p;
+        }
+        let ctx = self.ctx;
+        let mk = |bytes: usize, host: bool| -> *mut c_void {
+            let mut b: *mut c_void = std::ptr::null_mut();
+            unsafe {
+                check_status(
+                    vf_buffer_new(ctx, bytes, host as i32, &mut b),
+                    "components: buffer",
+                );
+            }
+            b
+        };
+        /* Горячие буферы — device-local: atomicMin по host-visible памяти у
+         * дискретной карты идёт через PCIe и стоит десятки миллисекунд. */
+        let bval = mk(n * 4, false);
+        let blab = mk(n * 4, false);
+        let bmask = mk(n * 4, false);
+        let bcnt = mk(16, true);
+        let bmdev = mk(cap * 7 * 4, false);
+        let broots = mk(cap * 4, true);
+        let boffs = mk(cap * 4, true);
+        let bcur = mk(cap * 4, false);
+        let bnodes = mk(n * 4, false);
+        let bmeta = mk(cap * 7 * 4, true);
+        let bstage = mk(n * 4, true);
+        let bact = mk(n * 4, false);
+        let mut bufs = [
+            bval, blab, bmask, bcnt, bmdev, broots, boffs, bcur, bnodes, bmeta, bstage, bact,
+        ];
+        let grid = [nx as u32, ny as u32, nz as u32, n as u32];
+        let mut iterations = 0u32;
+        let mut iters_stage = [0u32; 3];
+
+        /* Поле — через staging: прямо в device-local хост писать не может. */
+        let bits: Vec<u32> = f.val.iter().map(|v| v.to_bits()).collect();
+        unsafe {
+            check_status(
+                vf_buffer_write(ctx, bstage, 0, bits.as_ptr() as *const c_void, n * 4),
+                "components: stage val",
+            );
+            check_status(
+                vf_buffer_write(ctx, bcnt, 0, [0u8; 16].as_ptr() as *const c_void, 16),
+                "components: cnt",
+            );
+        }
+        self.components_step(&mut bufs, grid, 9, erode, cap as u32, 0, 1, n);
+        /* Шаг 0: ядро и стартовые метки + список занятых узлов. */
+        self.components_step(&mut bufs, grid, 0, erode, cap as u32, 0, 1, n);
+        let mut hdr0 = [0u32; 4];
+        unsafe {
+            check_status(
+                vf_buffer_read(ctx, bcnt, 0, hdr0.as_mut_ptr() as *mut c_void, 16),
+                "components: active",
+            );
+        }
+        /* Дальше все проходы идут ТОЛЬКО по занятым узлам. */
+        let active = (hdr0[3] as usize).min(n);
+        if std::env::var("VF_COMP_PROF").is_ok() {
+            eprintln!("components: hdr={hdr0:?} активных узлов {active}");
+        }
+
+        /* Шаги 1 и 2: распространение по ядру, затем по коже. Пачки по
+         * `PARTS_BATCH` проходов: флаг изменений читается раз на пачку, а не
+         * на проход (каждое чтение — синхронизация с устройством, и на
+         * RADV один dispatch стоит сотни микросекунд). */
+        for (si, mode) in [1u32, 2u32].into_iter().enumerate() {
+            let mut layer = 0u32;
+            loop {
+                unsafe {
+                    check_status(
+                        vf_buffer_write(ctx, bcnt, 0, [0u8; 4].as_ptr() as *const c_void, 4),
+                        "components: flag",
+                    );
+                }
+                self.components_step(
+                    &mut bufs, grid, mode, erode, cap as u32, PARTS_JUMPS, PARTS_BATCH, active,
+                );
+                layer += PARTS_BATCH;
+                iterations += PARTS_BATCH;
+                let mut hdr = [0u32; 4];
+                unsafe {
+                    check_status(
+                        vf_buffer_read(ctx, bcnt, 0, hdr.as_mut_ptr() as *mut c_void, 16),
+                        "components: hdr",
+                    );
+                }
+                if hdr[0] == 0 || layer > 8 * (nx + ny + nz) as u32 {
+                    break;
+                }
+            }
+            iters_stage[si] = layer;
+        }
+        /* Шаг 3: остаток без ядра (тонкие пластины) — своим индексом. */
+        self.components_step(&mut bufs, grid, 3, erode, cap as u32, 0, 1, active);
+        /* Шаг 4: распространение внутри остатка. */
+        {
+            let mut layer = 0u32;
+            loop {
+                unsafe {
+                    check_status(
+                        vf_buffer_write(ctx, bcnt, 0, [0u8; 4].as_ptr() as *const c_void, 4),
+                        "components: flag",
+                    );
+                }
+                self.components_step(
+                    &mut bufs, grid, 4, erode, cap as u32, PARTS_JUMPS, PARTS_BATCH, active,
+                );
+                layer += PARTS_BATCH;
+                iterations += PARTS_BATCH;
+                let mut hdr = [0u32; 4];
+                unsafe {
+                    check_status(
+                        vf_buffer_read(ctx, bcnt, 0, hdr.as_mut_ptr() as *mut c_void, 16),
+                        "components: hdr",
+                    );
+                }
+                if hdr[0] == 0 || layer > 8 * (nx + ny + nz) as u32 {
+                    break;
+                }
+            }
+            iters_stage[2] = layer;
+        }
+
+        /* Шаг 5: корни компонент (узел, индекс которого равен метке). Счётчики
+         * обнуляем ЧАСТИЧНО: cnt[3] (занятых узлов) нужен режимам по списку. */
+        unsafe {
+            let z = [0u32, 0, 0, active as u32];
+            check_status(
+                vf_buffer_write(ctx, bcnt, 0, z.as_ptr() as *const c_void, 16),
+                "components: cnt",
+            );
+        }
+        self.components_step(&mut bufs, grid, 5, erode, cap as u32, 0, 1, active);
+        let mut hdr = [0u32; 4];
+        unsafe {
+            check_status(
+                vf_buffer_read(ctx, bcnt, 0, hdr.as_mut_ptr() as *mut c_void, 16),
+                "components: hdr",
+            );
+        }
+        let found = hdr[1] as usize;
+        let c = found.min(cap);
+        if found > cap {
+            eprintln!("components: компонент {found} больше ёмкости {cap} — хвост отброшен");
+        }
+        let mut roots = vec![0u32; cap];
+        unsafe {
+            check_status(
+                vf_buffer_read(ctx, broots, 0, roots.as_mut_ptr() as *mut c_void, cap * 4),
+                "components: roots",
+            );
+        }
+        roots.truncate(c);
+        /* Сортировка корней на хосте (их единицы-сотни, а не узлы поля): номер
+         * компоненты = позиция в отсортированном списке, поэтому сжатие метки —
+         * двоичный поиск в шейдере и никакой таблицы соответствий. */
+        let mut order: Vec<usize> = (0..c).collect();
+        order.sort_by_key(|&i| roots[i]);
+        let sorted: Vec<u32> = order.iter().map(|&i| roots[i]).collect();
+        /* Мелочь на компоненту: габариты (lo = максимум, hi = 0) и счётчики
+         * узлов. Сначала в staging, затем копированием в device-local. */
+        let mut meta = vec![0u32; cap * 7];
+        for k in 0..cap {
+            meta[6 * k] = u32::MAX;
+            meta[6 * k + 1] = u32::MAX;
+            meta[6 * k + 2] = u32::MAX;
+        }
+        unsafe {
+            check_status(
+                vf_buffer_write(ctx, broots, 0, sorted.as_ptr() as *const c_void, c * 4),
+                "components: sorted roots",
+            );
+            let hdr2 = [0u32, 0, c as u32, active as u32];
+            check_status(
+                vf_buffer_write(ctx, bcnt, 0, hdr2.as_ptr() as *const c_void, 16),
+                "components: cnt sorted",
+            );
+            check_status(
+                vf_buffer_write(ctx, bmeta, 0, meta.as_ptr() as *const c_void, cap * 28),
+                "components: meta",
+            );
+        }
+        self.components_step(&mut bufs, grid, 13, erode, cap as u32, 0, 1, cap * 7);
+        /* Шаг 6: метка -> номер компоненты плюс габарит и счётчик узлов. */
+        self.components_step(&mut bufs, grid, 6, erode, cap as u32, 0, 1, active);
+        /* Читаем габариты и счётчики обратно через staging. */
+        self.components_step(&mut bufs, grid, 12, erode, cap as u32, 0, 1, cap * 7);
+        let mut bnd = vec![0u32; cap * 6];
+        let mut counts = vec![0u32; cap];
+        unsafe {
+            check_status(
+                vf_buffer_read(ctx, bmeta, 0, bnd.as_mut_ptr() as *mut c_void, cap * 24),
+                "components: bnd",
+            );
+            check_status(
+                vf_buffer_read(
+                    ctx,
+                    bmeta,
+                    cap * 24,
+                    counts.as_mut_ptr() as *mut c_void,
+                    cap * 4,
+                ),
+                "components: counts",
+            );
+        }
+        /* Шаг 7: плоский список узлов по компонентам (начала блоков — на хосте:
+         * компонент десятки, узлов миллионы). */
+        let mut offsets = vec![0u32; c + 1];
+        for k in 0..c {
+            offsets[k + 1] = offsets[k] + counts[k];
+        }
+        let total_nodes = offsets[c] as usize;
+        unsafe {
+            check_status(
+                vf_buffer_write(ctx, boffs, 0, offsets.as_ptr() as *const c_void, c * 4),
+                "components: offs",
+            );
+        }
+        self.components_step(&mut bufs, grid, 11, erode, cap as u32, 0, 1, cap);
+        self.components_step(&mut bufs, grid, 7, erode, cap as u32, 0, 1, active);
+        /* Список узлов — единственный крупный обратный трансфер: метки
+         * восстанавливаются из него на хосте (каждая компонента занимает
+         * непрерывный блок в `nodes`), а читать n*4 Б меток через PCIe
+         * значило бы платить за пустые узлы, которых в поле большинство. */
+        let mut nodes = vec![0u32; total_nodes.max(1)];
+        if total_nodes > 0 {
+            self.components_step(&mut bufs, grid, 10, erode, cap as u32, 0, 1, total_nodes);
+            unsafe {
+                check_status(
+                    vf_buffer_read(
+                        ctx,
+                        bstage,
+                        0,
+                        nodes.as_mut_ptr() as *mut c_void,
+                        total_nodes * 4,
+                    ),
+                    "components: nodes",
+                );
+            }
+        }
+        nodes.truncate(total_nodes);
+
+        let mut labels_raw = vec![u32::MAX; n];
+        for c in 0..c {
+            for k in offsets[c] as usize..offsets[c + 1] as usize {
+                if let Some(slot) = labels_raw.get_mut(nodes[k] as usize) {
+                    *slot = c as u32;
+                }
+            }
+        }
+        let labels = crate::parts::Labels {
+            label: labels_raw,
+            bounds: (0..c)
+                .map(|k| crate::parts::Bounds {
+                    lo: [
+                        f.lo[0] + bnd[6 * k] as i32,
+                        f.lo[1] + bnd[6 * k + 1] as i32,
+                        f.lo[2] + bnd[6 * k + 2] as i32,
+                    ],
+                    hi: [
+                        f.lo[0] + bnd[6 * k + 3] as i32,
+                        f.lo[1] + bnd[6 * k + 4] as i32,
+                        f.lo[2] + bnd[6 * k + 5] as i32,
+                    ],
+                })
+                .collect(),
+            counts: counts[0..c].iter().map(|&v| v as usize).collect(),
+        };
+        self.bytes_up += (n * 4) as u64;
+        self.bytes_down += (n * 8) as u64;
+        unsafe {
+            for b in bufs {
+                vf_buffer_free(ctx, b);
+            }
+        }
+        Some(crate::parts::GpuParts {
+            labels,
+            iterations,
+            iters_stage,
+            ms: t0.elapsed().as_secs_f32() * 1e3,
+            nodes,
+            offsets,
+        })
+    }
+
+    /// Один режим `components.comp`: `rounds` проходов одним submit'ом.
+    ///
+    /// `elems` — сколько потоков нужно режиму (узлы поля или элементы `cap`),
+    /// `jumps` — сколько локальных прыжков по меткам делает поток за проход
+    /// (режимы распространения; остальные режимы его не читают).
+    #[allow(clippy::too_many_arguments)]
+    fn components_step(
+        &self,
+        bufs: &mut [*mut c_void],
+        grid: [u32; 4],
+        mode: u32,
+        erode: u32,
+        cap: u32,
+        jumps: u32,
+        rounds: u32,
+        elems: usize,
+    ) {
+        let pushes = vec![
+            PartsPush {
+                grid,
+                par: [mode, erode, cap, jumps]
+            };
+            rounds as usize
+        ];
+        let mut ds: Vec<VfDispatch> = pushes
+            .iter()
+            .map(|p| VfDispatch {
+                pipeline: self.components_pipe,
+                buffers: bufs.as_mut_ptr(),
+                n_buffers: bufs.len() as u32,
+                push: p as *const PartsPush as *const c_void,
+                push_bytes: std::mem::size_of::<PartsPush>() as u32,
+                groups: [(elems as u32).div_ceil(64).max(1), 1, 1],
+                stage: 0,
+            })
+            .collect();
+        unsafe {
+            check_status(vf_run(self.ctx, ds.as_mut_ptr(), ds.len() as u32), "components");
+        }
     }
 }

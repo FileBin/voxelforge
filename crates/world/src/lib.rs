@@ -11,6 +11,7 @@
 pub mod bcc;
 pub mod ccd;
 pub mod field;
+pub mod parts;
 pub mod perf;
 pub mod sdf_contact;
 pub mod collide;
