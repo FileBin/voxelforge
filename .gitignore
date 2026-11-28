@@ -3,3 +3,4 @@ result*
 .direnv/
 demos/out/
 shaders/spv/
+shaders/spv-out

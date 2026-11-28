@@ -6,11 +6,28 @@ use crate::tet::{node_pos, Tet, TetBody};
 use crate::types::Body;
 use crate::vfw::Shape;
 
-pub const MAX_BODIES: usize = 64;
+/// Ёмкость буферов мира: сколько тел МОЖЕТ жить одновременно. Это НЕ число
+/// симулируемых тел — сколько их сейчас, знает `GpuSim::active()` (pc.grid.w).
+/// Ёмкость с запасом: мир перестаёт принимать тела только по-настоящему
+/// (кончился пул тетов / SDF), и об этом он говорит в лог.
+pub const MAX_BODIES: usize = crate::sim::MAX_BODIES_CAP;
 pub const DENSITY: f64 = 420.0;
 pub const MIN_TETS: usize = 20;
 /// Сколько снарядов живёт одновременно; дальше самый старый уходит из мира.
 pub const MAX_BULLETS: usize = 12;
+/// Срок жизни снаряда в тактах (8 с при 20 Гц). Снаряд, который не покинул
+/// ящик и не заснул, всё равно уходит по TTL — иначе слот занят навсегда.
+pub const BULLET_TTL_TICKS: u64 = 160;
+/// Как часто (в тактах) GPU-путь перечитывает позы ради отсечения улетевших
+/// тел. Между чтениями работают только TTL и сон: 20 КБ раз в 4 такта дешевле,
+/// чем полное чтение буфера каждый такт.
+const CULL_PERIOD: u64 = 4;
+/// Потолок, после которого SDF-контакты предупреждают о себе. Широкий проход
+/// SDF перебирает пары ТЕЛ (n(n-1)/2) и на каждую пару сканирует узлы поля:
+/// замер на RX 6600 — 65 тел 13 мс, 130 тел ~330 мс, 163 тела ~660 мс, 256
+/// тел роняют контекст. Это свойство прохода SDF, а не ёмкости буферов;
+/// прежний потолок 64 тела его просто скрывал.
+const SDF_BODY_WARN: usize = 96;
 /// Дешёвый порог CCD: если самое быстрое тело за такт смещается меньше этого,
 /// читать буфер тел ради continuous не нужно вовсе (метры).
 const CCD_MIN_MOVE: f64 = 0.05;
@@ -214,9 +231,36 @@ pub enum Kind {
     Bullet,
 }
 
+/// Почему тело убрано из мира. Нужен для счётчиков и лога VF_DEBUG=1:
+/// «мир перестал принимать тела» без причины не отлаживается.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Despawn {
+    /// Вышло за пределы ящика мира (упало ниже пола или улетело за стенку).
+    Bounds,
+    /// Истёк срок жизни снаряда.
+    Ttl,
+    /// Снаряд/осколок уснул и больше не нужен.
+    Sleep,
+    /// Вытеснено пулом снарядов (живых больше MAX_BULLETS).
+    Evicted,
+}
+
+impl Despawn {
+    fn text(self) -> &'static str {
+        match self {
+            Despawn::Bounds => "вышло за границы мира",
+            Despawn::Ttl => "истёк TTL снаряда",
+            Despawn::Sleep => "уснуло",
+            Despawn::Evicted => "вытеснено пулом снарядов",
+        }
+    }
+}
+
 pub struct LiveBody {
     /// Устойчивый идентификатор: слоты переиспользуются, id — нет.
     pub id: u64,
+    /// Номер такта, на котором тело родилось: по нему считается TTL снаряда.
+    pub born: u64,
     /// До какого кадра тело нельзя раскалывать: свежие осколки толкаются
     /// друг с другом ещё до того, как улеглись, и раньше это дробило их
     /// дальше по кругу — плита рассыпалась сама себя.
@@ -383,6 +427,12 @@ pub struct Live {
     pub mirror: Vec<GpuBody>,
     /// Следующий свободный идентификатор тела.
     next_id: u64,
+    /// Номер такта (растёт ровно на 1 за `step`): по нему считается TTL.
+    ticks: u64,
+    /// Свободные слоты внутри `bodies` (LIFO). Освобождается деспавном,
+    /// занимается спавном — поэтому снаряд и осколок сразу получают слот
+    /// обратно, а не упираются в ёмкость.
+    free_list: Vec<usize>,
     /// Номер текущего кадра.
     frames: u64,
     /// Живые снаряды в порядке выстрела: их слоты переиспользуются.
@@ -417,6 +467,16 @@ pub struct Live {
     pub cracks: usize,
     pub shards_made: usize,
     pub shots: usize,
+    /// Диагностика ёмкости: сколько тел создано, сколько спавнов отклонено
+    /// (нет свободного слота / кончился пул), сколько слотов освобождено.
+    pub created: usize,
+    pub refused: usize,
+    pub despawn_bounds: usize,
+    pub despawn_ttl: usize,
+    pub despawn_sleep: usize,
+    pub despawn_evicted: usize,
+    /// Одноразовое предупреждение о потолке SDF-контактов (см. `SDF_BODY_WARN`).
+    sdf_warned: bool,
     pub last_log: String,
     pub lines_on: bool,
     pub near: f32,
@@ -468,6 +528,7 @@ fn scene_plate() -> (Params, LiveBody, Vec<GpuBody>) {
 
     let mut body = LiveBody {
         id: 1,
+        born: 0,
         crack_after: 0,
         pos: [0.0, rest_y as f64, 0.0],
         quat: [1.0, 0.0, 0.0, 0.0],
@@ -543,6 +604,10 @@ impl Live {
             GpuSim::new(gpu_bodies.clone(), shader_dir, params)
         };
         let mut gpu = gpu;
+        /* Считаем только занятые слоты: буферы выделены на всю ёмкость
+         * (MAX_BODIES), но в мире пока одно тело. Дальше `set_active`
+         * вызывается при каждом спавне в новый слот. */
+        gpu.set_active(1);
         /* Режим контактов задаётся здесь один раз: у мира и у устройства он
          * обязан совпадать, иначе такт соберёт проходы одного режима. */
         gpu.set_sdf_collide(matches!(std::env::var("VF_COLLIDE").as_deref(), Ok("sdf")));
@@ -556,6 +621,8 @@ impl Live {
 
         let mut live = Live {
             next_id: 1 + (MAX_BODIES as u64),
+            ticks: 0,
+            free_list: Vec::new(),
             frames: 0,
             bullets: std::collections::VecDeque::new(),
             gpu_collide: matches!(
@@ -580,6 +647,13 @@ impl Live {
             cracks: 0,
             shards_made: 0,
             shots: 0,
+            created: 0,
+            refused: 0,
+            despawn_bounds: 0,
+            despawn_ttl: 0,
+            despawn_sleep: 0,
+            despawn_evicted: 0,
+            sdf_warned: false,
             last_log: String::new(),
             lines_on: false,
             near: 0.0,
@@ -1119,6 +1193,26 @@ impl Live {
         self.pending_vmax = 0.0;
         self.last_vmax = vmax as f32;
         self.last_awake = awake_now;
+        /* Отсечение тел. Раз в CULL_PERIOD тактов позы перечитываются с
+         * устройства (предыдущий такт уже закрыт — wait_idle выше), и тогда
+         * проверяются границы мира. Между чтениями работают только TTL и сон
+         * снарядов — им позиция не нужна. */
+        if self.ticks % CULL_PERIOD == 0 {
+            self.sync_all();
+            self.cull(true);
+        } else {
+            self.cull(false);
+        }
+        /* SDF-контакты не тянут сотни тел (см. SDF_BODY_WARN): предупредить
+         * ОДИН раз, пока такт ещё вменяемый, а не молчать до зависания. */
+        if self.sdf_collide && !self.sdf_warned && self.alive_count() > SDF_BODY_WARN {
+            self.sdf_warned = true;
+            eprintln!(
+                "[capacity] SDF-контакты: {} тел (потолок без провала такта ~{SDF_BODY_WARN}). \
+                 Для больших сцен запускайте без VF_COLLIDE=sdf (контакты SAT на CPU)",
+                self.alive_count()
+            );
+        }
         if self.fracture_enabled {
             if self.gpu_collide {
                 /* События удара с устройства: 32 байта на тело вместо списка
@@ -1160,7 +1254,13 @@ impl Live {
          * ещё пуст, пар нет, и снаряд пролетает сквозь плиту (найдено на
          * 120 м/с: кадр 0 — 0 пар, кадр 1 — 22976, но уже поздно). */
         if self.geom_dirty {
-            let local: Vec<Vec<[[f32; 3]; 4]>> = self.bodies.iter().map(|b| b.local_tets().clone()).collect();
+            /* Мёртвые слоты отдают ПУСТУЮ геометрию: иначе их теты висят в
+             * общем пуле и пул «протекает» с каждым спавном. */
+            let local: Vec<Vec<[[f32; 3]; 4]>> = self
+                .bodies
+                .iter()
+                .map(|b| if b.alive { b.local_tets().clone() } else { Vec::new() })
+                .collect();
             self.gpu.upload_geometry(&local);
             /* Таблица SDF-полей: дескриптор и значения на каждый слот. Заливаем
              * здесь же — вместе с геометрией, потому что набор тел меняется
@@ -1405,14 +1505,83 @@ impl Live {
         self.bodies.iter().filter(|b| b.alive).count()
     }
 
+    /// Свободных слотов в ёмкости: мёртвые слоты плюс ещё не занятая часть.
+    pub fn free_slots(&self) -> usize {
+        self.free_list.len() + (MAX_BODIES - self.bodies.len())
+    }
+
+    /// Сколько слотов мир освободил деспавном за прогон.
+    pub fn despawned(&self) -> usize {
+        self.despawn_bounds + self.despawn_ttl + self.despawn_sleep + self.despawn_evicted
+    }
+
+    fn log_capacity(&self, msg: &str) {
+        if std::env::var("VF_DEBUG").is_ok() {
+            eprintln!("[capacity] {msg}");
+        }
+    }
+
+    /// Сколько тетов занято живыми телами в общем пуле устройства. Пул
+    /// заливается по всем слотам, поэтому мёртвые слоты обязаны отдавать
+    /// пустую геометрию — иначе пул «протекает» на каждом спавне.
+    pub fn tets_in_use(&self) -> usize {
+        self.bodies
+            .iter()
+            .filter(|b| b.alive)
+            .map(|b| b.tets.len())
+            .sum()
+    }
+
+    /// Отсечение тел: улетело за ящик мира / истёк TTL снаряда / снаряд уснул.
+    /// `fresh` — позы на CPU свежие (границу можно проверять); иначе только
+    /// TTL и сон, которым позиция не нужна.
+    fn cull(&mut self, fresh: bool) {
+        let mut kill: Vec<(usize, Despawn)> = Vec::new();
+        for i in 0..self.bodies.len() {
+            let b = &self.bodies[i];
+            if !b.alive {
+                continue;
+            }
+            if fresh {
+                let p = b.pos;
+                if p[1] < -2.0
+                    || p[0].abs() > self.params.hi[0] as f64 + 1.5
+                    || p[2].abs() > self.params.hi[2] as f64 + 1.5
+                {
+                    kill.push((i, Despawn::Bounds));
+                    continue;
+                }
+            }
+            if b.kind == Kind::Bullet {
+                let age = self.ticks.saturating_sub(b.born);
+                if age > BULLET_TTL_TICKS {
+                    kill.push((i, Despawn::Ttl));
+                } else if self.mirror[i].misc[1] > 0.5 {
+                    /* Снаряд лёг и уснул — слот нужен следующему. Осколки не
+                     * трогаем: они и есть мир. */
+                    kill.push((i, Despawn::Sleep));
+                }
+            }
+        }
+        for (slot, why) in kill {
+            self.despawn(slot, why);
+        }
+    }
+
     fn free_slot(&mut self) -> Option<usize> {
-        if let Some(i) = self.bodies.iter().position(|b| !b.alive) {
-            return Some(i);
+        /* Free-list: слоты, освобождённые деспавном. Проверяем `alive` на
+         * случай, если слот успели занять другим путём — тогда он просто
+         * выбрасывается из списка. */
+        while let Some(slot) = self.free_list.pop() {
+            if slot < self.bodies.len() && !self.bodies[slot].alive {
+                return Some(slot);
+            }
         }
         if self.bodies.len() < MAX_BODIES {
             let _ = Body::new([0.0, -400.0, 0.0], [0.0; 3], 1.0, 0.05);
             self.bodies.push(LiveBody {
                 id: 0,
+                born: 0,
                 crack_after: 0,
                 pos: [0.0, -400.0, 0.0],
                 quat: [1.0, 0.0, 0.0, 0.0],
@@ -1430,13 +1599,17 @@ impl Live {
                 sdf: None,
                 sdf_shift: [0.0; 3],
             });
-            return Some(self.bodies.len() - 1);
+            let slot = self.bodies.len() - 1;
+            /* Новый слот — значит и считать надо на одно тело больше. */
+            self.gpu.set_active(self.bodies.len());
+            return Some(slot);
         }
         None
     }
 
     pub fn step(&mut self, dt: f32, substeps: u32, iterations: u32) {
         self.frames += 1;
+        self.ticks += 1;
         // Контакты нельзя снимать один раз на кадр: за 1/60 с снаряд на 26 м/с
         // пролетает 0.43 м — больше тетраэдра, и просто проходит сквозь тело.
         // Дробим кадр так, чтобы самое быстрое тело смещалось не больше
@@ -1537,27 +1710,7 @@ impl Live {
                 (t_collide + t_dep + t_solve + t_frac) * 1e3);
         }
         // улетевшее за пределы ящика убираем
-        let mut moved = false;
-        for i in 0..self.bodies.len() {
-            if !self.bodies[i].alive {
-                continue;
-            }
-            let p = self.bodies[i].pos;
-            if p[1] < -2.0
-                || p[0].abs() > self.params.hi[0] as f64 + 1.5
-                || p[2].abs() > self.params.hi[2] as f64 + 1.5
-            {
-                self.bodies[i].alive = false;
-                let parked = Body::new([0.0, -400.0, 0.0], [0.0; 3], 1.0, 0.05);
-                let mut g2 = GpuBody::from_cpu(&parked);
-                g2.misc[1] = 1.0;
-                self.mirror[i] = g2;
-                moved = true;
-            }
-        }
-        if moved {
-            self.gpu.write_bodies(&self.mirror);
-        }
+        self.cull(true);
     }
 
     /// Позиционная развязка — мягко и с потолком: жёсткий «выброс» на всю
@@ -1781,8 +1934,7 @@ impl Live {
             if !self.bodies[ti].alive {
                 continue;
             }
-            let free = self.bodies.iter().filter(|b| !b.alive).count()
-                + (MAX_BODIES - self.bodies.len());
+            let free = self.free_slots();
             if free < 2 {
                 continue;
             }
@@ -1957,6 +2109,7 @@ impl Live {
                 );
                 let mut body = LiveBody {
                     id: self.new_id(),
+                    born: self.ticks,
                     crack_after: self.frames + 30,
                     pos: [off[0] + tpos[0], off[1] + tpos[1], off[2] + tpos[2]],
                     quat: tq,
@@ -2105,6 +2258,10 @@ impl Live {
         let mut rng = crate::tet::Lcg::new(0xB17E_5EED ^ (self.cracks as u64));
         let mut created = 0usize;
         let mut new_slots: Vec<usize> = Vec::new();
+        /* Бюджет общего пула тетов: родитель уже учтён, его теты уйдут
+         * осколкам. Если пул кончился — осколок не создаётся с честным логом. */
+        let mut pool_left = crate::sim::MAX_POOL_TETS
+            .saturating_sub(self.tets_in_use().saturating_sub(self.bodies[ti].tets.len()));
 
         for (k, fr) in frags.iter().enumerate() {
             let lc = fr.world_centroid();
@@ -2123,11 +2280,32 @@ impl Live {
             let speed = v_rms * (0.5 + 0.9 * rng.unit() as f64);
 
             let slot = if k == 0 { Some(ti) } else { self.free_slot() };
-            let Some(slot) = slot else { break };
+            let Some(slot) = slot else {
+                self.refused += 1;
+                self.log_capacity(&format!(
+                    "осколок не создан: свободных слотов {} из {}",
+                    self.free_slots(),
+                    MAX_BODIES
+                ));
+                break;
+            };
+            if fr.tets.len() > pool_left {
+                self.free_list.push(slot);
+                self.refused += 1;
+                eprintln!(
+                    "[capacity] пул тетов исчерпан: осколок на {} тетов не влез (свободно {}), слотов {}",
+                    fr.tets.len(),
+                    pool_left,
+                    self.free_slots()
+                );
+                break;
+            }
+            pool_left -= fr.tets.len();
 
             let id = self.new_id();
             let mut body = LiveBody {
                 id,
+                born: self.ticks,
                 crack_after: self.frames + 30,
                 pos: wp,
                 quat: tq,
@@ -2140,7 +2318,7 @@ impl Live {
                 radius: 0.2,
                 tets: fr.tets.clone(),
                 origin: fr.origin,
-            sdf: fr.sdf.get().cloned(),
+                sdf: fr.sdf.get().cloned(),
                 sdf_shift: [0.0; 3],
                 level_cap: fr.level_cap,
                 local: Vec::new(),
@@ -2161,6 +2339,7 @@ impl Live {
             }
             new_slots.push(slot);
             created += 1;
+            self.created += 1;
         }
 
         // Слоты осколков ОБЯЗАНЫ уехать на GPU в этом же кадре: иначе снимок
@@ -2197,11 +2376,28 @@ impl Live {
 
     /// Убирает тело из мира: паркует его далеко внизу и помечает спящим.
     /// Слот после этого свободен и его забирает следующий снаряд.
-    fn despawn(&mut self, slot: usize) {
+    ///
+    /// `why` — причина: попадает в лог при VF_DEBUG=1 и в счётчики причин.
+    fn despawn(&mut self, slot: usize, why: Despawn) {
         if slot >= self.bodies.len() || !self.bodies[slot].alive {
             return;
         }
+        match why {
+            Despawn::Bounds => self.despawn_bounds += 1,
+            Despawn::Ttl => self.despawn_ttl += 1,
+            Despawn::Sleep => self.despawn_sleep += 1,
+            Despawn::Evicted => self.despawn_evicted += 1,
+        }
         self.bodies[slot].alive = false;
+        /* Слот возвращается в free-list: следующий спавн заберёт его, а не
+         * будет искать «первое мёртвое» линейным проходом. */
+        self.free_list.push(slot);
+        self.bullets.retain(|&s| s != slot);
+        self.log_capacity(&format!(
+            "деспавн слота {slot} (id {}): {}",
+            self.bodies[slot].id,
+            why.text()
+        ));
         let parked = Body::new([0.0, -400.0, 0.0], [0.0; 3], 1.0, 0.05);
         let mut g = GpuBody::from_cpu(&parked);
         g.misc[1] = 1.0;
@@ -2230,11 +2426,36 @@ impl Live {
         }
         while self.bullets.len() >= MAX_BULLETS {
             match self.bullets.pop_front() {
-                Some(old) => self.despawn(old),
+                Some(old) => self.despawn(old, Despawn::Evicted),
                 None => break,
             }
         }
-        let Some(slot) = self.free_slot() else { return false };
+        let Some(slot) = self.free_slot() else {
+            /* Молча отказывать нельзя: раньше это выглядело как «мир
+             * перестал принимать выстрелы». Теперь причина в логе и счётчике. */
+            self.refused += 1;
+            self.log_capacity(&format!(
+                "спавн снаряда отклонён: свободных слотов {} из {} (живых {})",
+                self.free_slots(),
+                MAX_BODIES,
+                self.alive_count()
+            ));
+            return false;
+        };
+        /* Пул тетов: если он исчерпан, тело не создаётся — но об этом честно
+         * сообщается, а не «мир молча перестал стрелять». */
+        let ball_tets = TetBody::ball([0.0, 0.0, 0.0], 0.14, 0).tets.len();
+        if self.tets_in_use() + ball_tets > crate::sim::MAX_POOL_TETS {
+            self.free_list.push(slot);
+            self.refused += 1;
+            eprintln!(
+                "[capacity] пул тетов исчерпан: {} + {} > {} — снаряд не создан",
+                self.tets_in_use(),
+                ball_tets,
+                crate::sim::MAX_POOL_TETS
+            );
+            return false;
+        }
         /* Снаряд — ШАР, заданный SDF (аналитическая сфера, запечённая в узлы).
          * Раньше здесь стоял гранёный куб, и никакая правка ball() до снаряда
          * не доходила — снаружи это и выглядело как угловатый бок с шипом. */
@@ -2242,6 +2463,7 @@ impl Live {
         let id = self.new_id();
         let mut body = LiveBody {
             id,
+            born: self.ticks,
             crack_after: 0,
             pos: from,
             quat: [1.0, 0.0, 0.0, 0.0],
@@ -2281,6 +2503,7 @@ impl Live {
         self.bullets.retain(|&s| s != slot);
         self.bullets.push_back(slot);
         self.shots += 1;
+        self.created += 1;
         /* снаряд только что родился на CPU — нарезка такта обязана это знать */
         self.refresh_vmax();
         self.last_awake = self.last_awake.max(1);
@@ -2296,13 +2519,23 @@ impl Live {
         let (params, body, gpu_bodies) = scene_plate();
         self.bodies = vec![body];
         self.mirror = gpu_bodies;
+        /* После сброса считаем одно тело: ёмкость буферов та же. */
+        self.gpu.set_active(1);
         self.gpu.write_bodies(&self.mirror);
         self.geom_dirty = true;
         self.bullets.clear();
+        self.free_list.clear();
+        self.ticks = 0;
         self.next_id = 1 + (MAX_BODIES as u64);
         self.cracks = 0;
         self.shards_made = 0;
         self.shots = 0;
+        self.created = 0;
+        self.refused = 0;
+        self.despawn_bounds = 0;
+        self.despawn_ttl = 0;
+        self.despawn_sleep = 0;
+        self.despawn_evicted = 0;
         self.last_vmax = 0.0;
         self.last_awake = MAX_BODIES as u32;
         self.pending_vmax = 0.0;

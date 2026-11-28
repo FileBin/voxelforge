@@ -29,6 +29,13 @@ void main() {
 
     vec3 alo = aabb[i * 2u].xyz;
     vec3 ahi = aabb[i * 2u + 1u].xyz;
+    vec3 cen_a = b[i].pos_r.xyz;
+    /* Радиус — описанная сфера тела: контакт двух тел возможен ТОЛЬКО если
+     * центры ближе суммы радиусов. Проверка ничего не теряет (сфера шире
+     * тела), но снимает пары, у которых AABB пересекаются из-за поворота
+     * вытянутого осколка. На куче в сотни тел это разница между «тактом» и
+     * зависанием: пар становится в разы меньше. */
+    float rad_a = b[i].pos_r.w;
     bool sleep_a = b[i].misc.y > 0.5;
     /* тело без запечённого поля (пустой слот, парковка, осколок без поля)
      * контактов по SDF не даёт — и его AABB, посчитанный по пустому пулу
@@ -41,6 +48,8 @@ void main() {
         vec3 blo = aabb[j * 2u].xyz;
         vec3 bhi = aabb[j * 2u + 1u].xyz;
         if (any(greaterThan(alo, bhi)) || any(greaterThan(blo, ahi))) continue;
+        float reach = rad_a + b[j].pos_r.w;
+        if (reach > 0.0 && distance(cen_a, b[j].pos_r.xyz) > reach) continue;
         /* обе спят — решать нечего (как в sat.comp) */
         if (sleep_a && b[j].misc.y > 0.5) continue;
 

@@ -67,9 +67,10 @@ layout(push_constant) uniform Push {
 const int CAP = 64;
 /* Кольцо событий раскола: 64 тела — потолок такта, вдвое с запасом. */
 const uint MAX_EVENTS = 128u;
-/* Потолок пар тел в широком проходе SDF (64 тела → 2016). Должно совпадать
- * с sim::MAX_SDF_PAIRS. */
-const uint MAX_SDF_PAIRS = 2016u;
+/* Потолок пар тел в широком проходе SDF. Ёмкость тел 512 → 512·511/2 =
+ * 130816; должно совпадать с sim::MAX_SDF_PAIRS. Пары за потолком не
+ * пишутся (счётчик всё равно растёт), поэтому значение — worst case. */
+const uint MAX_SDF_PAIRS = 130816u;
 const int GROUND = -1;
 
 ivec3 cell_of(vec3 p, vec3 lo, float cell, ivec3 dim) {

@@ -754,6 +754,9 @@ fn main() {
     let mut iterations_arg: u32 = 12;
     let mut shots: Vec<u64> = Vec::new();
     let mut tets_at_start = false;
+    /* --fill N — набить мир осколками до N тел ещё до окна: проверка того,
+     * что ёмкость больше 64 и что в строке тел оверлея это видно. */
+    let mut fill_bodies: usize = 0;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -765,6 +768,9 @@ fn main() {
             "--substeps" => substeps_arg = it.next().and_then(|v| v.parse().ok()).unwrap_or(10),
             "--iterations" => iterations_arg = it.next().and_then(|v| v.parse().ok()).unwrap_or(18),
             "--tets" => tets_at_start = true,
+            "--fill" => {
+                fill_bodies = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            }
             "--shots" => {
                 shots = it
                     .next()
@@ -786,7 +792,35 @@ fn main() {
 
     // Мир (и вместе с ним девайс Vulkan) создаётся ДО окна: окно рендерит на
     // том же девайсе, иначе буферы тел физически недоступны графике.
-    let live = Live::new_windowed(&shaders);
+    let mut live = Live::new_windowed(&shaders);
+    /* --fill N: набиваем мир осколками до старта окна. Нужно, чтобы проверка
+     * «ёмкость больше 64» была видна в строке тел оверлея, а не только в пробе. */
+    if fill_bodies > 0 {
+        use voxelforge_world::live::{Kind, MIN_TETS};
+        let mut guard = 0;
+        while live.alive_count() < fill_bodies && guard < 20000 {
+            guard += 1;
+            let mut best: Option<usize> = None;
+            let mut best_t = 0;
+            for (i, b) in live.bodies.iter().enumerate() {
+                if b.alive && b.kind != Kind::Bullet && b.tets.len() > best_t {
+                    best_t = b.tets.len();
+                    best = Some(i);
+                }
+            }
+            let Some(i) = best else { break };
+            if best_t < 2 * MIN_TETS {
+                break;
+            }
+            let p = live.bodies[i].pos;
+            let before = live.alive_count();
+            live.split(i, [p[0] as f32, p[1] as f32, p[2] as f32], 4000.0, 8);
+            if live.alive_count() == before {
+                break;
+            }
+        }
+        println!("[live] набивка: тел {}", live.alive_count());
+    }
     let body_buf0 = live.gpu.body_buffer();
     let mut view: *mut c_void = std::ptr::null_mut();
     unsafe {
