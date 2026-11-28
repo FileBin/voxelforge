@@ -1,0 +1,51 @@
+#version 450
+#include "common.glsl"
+
+/* Широкий проход SDF-коллизий: пары ТЕЛ, а не пар тетраэдров.
+ *
+ * SAT работает по парам тетов (их миллионы), SDF-контакту нужна пара тел:
+ * внутри пары поле уже даёт поверхность. Поэтому пары строятся прямо по
+ * AABB тел (body_aabb.comp кладёт их с запасом на путь за такт — быстрый
+ * снаряд попадает в пару ещё до того, как пересёк тело).
+ *
+ * Один вызов на тело i, перебор j > i: всего n²/2 проверок на такт, при
+ * 64 телах это 2016 сравнений — дешевле любой сетки.
+ *
+ * Вывод — список uvec2{body_a, body_b} и счётчик. Пара пишется один раз:
+ * нормаль контакта в SDF-проходе считается из градиентов, ей всё равно,
+ * в каком порядке тела.
+ */
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) readonly buffer Bodies { Body b[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Aabb { vec4 aabb[]; };
+layout(std430, set = 0, binding = 2) buffer Pairs { uvec2 pairs[]; };
+layout(std430, set = 0, binding = 3) buffer PairCount { uint pcnt[]; };
+layout(std430, set = 0, binding = 4) readonly buffer Descs { SdfDesc descs[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint n = uint(pc.grid.w);
+    if (i >= n) return;
+
+    vec3 alo = aabb[i * 2u].xyz;
+    vec3 ahi = aabb[i * 2u + 1u].xyz;
+    bool sleep_a = b[i].misc.y > 0.5;
+    /* тело без запечённого поля (пустой слот, парковка, осколок без поля)
+     * контактов по SDF не даёт — и его AABB, посчитанный по пустому пулу
+     * тетов, указывает в начало координат. Без этой проверки такие тела
+     * давали десятки ложных пар. */
+    if (!sdf_has_field(descs[i])) return;
+
+    for (uint j = i + 1u; j < n; j++) {
+        if (!sdf_has_field(descs[j])) continue;
+        vec3 blo = aabb[j * 2u].xyz;
+        vec3 bhi = aabb[j * 2u + 1u].xyz;
+        if (any(greaterThan(alo, bhi)) || any(greaterThan(blo, ahi))) continue;
+        /* обе спят — решать нечего (как в sat.comp) */
+        if (sleep_a && b[j].misc.y > 0.5) continue;
+
+        uint slot = atomicAdd(pcnt[0], 1u);
+        if (slot >= MAX_SDF_PAIRS) continue;
+        pairs[slot] = uvec2(i, j);
+    }
+}

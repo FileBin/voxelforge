@@ -456,7 +456,12 @@ impl TetBody {
                     let inside = q[0].max(q[1]).max(q[2]).min(0.0);
                     let i = (((z + nf) as usize) * dim + ((y + nf) as usize)) * dim
                         + ((x + nf) as usize);
-                    val[i] = (outside + inside) * step;
+                    /* В ЕДИНИЦАХ УЗЛА, как у шара и у поля по занятости:
+                     * молчаливое умножение на step давало метры, а физика
+                     * (sample_m, intersect_plane, sdf_contact) считает поле
+                     * узловым и умножает на step сама — глубина контакта
+                     * выходила в 14 раз меньше настоящей (шаг плиты 0.07 м). */
+                    val[i] = outside + inside;
                 }
             }
         }

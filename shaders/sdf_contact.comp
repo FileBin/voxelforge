@@ -1,58 +1,100 @@
 #version 450
-/* Контакты SDF↔SDF (перенос CPU-оракула crates/world/src/sdf_contact.rs).
+#include "common.glsl"
+
+/* Контакты SDF↔SDF — перенос CPU-оракула crates/world/src/sdf_contact.rs.
  *
  * Логика ровно та же, что проверена тестами на CPU:
- *   1. затравки — узлы сетки тела B внутри пересечения AABB и объёмов
+ *   1. затравки — узлы сетки ОДНОГО тела внутри пересечения AABB обоих
  *      (f_a < 0 и f_b < 0) — топологически нейтрально (тор, зацепления);
- *   2. 4 итерации спуска p -= 0.5*(f_a*n_a + f_b*n_b), n = gradient;
+ *   2. 4 итерации спуска p -= 0.5*(f_a*n_a + f_b*n_b), n = градиент (в метрах);
  *   3. валидность по обоим полям, глубина = (-f_a) + (-f_b),
  *      нормаль = normalize(n_a - n_b);
- *   4. дедуп по шагу и кэп контактов на пару.
+ *   4. контакты пишутся в ТОТ ЖЕ список тела, что заполняет sat.comp, поэтому
+ *      contact_select, impact, depenetrate и солвер не меняются.
  *
- * Раскладка (пока не подключена в такт, но фиксирована):
- *   binding 0 — SDF-поля на тело: uvec4{ lo.xyz, dims.x } ... см. sdf_desc
- *   binding 1 — значения полей подряд (f32)
- *   binding 2 — пары тел: uvec2{ body_a, body_b }
- *   binding 3 — контакты: vec4{ xyz точки, глубина } и vec4{ нормаль, 0 }
+ * Раскладка (sim.rs: GpuSim::upload_sdf):
+ *   binding 0 — тела (поза и поворот берутся здесь, а не из дескриптора:
+ *               тела двигаются каждый такт, таблица заливается только при спавне)
+ *   binding 1 — дескрипторы полей: ivec4 lo_dims (lo.xyz, dims.x),
+ *               ivec4 dims2 (dims.yz, 0, 0), vec4 step, vec4 shift
+ *               (shift — центр поля относительно центроида тела, в системе тела)
+ *   binding 2 — значения полей подряд: слот тела * SDF_STRIDE + (z*dims.y+y)*dims.x+x
+ *   binding 3 — пары тел из sdf_pairs.comp
+ *   binding 4 — список контактов тела (C)
+ *   binding 5 — счётчики контактов
+ *   binding 6 — число пар (из буфера, как у sat: чтения на CPU нет)
+ *
+ * ЗАТРАВКИ БЕЗ ПРОХОДА ПО ВСЕМ УЗЛАМ. Наивный перебор всей сетки тела — это
+ * десятки тысяч узлов × ~100 выборок поля на узел; на кадр это миллионы
+ * выборок даже для одной пары. Поэтому:
+ *   - перебираем узлы тела с МЕНЬШИМ полем (кто реже — тот сетка затравок);
+ *   - только внутри пересечения AABB (8 углов чужого поля в свою систему);
+ *   - не больше 64 затравок на пару (одна invocation = одна затравка), шаг
+ *     перебора равномерно растянут по всему пересечению.
+ * Остальное делает contact_select: он оставляет KEEP самых глубоких с
+ * отбрасыванием дублей ближе 0.02 м.
  */
 layout(local_size_x = 64) in;
 
-struct sdf_desc {
-    ivec4 lo_dims;   /* lo.xyz, dims.x */
-    ivec4 dims2;     /* dims.yz, 0, 0 */
-    vec4  step_pad;  /* step, 0, 0, 0 */
-    vec4  origin;    /* мировой центр тела */
-};
+/* Слов на слот в пуле значений. Должно совпадать с sim::SDF_STRIDE
+ * (64 слота × 65536 × 4 Б = 16 МБ). */
+const uint SDF_STRIDE = 65536u;
+/* Затравок на пару: одна рабочая группа, каждому потоку — свой кусок сетки. */
+const uint SEEDS = 64u;
+/* Контактов с одного потока. Потолок на пару — 64×это, дальше режет
+ * contact_select (KEEP = 24 самых глубоких с отбрасыванием дублей).
+ * Без потолка поток, попавший в толщу перекрытия, считал бы спуск на каждом
+ * узле — а это ~100 выборок поля на узел. */
+const uint PER_LANE = 2u;
 
-layout(std430, binding = 0) readonly buffer Descs { sdf_desc descs[]; };
-layout(std430, binding = 1) readonly buffer Values { float vals[]; };
-layout(std430, binding = 2) readonly buffer Pairs { uvec2 pairs[]; };
-/* Один массив: блок SSBO может иметь только один массив без размера.
- * Раскладка: [2*i] = точка.xyz + глубина, [2*i+1] = нормаль.xyz + 0. */
-layout(std430, binding = 3) writeonly buffer Out { vec4 c[]; };
-layout(std430, binding = 4) buffer Counters { uint counts[]; };
+layout(std430, set = 0, binding = 0) buffer Bodies { Body b[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Descs { SdfDesc descs[]; };
+layout(std430, set = 0, binding = 2) readonly buffer Values { float vals[]; };
+layout(std430, set = 0, binding = 3) readonly buffer Pairs { uvec2 pairs[]; };
+layout(std430, set = 0, binding = 4) buffer Lists { C list[]; };
+layout(std430, set = 0, binding = 5) buffer ListCount { uint lc[]; };
+layout(std430, set = 0, binding = 6) readonly buffer PairCount { uint pcnt[]; };
 
-layout(push_constant) uniform PC {
-    uint n_pairs;
-    uint max_contacts;
-    uint stride;
-    uint _pad;
-} pc;
+/* кватернион в common.glsl лежит как (w, x, y, z) */
+vec3 qrot(vec4 q, vec3 v) {
+    vec3 u = q.yzw;
+    float w = q.x;
+    vec3 t = 2.0 * cross(u, v);
+    return v + w * t + cross(u, t);
+}
 
-ivec3 dims_of(sdf_desc d) { return ivec3(d.lo_dims.w, d.dims2.x, d.dims2.y); }
+vec3 qinv_rot(vec4 q, vec3 v) { return qrot(vec4(q.x, -q.yzw), v); }
 
-vec3 node_to_world(sdf_desc d, vec3 n) { return d.origin.xyz + n * d.step_pad.x; }
-vec3 world_to_node(sdf_desc d, vec3 w) { return (w - d.origin.xyz) / d.step_pad.x; }
+ivec3 dims_of(SdfDesc d) { return sdf_dims(d); }
 
-float at_node(sdf_desc d, uint base, ivec3 n) {
+uint node_count(SdfDesc d) {
+    ivec3 dm = dims_of(d);
+    if (dm.x <= 0 || dm.y <= 0 || dm.z <= 0) return 0u;
+    return uint(dm.x) * uint(dm.y) * uint(dm.z);
+}
+
+/* узел (в координатах узлов сетки поля) → мир */
+vec3 node_to_world(Body bd, SdfDesc d, vec3 n) {
+    return qrot(bd.quat, d.shift.xyz + n * d.step_pad.x) + bd.pos_r.xyz;
+}
+
+/* мир → узел (дробный, для трилинейной выборки) */
+vec3 world_to_node(Body bd, SdfDesc d, vec3 w) {
+    return (qinv_rot(bd.quat, w - bd.pos_r.xyz) - d.shift.xyz) / d.step_pad.x;
+}
+
+/* значение в узле сетки: индексы локальные (n - lo), край — зажим, как в
+ * NodeField::at на CPU (иначе на границе поля выборка улетает в чужое тело) */
+float at_node(SdfDesc d, uint base, ivec3 n) {
     ivec3 dm = dims_of(d);
     ivec3 c = clamp(n, ivec3(0), dm - 1);
-    uint i = uint(c.z) * uint(dm.y * dm.x) + uint(c.y) * uint(dm.x) + uint(c.x);
+    uint i = (uint(c.z) * uint(dm.y) + uint(c.y)) * uint(dm.x) + uint(c.x);
     return vals[base + i];
 }
 
-/* трилинейная выборка в координатах узлов */
-float sample_node(sdf_desc d, uint base, vec3 p) {
+/* трилинейная выборка в координатах узлов (абсолютных, с lo) */
+float sample_node(SdfDesc d, uint base, vec3 n) {
+    vec3 p = n - vec3(d.lo_dims.xyz);
     vec3 f = floor(p);
     vec3 t = p - f;
     ivec3 i = ivec3(f);
@@ -65,11 +107,12 @@ float sample_node(sdf_desc d, uint base, vec3 p) {
     float v011 = at_node(d, base, i + ivec3(0, 1, 1));
     float v111 = at_node(d, base, i + ivec3(1, 1, 1));
     float a = mix(mix(v000, v100, t.x), mix(v010, v110, t.x), t.y);
-    float b = mix(mix(v001, v101, t.x), mix(v011, v111, t.x), t.y);
-    return mix(a, b, t.z);
+    float c = mix(mix(v001, v101, t.x), mix(v011, v111, t.x), t.y);
+    return mix(a, c, t.z);
 }
 
-vec3 gradient_node(sdf_desc d, uint base, vec3 p) {
+/* градиент в координатах узлов — нормаль изоповерхности в системе тела */
+vec3 gradient_node(SdfDesc d, uint base, vec3 p) {
     const float h = 0.5;
     float gx = sample_node(d, base, p + vec3(h, 0, 0)) - sample_node(d, base, p - vec3(h, 0, 0));
     float gy = sample_node(d, base, p + vec3(0, h, 0)) - sample_node(d, base, p - vec3(0, h, 0));
@@ -77,63 +120,160 @@ vec3 gradient_node(sdf_desc d, uint base, vec3 p) {
     return normalize(vec3(gx, gy, gz) + vec3(1e-9));
 }
 
-void main() {
-    uint pair = gl_GlobalInvocationID.x / 64u;
-    uint lane = gl_GlobalInvocationID.x % 64u;
-    if (pair >= pc.n_pairs) {
-        return;
-    }
-    uvec2 pr = pairs[pair];
-    sdf_desc da = descs[pr.x];
-    sdf_desc db = descs[pr.y];
-    uint base_a = pr.x * pc.stride;
-    uint base_b = pr.y * pc.stride;
+void push_contact(uint self, uint other, vec3 p, vec3 n, float depth) {
+    C c;
+    c.meta = ivec4(int(other), 0, 0, 0);
+    c.n_pen = vec4(n, depth);
+    c.point = vec4(p, 1.0);
+    uint slot = atomicAdd(lc[self], 1u);
+    if (slot < uint(CAP)) list[self * uint(CAP) + slot] = c;
+}
 
-    /* перебираем узлы B: каждая invocation смотрит свою долю узлов */
-    ivec3 dm = dims_of(db);
-    uint total = uint(dm.x) * uint(dm.y) * uint(dm.z);
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint pair = id / SEEDS;
+    uint lane = id % SEEDS;
+    if (pair >= pcnt[0]) return;
+    if (lane >= SEEDS) return;
+
+    uvec2 pr = pairs[pair];
+    uint ia = pr.x;
+    uint ib = pr.y;
+    uint nbody = uint(pc.grid.w);
+    if (ia >= nbody || ib >= nbody || ia == ib) return;
+
+    SdfDesc da = descs[ia];
+    SdfDesc db = descs[ib];
+    uint na = node_count(da);
+    uint nb = node_count(db);
+    if (na == 0u || nb == 0u) return;   /* у тела нет запечённого поля */
+
+    Body A = b[ia];
+    Body B = b[ib];
+    bool sleep_a = A.misc.y > 0.5;
+    bool sleep_b = B.misc.y > 0.5;
+    if (sleep_a && sleep_b) return;
+
+    /* затравки — по телу с меньшим полем: перебор его сетки дешевле */
+    bool a_seed = na <= nb;
+    uint is = a_seed ? ia : ib;
+    uint it = a_seed ? ib : ia;
+    SdfDesc ds = a_seed ? da : db;
+    SdfDesc dt = a_seed ? db : da;
+    Body Bs = a_seed ? A : B;
+    Body Bt = a_seed ? B : A;
+    uint base_s = is * SDF_STRIDE;
+    uint base_t = it * SDF_STRIDE;
+
+    /* AABB второго поля в мире — из его собственной сетки (8 углов) */
+    vec3 dmax = vec3(dims_of(dt) - ivec3(1));
+    vec3 tlo = vec3(1e30);
+    vec3 thi = vec3(-1e30);
+    for (int c = 0; c < 8; c++) {
+        vec3 n = vec3(float(c & 1), float((c >> 1) & 1), float((c >> 2) & 1)) * dmax
+               + vec3(dt.lo_dims.xyz);
+        vec3 w = node_to_world(Bt, dt, n);
+        tlo = min(tlo, w);
+        thi = max(thi, w);
+    }
+    /* его же — в систему узлов тела-затравки, и пересекаем с её сеткой */
+    vec3 slo = vec3(1e30);
+    vec3 shi = vec3(-1e30);
+    for (int c = 0; c < 8; c++) {
+        vec3 w = vec3((c & 1) != 0 ? thi.x : tlo.x,
+                      (c & 2) != 0 ? thi.y : tlo.y,
+                      (c & 4) != 0 ? thi.z : tlo.z);
+        vec3 n = world_to_node(Bs, ds, w);
+        slo = min(slo, n);
+        shi = max(shi, n);
+    }
+    vec3 flo = vec3(ds.lo_dims.xyz);
+    vec3 fhi = flo + vec3(dims_of(ds) - ivec3(1));
+    ivec3 lo_i = ivec3(ceil(max(slo, flo) - vec3(1e-3)));
+    ivec3 hi_i = ivec3(floor(min(shi, fhi) + vec3(1e-3)));
+    if (any(greaterThan(lo_i, hi_i))) return;
+
+    ivec3 span = hi_i - lo_i + ivec3(1);
+    uint total = uint(span.x) * uint(span.y) * uint(span.z);
+    /* Кусок сетки на поток — СПЛОШНОЙ, а не «каждый 64-й узел». Выборка с
+     * шагом пропускала перекрытия, которые занимают малую долю сетки (шар,
+     * утопленный в плиту: внутри его поля ~4% узлов) — контактов не было
+     * вовсе. Сплошной кусок просматривает ВСЕ узлы пересечения, а стоимость
+     * ограничивает потолок контактов на поток. */
+    uint per = max(1u, (total + SEEDS - 1u) / SEEDS);
+    uint begin = lane * per;
+    uint end = min(total, begin + per);
+    if (begin >= end) return;
+
+    uint sx = uint(span.x);
+    uint sy = uint(span.y);
     uint found = 0u;
-    for (uint k = lane; k < total; k += 64u) {
-        uint z = k / (uint(dm.x) * uint(dm.y));
-        uint r = k % (uint(dm.x) * uint(dm.y));
-        ivec3 n = ivec3(int(r % uint(dm.x)), int(r / uint(dm.x)), int(z));
-        n += ivec3(db.lo_dims.xyz);
-        vec3 w = node_to_world(db, vec3(n));
-        float fb = at_node(db, base_b, n - ivec3(db.lo_dims.xyz));
-        float fa = sample_node(da, base_a, world_to_node(da, w));
-        if (fa >= 0.0 || fb >= 0.0) {
-            continue;
-        }
+
+    for (uint k = begin; k < end; k++) {
+        ivec3 ln = ivec3(int(k % sx), int((k / sx) % sy), int(k / (sx * sy)));
+        ivec3 node = lo_i + ln;
+
+        float fs = at_node(ds, base_s, node - ds.lo_dims.xyz);
+        vec3 w = node_to_world(Bs, ds, vec3(node));
+        float ft = sample_node(dt, base_t, world_to_node(Bt, dt, w));
+        if (fs >= 0.0 || ft >= 0.0) continue;   /* узел не в пересечении объёмов */
+
+        /* спуск к паре ближайших точек поверхностей (метры, мировые градиенты).
+         * Шаг ограничен половиной шага узла: на глубоком перекрытии сумма
+         * заглублений больше самого перекрытия, и без предела точка улетает
+         * из пересечения за одну итерацию (проверено: шар, утопленный на
+         * 0.25 м, не давал ни одного контакта). */
         vec3 p = w;
-        for (int it = 0; it < 4; ++it) {
-            vec3 pa = world_to_node(da, p);
-            vec3 pb = world_to_node(db, p);
-            vec3 ga = gradient_node(da, base_a, pa);
-            vec3 gb = gradient_node(db, base_b, pb);
-            float va = sample_node(da, base_a, pa) * da.step_pad.x;
-            float vb = sample_node(db, base_b, pb) * db.step_pad.x;
-            p -= 0.5 * (va * ga + vb * gb);
+        for (int it2 = 0; it2 < 4; it2++) {
+            vec3 na = world_to_node(Bs, ds, p);
+            vec3 nb = world_to_node(Bt, dt, p);
+            vec3 ga = qrot(Bs.quat, gradient_node(ds, base_s, na));
+            vec3 gb = qrot(Bt.quat, gradient_node(dt, base_t, nb));
+            float va = sample_node(ds, base_s, na) * ds.step_pad.x;
+            float vb = sample_node(dt, base_t, nb) * dt.step_pad.x;
+            vec3 d = 0.5 * (va * ga + vb * gb);
+            float lim = 0.5 * ds.step_pad.x;
+            float len = length(d);
+            if (len > lim) d *= lim / len;
+            p -= d;
         }
-        vec3 pa = world_to_node(da, p);
-        vec3 pb = world_to_node(db, p);
-        float va = sample_node(da, base_a, pa) * da.step_pad.x;
-        float vb = sample_node(db, base_b, pb) * db.step_pad.x;
-        if (va >= 0.0 || vb >= 0.0) {
-            continue;
-        }
-        vec3 ga = gradient_node(da, base_a, pa);
-        vec3 gb = gradient_node(db, base_b, pb);
-        vec3 nrm = normalize(ga - gb + vec3(1e-9));
-        uint slot = atomicAdd(counts[pair], 1u);
-        if (slot >= pc.max_contacts) {
-            continue;
-        }
-        uint o = pair * pc.max_contacts + slot;
-        c[2u * o] = vec4(p, -va + (-vb));   /* глубина пары = сумма заглублений */
-        c[2u * o + 1u] = vec4(nrm, 0.0);
-        found++;
-        if (found >= pc.max_contacts) {
-            break;
-        }
+
+        vec3 na = world_to_node(Bs, ds, p);
+        vec3 nb = world_to_node(Bt, dt, p);
+        vec3 ga = qrot(Bs.quat, gradient_node(ds, base_s, na));
+        vec3 gb = qrot(Bt.quat, gradient_node(dt, base_t, nb));
+        float va = sample_node(ds, base_s, na) * ds.step_pad.x;
+        float vb = sample_node(dt, base_t, nb) * dt.step_pad.x;
+        if (va >= 0.0 || vb >= 0.0) continue;   /* спуск вывел из пересечения */
+
+        /* глубина пары — СУММА заглублений обеих сторон (сдвигать надо на неё);
+         * нормаль n_a - n_b смотрит от затравки к партнёру */
+        vec3 n = normalize(ga - gb + vec3(1e-9));
+        float depth = (-va) + (-vb);
+        push_contact(is, it, p, n, depth);
+        push_contact(it, is, p, -n, depth);
+        if (++found >= PER_LANE) break;
+    }
+    if (found == 0u) return;
+
+    /* Пробуждение на устройстве — как в sat.comp: спящее тело, которого
+     * коснулся движущийся сосед, просыпается здесь же. Запись идемпотентна. */
+    float sp_a = length(A.vel_m.xyz);
+    float sp_b = length(B.vel_m.xyz);
+    if (sleep_a && !sleep_b && sp_b > 0.35) {
+        A.misc.y = 0.0;
+        A.misc.x = 0.0;
+        A.vel_m.w = A.misc.z;
+        A.ang_i.w = A.misc.w;
+        A.anchor = vec4(A.pos_r.xyz, 0.0);
+        b[ia] = A;
+    }
+    if (sleep_b && !sleep_a && sp_a > 0.35) {
+        B.misc.y = 0.0;
+        B.misc.x = 0.0;
+        B.vel_m.w = B.misc.z;
+        B.ang_i.w = B.misc.w;
+        B.anchor = vec4(B.pos_r.xyz, 0.0);
+        b[ib] = B;
     }
 }

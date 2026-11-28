@@ -39,6 +39,21 @@ struct C {
     vec4 point;   /* xyz — точка приложения импульса в мире     */
 };
 
+/* Дескриптор SDF-поля тела на устройстве (sim::SdfDescGpu, 4 vec4, 64 байта).
+ * dims = 0 значит «у тела нет поля»: пара с ним не строится и не считается. */
+struct SdfDesc {
+    ivec4 lo_dims;   /* lo.xyz, dims.x */
+    ivec4 dims2;     /* dims.y, dims.z, 0, 0 */
+    vec4  step_pad;  /* step, 0, 0, 0 */
+    vec4  shift;     /* центр поля относительно центроида тела (система тела) */
+};
+
+ivec3 sdf_dims(SdfDesc d) { return ivec3(d.lo_dims.w, d.dims2.x, d.dims2.y); }
+bool sdf_has_field(SdfDesc d) {
+    ivec3 dm = sdf_dims(d);
+    return dm.x > 0 && dm.y > 0 && dm.z > 0;
+}
+
 layout(push_constant) uniform Push {
     vec4 prm0;    /* dt, gravity, angular_damping, friction        */
     vec4 prm1;    /* beta, max_push, margin, cell_size             */
@@ -52,6 +67,9 @@ layout(push_constant) uniform Push {
 const int CAP = 64;
 /* Кольцо событий раскола: 64 тела — потолок такта, вдвое с запасом. */
 const uint MAX_EVENTS = 128u;
+/* Потолок пар тел в широком проходе SDF (64 тела → 2016). Должно совпадать
+ * с sim::MAX_SDF_PAIRS. */
+const uint MAX_SDF_PAIRS = 2016u;
 const int GROUND = -1;
 
 ivec3 cell_of(vec3 p, vec3 lo, float cell, ivec3 dim) {

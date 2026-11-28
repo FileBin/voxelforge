@@ -97,8 +97,11 @@ pub fn contacts(
                 if fa_v >= 0.0 || fb_v >= 0.0 {
                     continue;
                 }
-                /* спуск к паре ближайших точек поверхностей */
+                /* спуск к паре ближайших точек поверхностей; шаг ограничен
+                 * половиной шага узла — иначе на глубоком перекрытии точка
+                 * улетает из пересечения за одну итерацию (то же в шейдере) */
                 let mut p = w;
+                let lim = 0.5 * fa.step;
                 for _ in 0..4 {
                     let pa = to_node(fa, oa, p);
                     let pb = to_node(fb, ob, p);
@@ -106,8 +109,18 @@ pub fn contacts(
                     let gb = fb.gradient(pb);
                     let va = fa.sample(pa) * fa.step;
                     let vb = fb.sample(pb) * fb.step;
+                    let mut d = [0.0f32; 3];
                     for k in 0..3 {
-                        p[k] -= 0.5 * (va * ga[k] + vb * gb[k]);
+                        d[k] = 0.5 * (va * ga[k] + vb * gb[k]);
+                    }
+                    let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                    if len > lim {
+                        for k in 0..3 {
+                            d[k] *= lim / len;
+                        }
+                    }
+                    for k in 0..3 {
+                        p[k] -= d[k];
                     }
                 }
                 let pa = to_node(fa, oa, p);

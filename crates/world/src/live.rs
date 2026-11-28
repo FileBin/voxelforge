@@ -37,6 +37,11 @@ pub struct LiveBody {
     /// Запечённое поле расстояний (SDF) тела: им пользуется и меш, и физика.
     /// Считается ОДИН раз при создании тела, в такте не пересчитывается.
     pub sdf: Option<crate::field::NodeField>,
+    /// Центр поля (`NodeField::lo` в узлах) относительно центроида тела, в
+    /// системе тела. Позу и поворот тела физика берёт из буфера тел, поэтому
+    /// в таблицу SDF уходит только эта постоянная часть преобразования.
+    /// Считается в `rebuild()` — там же, где локальные тетраэдры.
+    pub sdf_shift: [f32; 3],
     local: Vec<[[f32; 3]; 4]>,
     pub mesh: i32,
     pub lines: i32,
@@ -69,6 +74,13 @@ impl LiveBody {
             );
         }
         let c = tb.world_centroid();
+        /* Поле задано в координатах узлов от `origin`; тело физики живёт от
+         * центроида. Разница постоянная в системе тела — её и запоминаем. */
+        self.sdf_shift = [
+            self.origin[0] - c[0],
+            self.origin[1] - c[1],
+            self.origin[2] - c[2],
+        ];
         self.local = self
             .tets
             .iter()
@@ -160,6 +172,9 @@ pub struct Live {
     /// Контакты считает GPU (VF_COLLIDE=gpu). Пока сверка SAT не сошлась с
     /// CPU, по умолчанию выключено: включается флагом окружения.
     pub gpu_collide: bool,
+    /// Контакты считает `sdf_contact` по запечённым полям (VF_COLLIDE=sdf):
+    /// tет-пары и SAT из такта уходят, широкий проход — по AABB тел.
+    pub sdf_collide: bool,
     /// Пары тетов строит устройство (VF_PAIRS=gpu): тогда из кадра уходит и
     /// заливка пар, и чтение позиций тел.
     pub gpu_pairs: bool,
@@ -225,6 +240,7 @@ fn scene_plate() -> (Params, LiveBody, Vec<GpuBody>) {
          * строил TetBody без поля и меш считался BFS-ом по занятости —
          * отсюда гребни и шип на угле. */
         sdf: Some(plate.sdf().clone()),
+        sdf_shift: [0.0; 3],
         local: Vec::new(),
         mesh: -1,
         lines: -1,
@@ -281,12 +297,20 @@ impl Live {
         } else {
             GpuSim::new(gpu_bodies.clone(), shader_dir, params)
         };
+        let mut gpu = gpu;
+        /* Режим контактов задаётся здесь один раз: у мира и у устройства он
+         * обязан совпадать, иначе такт соберёт проходы одного режима. */
+        gpu.set_sdf_collide(matches!(std::env::var("VF_COLLIDE").as_deref(), Ok("sdf")));
 
         Live {
             next_id: 1 + (MAX_BODIES as u64),
             frames: 0,
             bullets: std::collections::VecDeque::new(),
-            gpu_collide: std::env::var("VF_COLLIDE").map(|v| v == "gpu").unwrap_or(false),
+            gpu_collide: matches!(
+                std::env::var("VF_COLLIDE").as_deref(),
+                Ok("gpu") | Ok("sdf")
+            ),
+            sdf_collide: matches!(std::env::var("VF_COLLIDE").as_deref(), Ok("sdf")),
             gpu_pairs: std::env::var("VF_PAIRS").map(|v| v == "gpu").unwrap_or(false),
             geom_dirty: true,
             wake_on_contact: true,
@@ -429,6 +453,21 @@ impl Live {
         if self.geom_dirty {
             let local: Vec<Vec<[[f32; 3]; 4]>> = self.bodies.iter().map(|b| b.local_tets().clone()).collect();
             self.gpu.upload_geometry(&local);
+            /* Таблица SDF-полей: дескриптор и значения на каждый слот. Заливаем
+             * здесь же — вместе с геометрией, потому что набор тел меняется
+             * ровно в этих точках (спавн, раскол, сброс). */
+            let items: Vec<Option<(&crate::field::NodeField, [f32; 3])>> = self
+                .bodies
+                .iter()
+                .map(|b| {
+                    if b.alive {
+                        b.sdf.as_ref().map(|f| (f, b.sdf_shift))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            self.gpu.upload_sdf(&items);
             self.geom_dirty = false;
         }
 
@@ -437,6 +476,10 @@ impl Live {
              * На CPU приходит только их число (4 байта) — позиции тел в кадре
              * больше не читаются. */
             self.gpu.run_tet_pairs(dt);
+        } else if self.sdf_collide {
+            /* SDF-контактам пары ТЕТОВ не нужны вовсе: широкий проход по AABB
+             * тел делает сам такт. CPU-путь ниже строил бы миллионы тет-пар
+             * ради ничего. */
         } else {
             /* Пары на CPU — отладочный путь: ему нужны позы, читаем буфер
              * целиком (в такте этого больше нет). */
@@ -629,6 +672,7 @@ impl Live {
                 kind: Kind::Shard,
                 alive: false,
                 sdf: None,
+                sdf_shift: [0.0; 3],
             });
             return Some(self.bodies.len() - 1);
         }
@@ -1170,6 +1214,7 @@ impl Live {
                 tets: fr.tets.clone(),
                 origin: fr.origin,
             sdf: fr.sdf.get().cloned(),
+                sdf_shift: [0.0; 3],
                 level_cap: fr.level_cap,
                 local: Vec::new(),
                 mesh: -1,
@@ -1279,6 +1324,7 @@ impl Live {
             origin: ball.origin,
             level_cap: ball.level_cap,
             sdf: ball.sdf.get().cloned(),
+            sdf_shift: [0.0; 3],
             local: Vec::new(),
             mesh: -1,
             lines: -1,

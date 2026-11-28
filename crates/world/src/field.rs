@@ -696,6 +696,11 @@ pub fn from_occupancy_metric(tets: &[[Node; 4]], pad: i32, smooth_iters: usize, 
         let d = if dist[i] == f32::MAX { 0.0 } else { dist[i] };
         f.val[i] = if solid[i] { -(d + 0.5) } else { d + 0.5 };
     }
+    /* Значения — в шагах узла, поэтому шаг обязан доехать до поля: от него
+     * зависят sample_m, intersect_plane и перевод узлов в мир в физике.
+     * Раньше здесь оставалась единица (параметр не использовался), и поле
+     * осколка оказывалось в 14 раз крупнее самого осколка. */
+    f.step = step_m;
     f.smooth(smooth_iters, 0.6);
     f
 }
@@ -720,8 +725,10 @@ pub fn intersect_plane(f: &NodeField, n: [f32; 3], d: f32) -> NodeField {
                     (f.lo[1] + y as i32) as f32,
                     (f.lo[2] + z as i32) as f32,
                 ];
-                /* расстояние до плоскости в единицах узла, со знаком «снаружи» */
-                let plane = (n[0] * p[0] + n[1] * p[1] + n[2] * p[2] - d) * f.step;
+                /* расстояние до плоскости — В ЕДИНИЦАХ УЗЛА, как и значения поля:
+                 * раньше здесь ещё умножалось на шаг, и для полей в узловых
+                 * единицах срез уезжал в 14 раз глубже (шаг 0.07 м) */
+                let plane = n[0] * p[0] + n[1] * p[1] + n[2] * p[2] - d;
                 out.val[i] = f.val[i].max(plane);
             }
         }
@@ -743,7 +750,10 @@ pub fn expand(f: &NodeField, layers: i32) -> NodeField {
         f.dims[1] + 2 * layers as usize,
         f.dims[2] + 2 * layers as usize,
     ];
-    let far = (f.dims[0].max(f.dims[1]).max(f.dims[2])) as f32 * f.step * 2.0;
+    /* Значения поля — в шагах узла, поэтому и «далеко снаружи» тоже: раньше
+     * здесь стояли метры, и у полей в узловых единицах подложка оказывалась
+     * меньше типичных значений — марчинг строил поверхность на её границе. */
+    let far = f.dims[0].max(f.dims[1]).max(f.dims[2]) as f32 * 2.0;
     let mut out = NodeField {
         lo: [f.lo[0] - layers, f.lo[1] - layers, f.lo[2] - layers],
         dims,

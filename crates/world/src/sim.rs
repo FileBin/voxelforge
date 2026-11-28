@@ -187,6 +187,8 @@ const P_TETPAIRSFLAT: usize = 27;
 const P_SDFFILL: usize = 28;
 /// Контакты SDF↔SDF (шаг 2 плана docs/sdf-collisions.md).
 const P_SDFCONTACT: usize = 29;
+/// Широкий проход SDF: пары ТЕЛ (не тетов).
+const P_SDFPAIRS: usize = 30;
 /// Ячеек на блок в параллельном скане (совпадает с 16 * 64 в шейдере).
 pub const SCAN_BLOCK: usize = 1024;
 /// Потолок изменений тел за одно событие (спавн/деспавн).
@@ -205,6 +207,14 @@ pub const MAX_EVENTS: usize = 128;
 pub const FRACTURE_ENERGY: f32 = 500.0;
 /// Потолок пар тетраэдров за такт.
 pub const MAX_PAIRS: usize = 65536;
+/// Слов поля SDF на слот тела в общем пуле. Поле плиты (куб 8 ячеек уровня 1)
+/// занимает ~29³ ≈ 24 К узлов, шар-снаряд — 19³ ≈ 7 К; потолок с двойным
+/// запасом. Память: 64 слота × 65536 × 4 Б = 16 МБ (совпадает с SDF_STRIDE
+/// в sdf_contact.comp).
+pub const SDF_STRIDE: usize = 65536;
+/// Потолок пар тел в широком проходе SDF (64 тела → 2016; совпадает с
+/// MAX_SDF_PAIRS в common.glsl).
+pub const MAX_SDF_PAIRS: usize = MAX_BODIES * (MAX_BODIES - 1) / 2;
 
 /// Контактов на тело. Было 24 — в плотной куче этого мало: часть контактов
 /// просто не попадала в список. Память: 64 тела x 64 контакта x 48 Б ≈ 200 КБ.
@@ -249,6 +259,21 @@ impl Default for Params {
             cell: 0.16,
         }
     }
+}
+
+/// Дескриптор SDF-поля тела на устройстве: 4 vec4, 64 байта без паддингов —
+/// ровно `struct SdfDesc` в sdf_contact.comp.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SdfDescGpu {
+    /// lo.xyz и dims.x
+    lo_dims: [i32; 4],
+    /// dims.y, dims.z, 0, 0
+    dims2: [i32; 4],
+    /// метров на узел
+    step_pad: [f32; 4],
+    /// центр поля относительно центроида тела (в системе тела)
+    shift: [f32; 4],
 }
 
 /// Где лежат скомпилированные шейдеры: аргумент → `VF_SHADERS` → два обычных
@@ -327,6 +352,16 @@ pub struct GpuSim {
     /// Пары тетраэдров, посчитанные CPU один раз на такт.
     pairs: *mut c_void,
     pub n_pairs: usize,
+    /// Таблица SDF-полей на устройстве (шаг 2 коллизий): дескриптор на тело
+    /// (lo/dims/step/shift — 4 vec4), общий пул значений (SDF_STRIDE слов на
+    /// слот), пары тел из широкого прохода и их счётчик. Заливается при
+    /// смене геометрии; поза и поворот берутся шейдером из буфера тел.
+    sdf_desc: *mut c_void,
+    sdf_vals: *mut c_void,
+    sdf_pairs: *mut c_void,
+    sdf_paircnt: *mut c_void,
+    /// Контакты считает `sdf_contact` по полям вместо `sat` (VF_COLLIDE=sdf).
+    pub sdf_collide: bool,
     lcount: *mut c_void,
     cellcnt: *mut c_void,
     starts: *mut c_void,
@@ -427,6 +462,14 @@ impl GpuSim {
         let starts = mk((ncells as usize + 1) * 4, false);
         let cursor = mk(ncells as usize * 4, false);
         let cbody = mk(n * 4, false);
+        /* Таблица SDF-полей: дескриптор на тело, общий пул значений (слот на
+         * тело), пары тел широкого прохода и счётчик. Пул создаётся пустым:
+         * незанятые дескрипторы — нули (dims = 0 → поля нет), и шейдер пару
+         * с таким телом пропускает. */
+        let sdf_desc = mk(MAX_BODIES * 64, true);
+        let sdf_vals = mk(MAX_BODIES * SDF_STRIDE * 4, true);
+        let sdf_pairs = mk(MAX_SDF_PAIRS * 8, true);
+        let sdf_paircnt = mk(4, true);
         // Тела обязаны попасть на устройство до первого dispatch.
         unsafe {
             check_status(
@@ -440,8 +483,21 @@ impl GpuSim {
                 "upload",
             )
         };
+        /* Дескрипторы SDF обязаны стартовать нулями: dims = 0 значит «у тела
+         * нет поля», иначе шейдер прочитает мусор буфера как размеры сетки. */
+        unsafe {
+            let zeros = vec![0u8; MAX_BODIES * 64];
+            check_status(
+                vf_buffer_write(ctx, sdf_desc, 0, zeros.as_ptr() as *const c_void, zeros.len()),
+                "sdf_desc zero",
+            );
+            check_status(
+                vf_buffer_write(ctx, sdf_paircnt, 0, [0u8; 4].as_ptr() as *const c_void, 4),
+                "sdf_paircnt zero",
+            );
+        }
 
-        let names: [(&str, u32); 30] = [
+        let names: [(&str, u32); 31] = [
             ("integrate", 1),
             ("clear", 2),
             ("count", 2),
@@ -471,7 +527,8 @@ impl GpuSim {
             ("tet_scan_p", 4),
             ("tet_pairs_flat", 8),
             ("sdf_fill", 1),
-            ("sdf_contact", 5),
+            ("sdf_contact", 7),
+            ("sdf_pairs", 5),
         ];
         let mut pipes = Vec::new();
         for (nm, nb) in names.iter() {
@@ -537,6 +594,13 @@ impl GpuSim {
             pairs_on_gpu: false,
             pairs,
             n_pairs: 0,
+            sdf_desc,
+            sdf_vals,
+            sdf_pairs,
+            sdf_paircnt,
+            /* По умолчанию — SAT (рабочий режим пользователя). VF_COLLIDE=sdf
+             * переключает контакты на поля; старый путь остаётся для сверки. */
+            sdf_collide: matches!(std::env::var("VF_COLLIDE").as_deref(), Ok("sdf")),
             lcount,
             cellcnt,
             starts,
@@ -662,6 +726,9 @@ impl GpuSim {
         } else {
             ((self.n_pairs as u32) + WG - 1) / WG
         };
+        /* SDF: одна рабочая группа на пару тел (64 затравки), число пар шейдер
+         * читает из буфера — поэтому групп всегда по потолку пар. */
+        let g_sdf = ((MAX_SDF_PAIRS as u32) + WG - 1) / WG;
         let push = self.push(h, g_body);
         {
             let zero = vec![0u8; MAX_BODIES * 32];
@@ -674,6 +741,18 @@ impl GpuSim {
                 vf_buffer_write(self.ctx, self.impact_cnt, 0, [0u8; 4].as_ptr() as *const c_void, 4);
                 /* статистика такта: 8 Б на запись и 8 Б на чтение */
                 vf_buffer_write(self.ctx, self.stat, 0, [0u8; 8].as_ptr() as *const c_void, 8);
+                if self.sdf_collide {
+                    /* счётчик пар тел — 4 Б; пары строятся один раз на такт
+                     * (внутри такта позы меняются, но пересборка пар каждый
+                     * кусок стоила бы дороже, чем сами контакты) */
+                    vf_buffer_write(
+                        self.ctx,
+                        self.sdf_paircnt,
+                        0,
+                        [0u8; 4].as_ptr() as *const c_void,
+                        4,
+                    );
+                }
             }
         }
 
@@ -695,6 +774,24 @@ impl GpuSim {
             push,
             groups: [g_body, 1, 1],
         });
+        if self.sdf_collide {
+            /* Широкий проход по ТЕЛАМ (не по тетам): AABB с запасом на путь за
+             * такт и пары тел. Пары строятся один раз на такт — позы внутри
+             * такта меняются, но пересборка пар на каждом куске стоила бы
+             * дороже самих контактов. */
+            steps.push(Step {
+                pipe: P_BODYAABB,
+                bufs: vec![a, self.tets, self.span, self.baabb],
+                push,
+                groups: [g_body, 1, 1],
+            });
+            steps.push(Step {
+                pipe: P_SDFPAIRS,
+                bufs: vec![a, self.baabb, self.sdf_pairs, self.sdf_paircnt, self.sdf_desc],
+                push,
+                groups: [g_body, 1, 1],
+            });
+        }
 
         for _group in 0..groups {
             let n_steps = per_group.min(left);
@@ -715,12 +812,31 @@ impl GpuSim {
                 push,
                 groups: [g_body, 1, 1],
             });
-            steps.push(Step {
-                pipe: P_SAT,
-                bufs: vec![a, self.tets, self.span, self.pairs, self.list, self.lcount, self.pair_count],
-                push,
-                groups: [g_pairs.max(1), 1, 1],
-            });
+            if self.sdf_collide {
+                /* Контакты по полям: пары тел уже лежат в буфере, число пар
+                 * шейдер читает сам — CPU его не знает и не ждёт. */
+                steps.push(Step {
+                    pipe: P_SDFCONTACT,
+                    bufs: vec![
+                        a,
+                        self.sdf_desc,
+                        self.sdf_vals,
+                        self.sdf_pairs,
+                        self.list,
+                        self.lcount,
+                        self.sdf_paircnt,
+                    ],
+                    push,
+                    groups: [g_sdf.max(1), 1, 1],
+                });
+            } else {
+                steps.push(Step {
+                    pipe: P_SAT,
+                    bufs: vec![a, self.tets, self.span, self.pairs, self.list, self.lcount, self.pair_count],
+                    push,
+                    groups: [g_pairs.max(1), 1, 1],
+                });
+            }
             steps.push(Step {
                 pipe: P_SELECT,
                 bufs: vec![self.list, self.lcount],
@@ -978,6 +1094,94 @@ impl GpuSim {
                 "upload_spans",
             );
         }
+    }
+
+    /// Залить таблицу SDF-полей на устройство: дескриптор на тело и значения
+    /// в общий пул. Вызывается при смене геометрии (спавн/раскол/сброс),
+    /// а не каждый такт: поза и поворот берутся шейдером из буфера тел.
+    ///
+    /// Элемент — `Some((поле, shift))`, где `shift` = `origin - центроид` в
+    /// системе тела (см. `LiveBody::sdf_shift`). `None` или поле, не влезающее
+    /// в слот, оставляют дескриптор нулевым: шейдер такую пару пропускает.
+    pub fn upload_sdf(&mut self, fields: &[Option<(&crate::field::NodeField, [f32; 3])>]) {
+        let mut descs = vec![SdfDescGpu::default(); MAX_BODIES];
+        for (i, item) in fields.iter().take(MAX_BODIES).enumerate() {
+            let Some((f, shift)) = item else { continue };
+            let n = f.val.len();
+            if f.dims.contains(&0) || n > SDF_STRIDE {
+                eprintln!(
+                    "sdf: поле тела {i} ({n} узлов) не влезает в слот {SDF_STRIDE} — контакты SDF для него выключены"
+                );
+                continue;
+            }
+            descs[i] = SdfDescGpu {
+                lo_dims: [f.lo[0], f.lo[1], f.lo[2], f.dims[0] as i32],
+                dims2: [f.dims[1] as i32, f.dims[2] as i32, 0, 0],
+                step_pad: [f.step, 0.0, 0.0, 0.0],
+                shift: [shift[0], shift[1], shift[2], 0.0],
+            };
+            unsafe {
+                check_status(
+                    vf_buffer_write(
+                        self.ctx,
+                        self.sdf_vals,
+                        i * SDF_STRIDE * 4,
+                        f.val.as_ptr() as *const c_void,
+                        n * 4,
+                    ),
+                    "upload_sdf values",
+                );
+            }
+            self.bytes_up += (n * 4) as u64;
+        }
+        unsafe {
+            check_status(
+                vf_buffer_write(
+                    self.ctx,
+                    self.sdf_desc,
+                    0,
+                    descs.as_ptr() as *const c_void,
+                    descs.len() * std::mem::size_of::<SdfDescGpu>(),
+                ),
+                "upload_sdf descs",
+            );
+        }
+        self.bytes_up += (descs.len() * 64) as u64;
+    }
+
+    /// Пары тел из широкого прохода SDF (диагностика: сколько их нашлось и
+    /// какие именно — если контактов нет, сразу видно, чья это вина).
+    pub fn read_sdf_pairs(&mut self) -> Vec<[u32; 2]> {
+        let mut cnt = [0u32; 1];
+        unsafe {
+            check_status(
+                vf_buffer_read(self.ctx, self.sdf_paircnt, 0, cnt.as_mut_ptr() as *mut c_void, 4),
+                "read_sdf_paircnt",
+            );
+        }
+        let n = (cnt[0] as usize).min(MAX_SDF_PAIRS);
+        let mut out = vec![[0u32; 2]; n.max(1)];
+        if n > 0 {
+            unsafe {
+                check_status(
+                    vf_buffer_read(
+                        self.ctx,
+                        self.sdf_pairs,
+                        0,
+                        out.as_mut_ptr() as *mut c_void,
+                        n * 8,
+                    ),
+                    "read_sdf_pairs",
+                );
+            }
+        }
+        out.truncate(n);
+        out
+    }
+
+    /// Переключить контакты на поля (или обратно на SAT) на ходу — для проб.
+    pub fn set_sdf_collide(&mut self, on: bool) {
+        self.sdf_collide = on;
     }
 
     /// Обратное чтение пула — только для проверок, в кадре не используется.
@@ -1733,6 +1937,10 @@ impl Drop for GpuSim {
                 self.impact_cnt,
                 self.stat,
                 self.baabb,
+                self.sdf_desc,
+                self.sdf_vals,
+                self.sdf_pairs,
+                self.sdf_paircnt,
             ] {
                 vf_buffer_free(self.ctx, b);
             }
