@@ -544,10 +544,18 @@ impl Sim {
                 let mut g = shared.lock().unwrap();
                 // Рисуем на такт позади: от опубликованного снимка к следующему.
                 let step = if g.interval > 0.0 { g.interval } else { g.tick };
-                let alpha = if step > 0.0 {
-                    (g.t_pub_at.elapsed().as_secs_f32() / step).clamp(0.0, 1.0)
-                } else {
+                /* Если такт не укладывается в свой интервал (физика тяжелее
+                 * кадра), интерполяция начинает врать: пара prev→cur меняется
+                 * позже, чем кончается alpha, и картинка идёт «перепутанными
+                 * парами». В этом режиме рисуем ТОЧНОЕ состояние такта
+                 * (alpha = 1): движение становится чуть ступенчатым, но глаз
+                 * не видит дёрганья. Как только физика снова успевает —
+                 * интерполяция возвращается сама. */
+                let overdue = step > g.tick * 1.25;
+                let alpha = if overdue || step <= 0.0 {
                     1.0
+                } else {
+                    (g.t_pub_at.elapsed().as_secs_f32() / step).clamp(0.0, 1.0)
                 };
                 SnapOut {
                     body_buf: g.body_buf,
@@ -579,8 +587,12 @@ fn main() {
     let mut fracture_on = true;
     // Подшаги и итерации солвера: раньше были жёстко 10 и 18, и на кучу это
     // ложилось тяжело (6 подпроходов x 18 итераций на такт).
-    let mut substeps_arg: u32 = 10;
-    let mut iterations_arg: u32 = 18;
+    /* Подшаги и итерации: меньше прежних 10/18. Сетка стала тяжелее (теты
+     * Сомирвилля заходят в соседние ячейки), и такт перестал укладываться в
+     * кадровый бюджет — а это и давало дрожание. Флаги --substeps/--iterations
+     * по-прежнему переопределяют. */
+    let mut substeps_arg: u32 = 8;
+    let mut iterations_arg: u32 = 12;
     let mut shots: Vec<u64> = Vec::new();
     let mut tets_at_start = false;
     let mut it = std::env::args().skip(1);
