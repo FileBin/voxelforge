@@ -95,6 +95,8 @@ struct vf_view {
     /* Строка тел/контактов под таблицей; scene_ok == 0 — не рисовать. */
     vf_scene_counts perf_scene;
     int perf_scene_ok;
+    int ccd_ok;                /* есть строка CCD (CPU-время прохода) */
+    char ccd_line[128];
     /* Оверлей запрошен этим кадром (F3 / VF_PERF), даже если данных ещё нет:
      * тогда панель показывает «ждём такт», а не исчезает молча. */
     int perf_show;
@@ -1471,11 +1473,11 @@ static void draw_perf_overlay(vf_view *v) {
     int ph_on = v->ph_win_frames > 0;
     if (ph_on) ph_rows = (uint32_t)(sizeof(ph_show) / sizeof(ph_show[0])) + 2 + (v->ts_ok ? 1 : 0);
     /* Шапка (заголовок + две строки частот + подписи + два графика) + строки
-     * стадий + строка ИТОГО такта (+ строка тел, если есть). Пока такта не
-     * было — две строки: строка частот уже нарисована, под ней «waiting for a
-     * physics tick». */
+     * стадий + строка ИТОГО такта (+ строка тел) + строка CCD, если она есть.
+     * Пока такта не было — две строки: строка частот уже нарисована, под ней
+     * «waiting for a physics tick». */
     float h = (yhead - y0)
-            + lh * (float)(nrows ? nrows + 2 + (v->perf_scene_ok ? 1 : 0) : 2)
+            + lh * (float)(nrows ? nrows + 2 + (v->perf_scene_ok ? 1 : 0) + (v->ccd_ok ? 1 : 0) : 2)
             + 8.0f;
     /* Фазы кадра рисуются только вместе с таблицей стадий: при nrows == 0
      * панель выходит раньше, и высоту блока добавляем ровно тогда же. */
@@ -1630,11 +1632,22 @@ static void draw_perf_overlay(vf_view *v) {
         ui_text(v, x0 + 12, y + 4, sc, head, line);
     }
 
+    /* CCD на CPU: отдельной строкой — в стадии GPU он не попадает. Строка идёт
+     * сразу под объёмом работы, до фаз кадра: это тоже про такт, а не про
+     * главный поток. */
+    float y_after_body = yhead + lh * (float)(nrows + 2 + (v->perf_scene_ok ? 1 : 0));
+    if (v->ccd_ok) {
+        char cl[160];
+        snprintf(cl, sizeof cl, "%.120s", v->ccd_line);
+        ui_text(v, x0 + 12, y_after_body + 4, sc, text, cl);
+        y_after_body += lh;
+    }
+
     /* Фазы кадра на CPU: где стоит главный поток. Строка interval — фактический
      * ритм кадров; gpu idle — сколько GPU простаивал между кадрами (метки
      * таймстемпов), то есть ждал CPU или развёртку. */
     if (ph_on) {
-        float y = yhead + lh * (float)(nrows + 2 + (v->perf_scene_ok ? 1 : 0)) + 6.0f;
+        float y = y_after_body + 6.0f;
         ui_text(v, x0 + 12, y + 4, sc, title, "FRAME (CPU, ms)");
         y += lh;
         ui_text(v, x0 + 12, y + 4, sc, head, "phase");
@@ -1719,6 +1732,16 @@ void vf_view_perf(vf_view *v, const vf_perf_row *rows, uint32_t n,
     if (n > VF_PERF_MAX_ROWS) n = VF_PERF_MAX_ROWS;
     memcpy(v->perf_rows, rows, (size_t)n * sizeof(*rows));
     v->perf_n = n;
+}
+
+void vf_view_ccd(vf_view *v, const char *line) {
+    if (!v) return;
+    v->ccd_ok = line != NULL;
+    if (!line) {
+        v->ccd_line[0] = '\0';
+        return;
+    }
+    snprintf(v->ccd_line, sizeof(v->ccd_line), "%s", line);
 }
 
 void vf_view_end(vf_view *v) {

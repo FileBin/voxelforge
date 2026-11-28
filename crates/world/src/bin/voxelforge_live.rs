@@ -89,6 +89,8 @@ unsafe extern "C" {
         scene: *const VfSceneCounts,
         rates: *const VfRatesView,
     );
+    /// Строка CCD под таблицей стадий (CPU-время прохода, не стадия GPU).
+    fn vf_view_ccd(v: *mut c_void, line: *const c_char);
 }
 
 // ---------------------------------------------------------------- матрицы
@@ -278,6 +280,8 @@ struct Shared {
     /// Сколько тактов завершилось с включения сбора (монотонно): по дельте
     /// главный поток считает настоящий TPS.
     tick_no: u64,
+    /// Строка CCD (CPU-фазы прохода) для панели диагностики.
+    ccd_line: String,
     log: String,
 }
 
@@ -309,6 +313,7 @@ struct SnapOut {
     perf_scene: VfSceneCounts,
     /// Сколько тактов физики завершилось к этому кадру (для TPS).
     tick_no: u64,
+    ccd_line: String,
     log: String,
     near: f32,
     far: f32,
@@ -416,6 +421,7 @@ impl Sim {
             perf_scene: VfSceneCounts::default(),
             rates: RatesOut::default(),
             tick_no: live.gpu.perf_ticks(),
+            ccd_line: String::new(),
             log: String::new(),
         }));
         let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
@@ -509,9 +515,11 @@ impl Sim {
                             g.perf_rows = live.gpu.perf_overlay();
                             g.perf_tick = live.gpu.perf_tick_range();
                             g.perf_scene = live.gpu.perf_scene();
+                            g.ccd_line = live.ccd_stat.line.clone();
                         } else {
                             g.perf_rows.clear();
                             g.perf_scene = VfSceneCounts::default();
+                            g.ccd_line.clear();
                         }
                         /* Такт завершился — отдаём его счётчик кадру (TPS) и
                          * строку частот обратно в такт: печатает таблицу такт,
@@ -645,6 +653,7 @@ impl Sim {
                     perf_tick: l.gpu.perf_tick_range(),
                     perf_scene: l.gpu.perf_scene(),
                     tick_no: l.gpu.perf_ticks(),
+                    ccd_line: if l.gpu.perf_on() { l.ccd_stat.line.clone() } else { String::new() },
                     log: String::new(),
                     near: l.near,
                     far: l.far,
@@ -705,6 +714,7 @@ impl Sim {
                     perf_tick: g.perf_tick,
                     perf_scene: g.perf_scene,
                     tick_no: g.tick_no,
+                    ccd_line: g.ccd_line.clone(),
                     log: std::mem::take(&mut g.log),
                     near: 0.0,
                     far: 60.0,
@@ -1177,6 +1187,16 @@ fn main() {
                 out.perf_tick.2,
                 &out.perf_scene,
                 &rates_view,
+            );
+            /* Строка CCD: CPU-фазы прохода, отдельно от стадий GPU. */
+            let ccd = std::ffi::CString::new(out.ccd_line.as_str()).unwrap_or_default();
+            vf_view_ccd(
+                view,
+                if out.perf_on && !out.ccd_line.is_empty() {
+                    ccd.as_ptr()
+                } else {
+                    std::ptr::null()
+                },
             );
             vf_view_end(view);
         }

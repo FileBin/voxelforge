@@ -76,6 +76,11 @@ void vf_view_perf(vf_view *v, const vf_perf_row *rows, uint32_t n,
                   float tick_min_ms, float tick_mean_ms, float tick_max_ms,
                   const vf_scene_counts *scene, const vf_rates *rates);
 
+/* Строка CCD под таблицей стадий: «ccd: probes N trace X ms bisect Y ms
+ * total Z ms». Отдельной строкой, потому что это CPU-время и в стадии GPU оно
+ * не попадает. line == NULL — строку не рисовать. Копируется внутрь окна. */
+void vf_view_ccd(vf_view *v, const char *line);
+
 // Опросить события. Возвращает 0, если окно закрыто.
 int vf_view_poll(vf_view *v, vf_input *in);
 
