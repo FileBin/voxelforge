@@ -15,6 +15,7 @@ pub mod collide;
 pub mod live;
 pub mod sim;
 pub mod t1;
+pub mod t1root;
 pub mod tet;
 pub mod types;
 pub mod vfw;

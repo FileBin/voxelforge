@@ -736,6 +736,42 @@ pub fn intersect_plane(f: &NodeField, n: [f32; 3], d: f32) -> NodeField {
     out
 }
 
+/// Обрезать поле до блока узлов `lo..lo+dims` (пересечение с исходным блоком).
+///
+/// Нужно осколкам: каждый несёт ТОЛЬКО свой кусок поля родителя, а не весь его
+/// бокс. Иначе поле осколка — сотни тысяч узлов (не влезает в слот SDF на
+/// устройстве), а марчинг перебирает всю сетку родителя на каждый осколок.
+pub fn crop(f: &NodeField, lo: [i32; 3], dims: [usize; 3]) -> NodeField {
+    let mut out_lo = [0i32; 3];
+    let mut out_dims = [0usize; 3];
+    for k in 0..3 {
+        let a = lo[k].max(f.lo[k]);
+        let hi_src = f.lo[k] + f.dims[k] as i32 - 1;
+        let b = (lo[k] + dims[k] as i32 - 1).min(hi_src);
+        assert!(b >= a, "crop: пустое пересечение по оси {k} ({a}..{b})");
+        out_lo[k] = a;
+        out_dims[k] = (b - a + 1) as usize;
+    }
+    let n = out_dims[0] * out_dims[1] * out_dims[2];
+    let mut val = Vec::with_capacity(n);
+    for z in 0..out_dims[2] {
+        for y in 0..out_dims[1] {
+            for x in 0..out_dims[0] {
+                let sx = (out_lo[0] + x as i32 - f.lo[0]) as usize;
+                let sy = (out_lo[1] + y as i32 - f.lo[1]) as usize;
+                let sz = (out_lo[2] + z as i32 - f.lo[2]) as usize;
+                val.push(f.val[(sz * f.dims[1] + sy) * f.dims[0] + sx]);
+            }
+        }
+    }
+    NodeField {
+        lo: out_lo,
+        dims: out_dims,
+        val,
+        step: f.step,
+    }
+}
+
 /// Добавить `layers` узлов ПУСТОТЫ вокруг блока.
 ///
 /// Нужно для мелких осколков: у них занятая область почти вплотную подходит к

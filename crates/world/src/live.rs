@@ -64,13 +64,16 @@ impl LiveBody {
             b
         };
         {
-            let m = tb.surface();
+            /* Меш здесь НЕ строится: раньше этот println марчил поле целиком
+             * ради числа треугольников, и каждый осколок считался дважды
+             * (здесь и в `shape_for`) — на мелком поле это удваивало время
+             * раскола. Печатаем только то, что и так известно. */
             println!(
-                "[body {}] поле SDF: {} · тетов {} · треугольников {}",
+                "[body {}] поле SDF: {} · тетов {} · узлов {}",
                 self.id,
                 if tb.sdf.get().is_some() { "ЕСТЬ" } else { "НЕТ — вывод из тетов" },
                 self.tets.len(),
-                m.triangles()
+                tb.sdf.get().map(|f| f.val.len()).unwrap_or(0)
             );
         }
         let c = tb.world_centroid();
@@ -1107,12 +1110,18 @@ impl Live {
             let t = &self.bodies[ti];
             (t.quat, t.pos, t.vel)
         };
-        let tb = TetBody {
+        /* ПОЛЕ РОДИТЕЛЯ — в осколки. Раньше здесь стоял `sdf: Default::default()`,
+         * и `shatter_fields` считал поле заново BFS-ом по занятости: осколки
+         * выходили «старой» грубой формы, пока целые тела были гладкими. */
+        let mut tb = TetBody {
             tets: self.bodies[ti].tets.clone(),
             level_cap: self.bodies[ti].level_cap,
             origin: self.bodies[ti].origin,
-           sdf: Default::default(),
+            sdf: Default::default(),
         };
+        if let Some(f) = &self.bodies[ti].sdf {
+            let _ = tb.sdf.set(f.clone());
+        }
         let c = tb.world_centroid();
         // точка удара в координатах решётки этого тела
         let p_local = rot_inv(
@@ -1404,7 +1413,7 @@ impl Live {
         };
         let c = tb.world_centroid();
         // без сглаживания: у скола должны быть грани, а не блоб
-        let (mut mesh, grid) = tb.surface_grid_smoothed(0, 0.0);
+        let (mut mesh, grid) = tb.surface_grid();
         for p in mesh.positions.iter_mut() {
             p[0] -= c[0];
             p[1] -= c[1];

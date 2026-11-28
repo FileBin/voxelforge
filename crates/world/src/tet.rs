@@ -458,15 +458,18 @@ impl TetBody {
          * СИММЕТРИЧНОЙ (никакого перекоса, центр тот же), а ноль поля уходит
          * строго между слоями узлов. */
         let half_eval = half + 1e-4;
+        /* Шаг поля — ВДВОЕ мельче шага тетов (level+1). Мельче нельзя по
+         * бюджету кадра: у куба грани ПЛОСКИЕ, лишние треугольники ничего не
+         * добавляют к форме, а в программном рендере (llvmpipe) они стоят
+         * кадра. Точность поверхности при этом задаётся полем, а не тетами. */
         let (nf, fstep) = {
-            let mut fl = level + 1;
-            loop {
-                let fs = node_step(fl);
-                let (n, dim) = field_dims(half, fs, 3);
-                if dim * dim * dim <= FIELD_NODE_BUDGET || fl <= level {
-                    break (n, fs);
-                }
-                fl -= 1;
+            let fs = node_step(level + 1);
+            let (n, dim) = field_dims(half, fs, 3);
+            if dim * dim * dim <= FIELD_NODE_BUDGET {
+                (n, fs)
+            } else {
+                let fs = node_step(level);
+                (field_dims(half, fs, 3).0, fs)
             }
         };
         let dim = (2 * nf + 1) as usize;
@@ -729,9 +732,14 @@ impl TetBody {
             let mut tets = Vec::new();
             for t in &self.tets {
                 let c = t.v;
-                let cx = (c[0].0 + c[1].0 + c[2].0 + c[3].0) as f32 / 4.0;
-                let cy = (c[0].1 + c[1].1 + c[2].1 + c[3].1) as f32 / 4.0;
-                let cz = (c[0].2 + c[1].2 + c[2].2 + c[3].2) as f32 / 4.0;
+                /* центроид тета — В УЗЛАХ ПОЛЯ: у тета свой шаг (node_step), у
+                 * поля свой (step). Раньше центроид (в узлах тета) сравнивался с
+                 * затравкой, поделённой на шаг ПОЛЯ, — раздача тетов уезжала и
+                 * на мелком поле один осколок оставался вообще без тетов. */
+                let s = node_step(t.level) / step;
+                let cx = (c[0].0 + c[1].0 + c[2].0 + c[3].0) as f32 / 4.0 * s;
+                let cy = (c[0].1 + c[1].1 + c[2].1 + c[3].1) as f32 / 4.0 * s;
+                let cz = (c[0].2 + c[1].2 + c[2].2 + c[3].2) as f32 / 4.0 * s;
                 let mut best = f32::MAX;
                 let mut best_i = usize::MAX;
                 for (k, sk) in pts.iter().enumerate() {
@@ -749,15 +757,55 @@ impl TetBody {
                 }
             }
             if tets.is_empty() {
+                eprintln!("DIAG shatter: осколок {i} пропущен — нет тетов");
                 continue;
             }
+            /* Поле осколка — ОБРЕЗАННЫЙ кусок поля родителя (то же расстояние,
+             * тот же шаг), а не весь бокс: меш строится по нему, поэтому
+             * осколок получает ту же гладкость, что и целое тело.
+             * Границы обрезки берём по ЗАНЯТОЙ области самого поля (узлы с
+             * отрицательным значением), а не по тетам: теты лишь разметка, и
+             * поверхность среза может выйти за их бокс — тогда марчинг упрётся
+             * в край обрезанного поля и меш развалится. */
+            let (mut blo, mut bhi) = ([i32::MAX; 3], [i32::MIN; 3]);
+            for z in 0..f.dims[2] {
+                for y in 0..f.dims[1] {
+                    for x in 0..f.dims[0] {
+                        if f.val[(z * f.dims[1] + y) * f.dims[0] + x] < 0.0 {
+                            let c = [
+                                f.lo[0] + x as i32,
+                                f.lo[1] + y as i32,
+                                f.lo[2] + z as i32,
+                            ];
+                            for k in 0..3 {
+                                blo[k] = blo[k].min(c[k]);
+                                bhi[k] = bhi[k].max(c[k]);
+                            }
+                        }
+                    }
+                }
+            }
+            if blo[0] > bhi[0] {
+                eprintln!("DIAG shatter: осколок {i} пропущен — в поле нет отрицательных узлов");
+                continue;
+            }
+            /* запас 3 узла: марчинг идёт ячейками, и срезу нужен слой
+             * внешних узлов; больше не нужно, а каждый лишний слой — это
+             * объём поля, который обязан влезть в слот SDF на устройстве */
+            let lo = [blo[0] - 3, blo[1] - 3, blo[2] - 3];
+            let dims = [
+                (bhi[0] - blo[0] + 1 + 6) as usize,
+                (bhi[1] - blo[1] + 1 + 6) as usize,
+                (bhi[2] - blo[2] + 1 + 6) as usize,
+            ];
+            let fc = field::crop(&f, lo, dims);
             let body = TetBody {
                 tets,
                 level_cap: self.level_cap,
                 origin: self.origin,
                 sdf: Default::default(),
             };
-            let _ = body.sdf.set(f);
+            let _ = body.sdf.set(fc);
             out.push(body);
         }
         out
@@ -824,51 +872,6 @@ impl TetBody {
             origin: self.origin,
             sdf: Default::default(),
         }).collect()
-    }
-
-    /// Раскол: тетраэдры раздаются ближайшей затравке (Вороной). Осколки
-    /// выходят неровными, потому что граница режется по центрам тетраэдров.
-    pub fn shatter(&self, seeds: usize, seed: u64) -> Vec<TetBody> {
-        // центроиды тетраэдров локальные (без origin) — затравки тоже локальные,
-        // иначе все тетраэдры достанутся одной-двум ближайшим затравкам
-        let (lo, hi) = self.bounds();
-        let lo = [lo[0] - self.origin[0], lo[1] - self.origin[1], lo[2] - self.origin[2]];
-        let hi = [hi[0] - self.origin[0], hi[1] - self.origin[1], hi[2] - self.origin[2]];
-        let mut rng = Lcg::new(seed);
-        let pts: Vec<[f64; 3]> = (0..seeds)
-            .map(|_| {
-                [
-                    lo[0] as f64 + (hi[0] - lo[0]) as f64 * rng.unit() as f64,
-                    lo[1] as f64 + (hi[1] - lo[1]) as f64 * rng.unit() as f64,
-                    lo[2] as f64 + (hi[2] - lo[2]) as f64 * rng.unit() as f64,
-                ]
-            })
-            .collect();
-
-        let mut buckets: Vec<Vec<Tet>> = vec![Vec::new(); seeds];
-        for t in &self.tets {
-            let c = t.centroid();
-            let mut best = 0;
-            let mut best_d = f64::MAX;
-            for (i, p) in pts.iter().enumerate() {
-                let d = (c[0] - p[0]).powi(2) + (c[1] - p[1]).powi(2) + (c[2] - p[2]).powi(2);
-                if d < best_d {
-                    best_d = d;
-                    best = i;
-                }
-            }
-            buckets[best].push(*t);
-        }
-        buckets
-            .into_iter()
-            .filter(|v| !v.is_empty())
-            .map(|tets| TetBody {
-                tets,
-                level_cap: self.level_cap,
-                origin: self.origin,
-                sdf: Default::default(),
-            })
-            .collect()
     }
 
     /// Тетраэдры в локальных координатах (относительно центроида) — для
@@ -953,27 +956,16 @@ impl TetBody {
         self.surface_grid().0
     }
 
+    /// Меш и его решётка. НИКАКОГО сглаживания вершин и никаких проекций:
+    /// форма — только из значений поля в узлах (марчинг + t по рёбрам).
     pub fn surface_grid(&self) -> (Mesh, Grid) {
-        self.surface_grid_smoothed(1, 0.30)
-    }
-
-    /// То же, но с явным сглаживанием: 0 — гранёная поверхность (как у
-    /// настоящего скола), больше — «обтекаемая».
-    pub fn surface_grid_smoothed(&self, iterations: usize, lambda: f32) -> (Mesh, Grid) {
-        /* Марчинг — ОСНОВНОЙ путь: поверхность это изоповерхность поля, а не
-         * набор граней тетов (грани давали «квадраты» и незамкнутый меш).
-         * VF_MARCH=old оставлен для сравнения со старым путём. */
-        let mut mesh = if std::env::var("VF_MARCH").as_deref() == Ok("old") {
-            self.extract_faces()
-        } else {
-            self.extract_marching()
-        };
-        /* Поле уже гладкое (SDF запечён и сглажен) — лапласиан по вершинам
-         * только сдвигал бы их с изоповерхности. Крутим его лишь для старого
-         * пути без SDF. */
-        if self.sdf.get().is_none() {
-            smooth(&mut mesh, iterations, lambda);
-        }
+        /* Поверхность — изоповерхность ПОЛЯ, а не набор граней тетов.
+         * Единственный путь: марчинг по полю тела. Теты — только разметка и
+         * масса, форма задаётся значениями поля в узлах. (Старый переключатель
+         * VF_MARCH=old удалён: он собирал меш из тетов и перекрывал форму поля.) */
+        let mut mesh = self.extract_marching();
+        /* Лапласиана вершин здесь НЕТ: он сдвигал вершины с изоповерхности и
+         * подменял собой интерполяцию. Гладкость даёт шаг сетки поля. */
         /* Нормали — из ГРАДИЕНТА поля, а не из граней треугольников: поле
          * гладкое (расстояние), поэтому затенение перестаёт показывать
          * тетраэдры и поверхность читается как одна оболочка. Кадр — кадр
@@ -1184,6 +1176,7 @@ impl TetBody {
     }
 
 /// Точная поверхность: грани, встречающиеся у одного тетраэдра.
+    #[cfg(test)]
     fn extract_faces(&self) -> Mesh {
         let mut faces: HashMap<[u64; 3], (u32, [Node; 3], u8, [f32; 3])> = HashMap::new();
         // Узлы решётки отсчитываются от origin тела. Здесь раньше стоял
@@ -1492,8 +1485,6 @@ pub fn split_surfaces(origin: [f32; 3], tets: &[Tet], shard_of: &[usize], n_shar
 
     for m in out.iter_mut() {
         orient_consistently(m);
-        // сглаживание как в `surface()`: уводит вершины с узлов решётки
-        smooth(m, 2, 0.45);
     }
     out
 }
@@ -1668,66 +1659,7 @@ fn orient_consistently(m: &mut Mesh) {
 }
 
 
-/// Лапласиан: вершина тянется к среднему соседей. Снимает «решёточность»
-/// поверхности, не меняя топологию (меш остаётся водонепроницаемым).
-/// Объём возвращается масштабом вокруг центра масс.
-fn smooth(m: &mut Mesh, iterations: usize, lambda: f32) {
-    let n = m.positions.len();
-    if n == 0 {
-        return;
-    }
-    let mut neigh: Vec<Vec<u32>> = vec![Vec::new(); n];
-    for t in m.indices.chunks(3) {
-        for e in 0..3 {
-            let (a, b) = (t[e], t[(e + 1) % 3]);
-            neigh[a as usize].push(b);
-            neigh[b as usize].push(a);
-        }
-    }
-    for v in neigh.iter_mut() {
-        v.sort_unstable();
-        v.dedup();
-    }
 
-    let vol0 = mesh_volume(m);
-    let mut c = [0.0f64; 3];
-    for p in &m.positions {
-        for k in 0..3 {
-            c[k] += p[k] as f64 / n as f64;
-        }
-    }
-
-    for _ in 0..iterations {
-        let mut next = m.positions.clone();
-        for i in 0..n {
-            if neigh[i].is_empty() {
-                continue;
-            }
-            let mut avg = [0.0f32; 3];
-            for &j in &neigh[i] {
-                for k in 0..3 {
-                    avg[k] += m.positions[j as usize][k] / neigh[i].len() as f32;
-                }
-            }
-            for k in 0..3 {
-                next[i][k] = m.positions[i][k] + lambda * (avg[k] - m.positions[i][k]);
-            }
-        }
-        m.positions = next;
-    }
-
-    // объём после сглаживания просел — возвращаем масштабом
-    let vol1 = mesh_volume(m);
-    if vol1.abs() > 1e-9 {
-        let s = (vol0 / vol1).cbrt();
-        for p in m.positions.iter_mut() {
-            for k in 0..3 {
-                p[k] = (c[k] as f32) + (p[k] - c[k] as f32) * s;
-            }
-        }
-    }
-    recompute_normals(m);
-}
 
 /// Плоские нормали по треугольникам (после сдвига вершин старые неверны).
 fn recompute_normals(m: &mut Mesh) {
@@ -2168,32 +2100,256 @@ mod sdf_quality_tests {
         }
     }
 
-    /// Числовая проверка интерполяции: для шара r=1 при шаге h отклонение
-    /// вершин от |p|-r должно быть O(h²), а не «константа у узла».
-    /// Замеряется ДО проекции (чистая линейная интерполяция) и после неё.
+    /// Таблица «что получилось»: вершины, треугольники, точность. Печатается
+    /// по `--nocapture`; она же держит грубые пределы, чтобы деградация не
+    /// проходила незаметно.
     #[test]
-    fn t_interpolation_error_is_second_order() {
-        let body = TetBody::ball([0.0, 0.0, 0.0], 1.0, 0);
-        let h = body.sdf().step;
-        let d = body.march_diag();
-        assert_eq!(d.interp.len(), body.march_diag().interp.len());
-        let mesh = body.extract_marching();
-        let (mut pre, mut post, mut disp) = (0.0f32, 0.0f32, 0.0f32);
-        for (i, p) in d.interp.iter().enumerate() {
-            let r = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
-            pre = pre.max((r - 1.0).abs());
-            let q = mesh.positions[i];
-            let rq = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2]).sqrt();
-            post = post.max((rq - 1.0).abs());
-            disp = disp.max((0..3).map(|k| (q[k] - p[k]).powi(2)).sum::<f32>().sqrt());
+    fn mesh_stats_table() {
+        for (name, body, want_r) in [
+            ("плита 4×4×4", TetBody::cube([0.0, 0.0, 0.0], 4, 0), 0.0f32),
+            ("шар r=0.30 (демо)", TetBody::ball([0.0; 3], 0.30, 1), 0.30),
+            ("снаряд r=0.14", TetBody::ball([0.0; 3], 0.14, 0), 0.14),
+            ("шар r=1.0", TetBody::ball([0.0; 3], 1.0, 0), 1.0),
+        ] {
+            let m = body.extract_marching();
+            let h = body.sdf().step;
+            let mut worst = 0.0f32;
+            if want_r > 0.0 {
+                for p in &m.positions {
+                    let r = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+                    worst = worst.max((r - want_r).abs());
+                }
+            }
+            println!(
+                "DIAG {name}: шаг поля {h:.4}, вершин {}, треугольников {}, {}",
+                m.positions.len(),
+                m.triangles(),
+                if want_r > 0.0 {
+                    format!("макс |r−R| {worst:.5} м ({:.2}%)", 100.0 * worst / want_r)
+                } else {
+                    "коробка".to_string()
+                }
+            );
+            assert!(m.positions.len() > 200, "{name}: меш подозрительно бедный");
+            if want_r > 0.0 {
+                assert!(worst < 0.02 * want_r, "{name}: шар не круглый: {worst}");
+            }
         }
-        println!(
-            "DIAG шар r=1 шаг h={h:.5}: |r-1| до проекции {pre:.5} (O(h²)={:.5}), после {post:.5}, сдвиг проекции {disp:.5}",
-            h * h / 2.0
-        );
-        assert!(pre < h * h, "интерполяция не второго порядка: {pre} при h={h}");
     }
 
+    /// ОСКОЛКИ ИДУТ ТЕМ ЖЕ ПУТЁМ, ЧТО И ЦЕЛЫЕ ТЕЛА: поле осколка — поле
+    /// родителя, отсечённое плоскостями Вороного и обрезанное по своему боксу.
+    /// Проверки: меш лежит на нуле СВОЕГО поля, срез плоский (2 мм), объём
+    /// осколков равен объёму родителя, меши замкнуты.
+    #[test]
+    fn shards_keep_parent_field_granularity() {
+        let parent = TetBody::cube([0.0, 0.0, 0.0], 4, 0);
+        let pf = parent.sdf().clone();
+        let frags = parent.shatter_biased(2, 0x5EED, [0.3, 0.2, 0.1]);
+        assert_eq!(frags.len(), 2, "два осколка — один плоский срез у каждого");
+        let mut vol_sum = 0.0f64;
+        for (i, fr) in frags.iter().enumerate() {
+            let f = fr.sdf();
+            assert!(
+                (f.step - pf.step).abs() < 1e-9,
+                "осколок {i}: шаг поля {} вместо {}",
+                f.step,
+                pf.step
+            );
+            let m = fr.extract_marching();
+            assert!(m.positions.len() > 20, "осколок {i}: меш пустой");
+            /* 1. меш на нуле своего поля (трилинейная выборка в вершине).
+             * На ГЛАДКИХ участках (грани коробки, плоскость среза) это ровно
+             * ноль — поле там линейное. На ПЕРЕГИБЕ «срез × грань» поле
+             * max(a,b) нелинейно, и вершина линейного марчинга неизбежно
+             * отходит на долю шага: поэтому смотрим 95-й процентиль, а не
+             * единичный максимум. */
+            let mut offs: Vec<f32> = m
+                .positions
+                .iter()
+                .map(|p| {
+                    let local = [
+                        (p[0] - fr.origin[0]) / f.step,
+                        (p[1] - fr.origin[1]) / f.step,
+                        (p[2] - fr.origin[2]) / f.step,
+                    ];
+                    f.sample(local).abs() * f.step
+                })
+                .collect();
+            offs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let worst = offs[(offs.len() * 95) / 100];
+            /* 2. срез плоский: вершины ГЛУБОКО внутри родителя могут быть
+             * только на плоскости среза — они обязаны быть компланарны */
+            let deep: Vec<[f32; 3]> = m
+                .positions
+                .iter()
+                .copied()
+                .filter(|p| {
+                    let local = [
+                        (p[0] - fr.origin[0]) / f.step,
+                        (p[1] - fr.origin[1]) / f.step,
+                        (p[2] - fr.origin[2]) / f.step,
+                    ];
+                    pf.sample(local) * pf.step < -4.0 * f.step
+                })
+                .collect();
+            let mut flat = 0.0f32;
+            if deep.len() >= 4 {
+                let c = deep.iter().fold([0.0f32; 3], |mut a, p| {
+                    for k in 0..3 {
+                        a[k] += p[k] / deep.len() as f32;
+                    }
+                    a
+                });
+                let d2 = |p: &[f32; 3], q: &[f32; 3]| {
+                    (0..3).map(|k| (p[k] - q[k]).powi(2)).sum::<f32>()
+                };
+                let far = |from: &[f32; 3]| -> [f32; 3] {
+                    *deep
+                        .iter()
+                        .max_by(|a, b| d2(a, from).partial_cmp(&d2(b, from)).unwrap())
+                        .unwrap()
+                };
+                let p0 = far(&c);
+                let p1 = far(&p0);
+                let mut best = (0.0f32, [0.0f32; 3]);
+                for p in &deep {
+                    let (u, v) = (
+                        [p[0] - p0[0], p[1] - p0[1], p[2] - p0[2]],
+                        [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]],
+                    );
+                    let n = [
+                        u[1] * v[2] - u[2] * v[1],
+                        u[2] * v[0] - u[0] * v[2],
+                        u[0] * v[1] - u[1] * v[0],
+                    ];
+                    let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+                    if len > best.0 {
+                        best = (len, [n[0] / len, n[1] / len, n[2] / len]);
+                    }
+                }
+                let n = best.1;
+                let mut dists: Vec<f32> = deep
+                    .iter()
+                    .map(|p| {
+                        ((p[0] - p0[0]) * n[0] + (p[1] - p0[1]) * n[1] + (p[2] - p0[2]) * n[2])
+                            .abs()
+                    })
+                    .collect();
+                dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                /* 95-й процентиль: единичные вершины на стыке среза с исходной
+                 * поверхностью родителя в плоскость не входят */
+                flat = dists[(dists.len() * 95) / 100];
+                println!("DIAG осколок {i}: срез — медиана {:.5} м, 95% {:.5} м, макс {:.5} м",
+                    dists[dists.len() / 2], flat, dists[dists.len() - 1]);
+            }
+            /* 3. меш замкнут: каждое ребро ровно в двух треугольниках */
+            let mut edges = std::collections::HashMap::new();
+            for t in m.indices.chunks(3) {
+                for k in 0..3 {
+                    let a = t[k].min(t[(k + 1) % 3]);
+                    let b = t[k].max(t[(k + 1) % 3]);
+                    *edges.entry((a, b)).or_insert(0usize) += 1;
+                }
+            }
+            let open = edges.values().filter(|c| **c != 2).count();
+            /* диагностика: сколько вершин лежит на границе ОБРЕЗАННОГО поля —
+             * если много, поверхность режется о край поля, а не о срез */
+            let mut on_border = 0usize;
+            let hi_node = [
+                f.lo[0] + f.dims[0] as i32 - 1,
+                f.lo[1] + f.dims[1] as i32 - 1,
+                f.lo[2] + f.dims[2] as i32 - 1,
+            ];
+            for p in &m.positions {
+                let n = [
+                    (p[0] - fr.origin[0]) / f.step,
+                    (p[1] - fr.origin[1]) / f.step,
+                    (p[2] - fr.origin[2]) / f.step,
+                ];
+                if (0..3).any(|k| (n[k] - f.lo[k] as f32).abs() < 1.5 || (n[k] - hi_node[k] as f32).abs() < 1.5) {
+                    on_border += 1;
+                }
+            }
+            println!(
+                "DIAG осколок {i}: поле lo {:?} dims {:?}, вершин на границе поля {on_border}",
+                f.lo, f.dims
+            );
+            vol_sum += fr.volume();
+            println!(
+                "DIAG осколок {i}: шаг {:.4}, вершин {}, треугольников {}, |поле| {:.4} м, срез плоский {:.4} м (вершин на срезе {}), открытых рёбер {}",
+                f.step,
+                m.positions.len(),
+                m.triangles(),
+                worst,
+                flat,
+                deep.len(),
+                open
+            );
+            println!(
+                "DIAG осколок {i}: |поле| медиана {:.5} м, 95% {:.5} м, макс {:.5} м",
+                offs[offs.len() / 2],
+                worst,
+                offs[offs.len() - 1]
+            );
+            assert!(
+                offs[offs.len() / 2] < 0.005,
+                "осколок {i}: медиана смещения с поверхности {:.5} м",
+                offs[offs.len() / 2]
+            );
+            assert!(worst < 0.05, "осколок {i}: 95% вершин далеко от нуля поля: {worst} м");
+            assert!(open == 0, "осколок {i}: меш не замкнут, {open} рёбер");
+            if deep.len() >= 4 {
+                assert!(flat < 0.002, "осколок {i}: срез не плоский: {flat} м");
+            }
+        }
+        println!(
+            "DIAG объём: осколки {:.6} против родителя {:.6}",
+            vol_sum,
+            parent.volume()
+        );
+        assert!(
+            (vol_sum - parent.volume()).abs() < 1e-4 * parent.volume() as f64,
+            "объём осколков не равен объёму родителя"
+        );
+    }
+
+    /// ЧИСТАЯ ЛИНЕЙНАЯ ИНТЕРПОЛЯЦИЯ: вершина меша — ровно точка ребра по
+    /// t = v0/(v0−v1), никаких подтягиваний к аналитике. Поэтому отклонение от
+    /// истинной сферы обязано подчиняться закону O(h²/R): при сетке с
+    /// постоянным числом узлов на радиус R полей 1, 1/2, 1/4 (шаг h тоже
+    /// делится вдвое) отношение «ошибка · R / h²» ОБЯЗАНО быть постоянным.
+    /// Проекция дала бы ~0, ошибка единиц — константу, не зависящую от h.
+    #[test]
+    fn interpolation_error_follows_second_order_law() {
+        let mut law = Vec::new();
+        for (r, level) in [(1.0f32, 0u8), (0.5, 1), (0.25, 2)] {
+            let body = TetBody::ball([0.0; 3], r, level);
+            let h = body.sdf().step;
+            let d = body.march_diag();
+            let mut worst = 0.0f32;
+            for p in &d.interp {
+                let rr = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+                worst = worst.max((rr - (r + 1e-4)).abs());
+            }
+            let k = worst * r / (h * h);
+            println!(
+                "DIAG шар R={r}: шаг h={h:.4} ({:.1} узла на радиус), вершин {}, макс |r−R| = {:.6} м, ошибка·R/h² = {k:.3}",
+                r / h,
+                d.interp.len(),
+                worst
+            );
+            law.push(k);
+        }
+        let k0 = law[0];
+        assert!(k0 > 0.2 && k0 < 5.0, "ошибка не порядка h²/R: {k0}");
+        for k in &law {
+            assert!(
+                (k - k0).abs() < 0.05 * k0,
+                "закон h²/R нарушен: {k} против {k0} (значит вершины не интерполируются, а подтягиваются)"
+            );
+        }
+    }
 
     /// Меш обязан лежать на НУЛЕ поля расстояний — это и есть поверхность,
     /// по которой считаются столкновения. Проверка прямая: сэмплируем поле в
@@ -2247,6 +2403,7 @@ mod rot_check {
         let (n, level) = (4i32, 0u8);
         let half = n as f32 * node_step(level);
         let body = TetBody::cube([0.0, 0.0, 0.0], n, level);
+        let h = body.sdf().step;
         let m = body.extract_marching();
         assert!(m.positions.len() > 100, "меш подозрительно бедный");
         let mut lo = [f32::MAX; 3];
@@ -2269,10 +2426,32 @@ mod rot_check {
             .filter(|p| (0..3).any(|k| (p[k] - lo[k]).abs() < 1e-4 || (p[k] - hi[k]).abs() < 1e-4))
             .count();
         let flat = on_face as f32 / m.positions.len() as f32;
+        /* ВЕРХНЯЯ ГРАНЬ: все её вершины обязаны лежать в одной плоскости.
+         * Поле коробки кусочно-плоское, линейная интерполяция вдоль ребра на
+         * грани ТОЧНА, поэтому отклонение = ошибка в значениях поля, а не
+         * «мягкость» поверхности. */
+        let ymax = m.positions.iter().fold(f32::MIN, |a, p| a.max(p[1]));
+        let top: Vec<f32> = m
+            .positions
+            .iter()
+            .filter(|p| p[1] > ymax - 0.5 * h)
+            .map(|p| (p[1] - half).abs())
+            .collect();
+        let top_max = top.iter().fold(0.0f32, |a, d| a.max(*d));
         println!(
-            "плита {}×{}×{}: вершин {}, на плоскостях {:.0}%",
-            n, n, n, m.positions.len(), flat * 100.0
+            "плита {}×{}×{}: шаг поля {h:.4}, вершин {}, на плоскостях {:.0}%, вершин на верхней грани {}, макс отклонение по y {:.6} м",
+            n,
+            n,
+            n,
+            m.positions.len(),
+            flat * 100.0,
+            top.len(),
+            top_max
         );
         assert!(flat > 0.98, "вершины не на плоскостях коробки: {:.0}%", flat * 100.0);
+        assert!(
+            top_max <= 1e-3,
+            "верхняя грань не плоская: {top_max} м (это ошибка в значениях поля, не геометрия)"
+        );
     }
 }

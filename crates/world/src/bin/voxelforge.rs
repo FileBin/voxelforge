@@ -345,33 +345,13 @@ fn main() {
                 e_kin / 1000.0
             ));
 
-            // формы осколков (меш + каркас тетраэдров)
+            // формы осколков: МЕШ ПО ПОЛЮ осколка (тот же марчинг, что у целых
+            // тел). Раньше здесь стоял `split_surfaces` — сборка меша из граней
+            // тетов, и осколки выходили «старой» грубой формы, пока целые тела
+            // были гладкими.
             let base = shapes.len() as u32;
-            let mut tets_all = Vec::new();
-            let mut owner = Vec::new();
             for (i, fr) in frags.iter().enumerate() {
-                tets_all.extend_from_slice(&fr.tets);
-                owner.extend(std::iter::repeat(i).take(fr.tets.len()));
-            }
-            let mut meshes = split_surfaces(plate.origin, &tets_all, &owner, n);
-            for (i, m) in meshes.iter_mut().enumerate() {
-                let c = frags[i].world_centroid();
-                for p in m.positions.iter_mut() {
-                    p[0] -= c[0];
-                    p[1] -= c[1];
-                    p[2] -= c[2];
-                }
-            }
-            for (i, m) in meshes.into_iter().enumerate() {
-                let g = frags[i].surface_grid().1;
-                shapes.push(Shape {
-                    level: m.level,
-                    mesh: m,
-                    grid_lo: g.lo,
-                    grid_hi: g.hi,
-                    grid_step: g.step,
-                    edges: frags[i].edge_lines(),
-                });
+                shapes.push(shape_of(fr));
                 shape_id[i] = base + i as u32;
             }
 
