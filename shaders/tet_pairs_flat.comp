@@ -108,6 +108,13 @@ void main() {
         aabb(B.x, tb, blo, bhi, okb);
         if (!oka || !okb) continue;
         vec3 inflB = abs(b[B.x].vel_m.xyz) * pc.prm0.x;
+        /* AABB тетов не пересекаются ДАЖЕ с запасом на путь за такт — SAT всё
+         * равно нашёл бы разделяющую ось по координате, пара физически не
+         * может дать контакт. Запас тот же, что у раскладки по ячейкам
+         * (|v|·dt), поэтому быстрый снаряд свои пары не теряет. В плотной
+         * ячейке (десятки тетов разных тел) это отсекает почти всё. */
+        if (any(greaterThan(alo - inflA, bhi + inflB)) ||
+            any(greaterThan(blo - inflB, ahi + inflA))) continue;
         ivec3 cb = clamp(ivec3(floor((blo - inflB - lo_box) / cell)), ivec3(0), dims - ivec3(1));
         ivec3 canon3 = max(ca, cb);
         int canon = (canon3.z * dims.y + canon3.y) * dims.x + canon3.x;
