@@ -131,6 +131,12 @@ static uint32_t mem_type(VkPhysicalDevice phys, uint32_t bits, VkMemoryPropertyF
 
 static int make_buffer(vf_view *v, VkDeviceSize size, VkBufferUsageFlags usage,
                        VkBuffer *buf, VkDeviceMemory *mem, VkMemoryPropertyFlags props) {
+    /* Проверки перед драйвером: на нулевом размере и при исчерпанной памяти
+     * RADV падал внутри vkBindBufferMemory вместо того, чтобы вернуть ошибку. */
+    if (size == 0) {
+        fprintf(stderr, "[view] буфер нулевого размера — пропуск\n");
+        return 0;
+    }
     VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.size = size;
     bi.usage = usage;
@@ -138,11 +144,29 @@ static int make_buffer(vf_view *v, VkDeviceSize size, VkBufferUsageFlags usage,
     if (!ok(vkCreateBuffer(v->dev, &bi, NULL, buf), "vkCreateBuffer")) return 0;
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(v->dev, *buf, &req);
+    uint32_t mti = mem_type(v->phys, req.memoryTypeBits, props);
+    if (mti == UINT32_MAX) {
+        fprintf(stderr, "[view] нет подходящего типа памяти под буфер %.1f МБ\n",
+                (double)req.size / (1024.0 * 1024.0));
+        vkDestroyBuffer(v->dev, *buf, NULL);
+        *buf = VK_NULL_HANDLE;
+        return 0;
+    }
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     ai.allocationSize = req.size;
-    ai.memoryTypeIndex = mem_type(v->phys, req.memoryTypeBits, props);
-    if (!ok(vkAllocateMemory(v->dev, &ai, NULL, mem), "vkAllocateMemory")) return 0;
-    if (!ok(vkBindBufferMemory(v->dev, *buf, *mem, 0), "vkBindBufferMemory")) return 0;
+    ai.memoryTypeIndex = mti;
+    if (!ok(vkAllocateMemory(v->dev, &ai, NULL, mem), "vkAllocateMemory")) {
+        vkDestroyBuffer(v->dev, *buf, NULL);
+        *buf = VK_NULL_HANDLE;
+        return 0;
+    }
+    if (!ok(vkBindBufferMemory(v->dev, *buf, *mem, 0), "vkBindBufferMemory")) {
+        vkDestroyBuffer(v->dev, *buf, NULL);
+        vkFreeMemory(v->dev, *mem, NULL);
+        *buf = VK_NULL_HANDLE;
+        *mem = VK_NULL_HANDLE;
+        return 0;
+    }
     return 1;
 }
 
@@ -727,7 +751,15 @@ static int32_t add_shape(vf_view *v, const void *verts, VkDeviceSize vsize,
 
 int32_t vf_view_add_mesh(vf_view *v, const float *pos, const float *nrm, uint32_t nv,
                          const uint32_t *idx, uint32_t ni) {
+    if (nv == 0 || ni == 0 || (uint64_t)nv > 4u * 1024u * 1024u) {
+        fprintf(stderr, "[view] меш странного размера: %u вершин, %u индексов\n", nv, ni);
+        return -1;
+    }
     float *verts = malloc(sizeof(float) * 6 * nv);
+    if (!verts) {
+        fprintf(stderr, "[view] нет памяти под меш на %u вершин\n", nv);
+        return -1;
+    }
     for (uint32_t i = 0; i < nv; i++) {
         memcpy(verts + i * 6, pos + i * 3, sizeof(float) * 3);
         memcpy(verts + i * 6 + 3, nrm + i * 3, sizeof(float) * 3);
