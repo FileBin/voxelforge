@@ -419,13 +419,17 @@ static int make_swapchain(vf_view *v) {
      * ровно. MAILBOX отдаёт ритм приложению — с ним картинка отзывчивее, но
      * фаза у композитора не та, и на движении видно подрагивание.
      * VF_PRESENT=mailbox|immediate включает их осознанно. */
+    /* По умолчанию MAILBOX: очередь не копится и показывается самый свежий
+     * кадр. С FIFO на этой связке (общий UBO камеры и кадр позы, один fence)
+     * картинка идёт «перепутанными кадрами» — проверено на карте: MAILBOX ровно,
+     * FIFO дёргается. VF_PRESENT=fifo возвращает старый режим для сравнения. */
     VkPresentModeKHR pm = VK_PRESENT_MODE_FIFO_KHR;
     const char *pm_name = "FIFO";
     const char *want_pm = getenv("VF_PRESENT");
     if (want_pm && !strcmp(want_pm, "immediate") && has_immediate) {
         pm = VK_PRESENT_MODE_IMMEDIATE_KHR;
         pm_name = "IMMEDIATE";
-    } else if (want_pm && !strcmp(want_pm, "mailbox") && has_mailbox) {
+    } else if ((!want_pm || strcmp(want_pm, "fifo")) && has_mailbox) {
         pm = VK_PRESENT_MODE_MAILBOX_KHR;
         pm_name = "MAILBOX";
     }
