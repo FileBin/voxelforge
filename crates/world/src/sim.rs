@@ -14,6 +14,14 @@ pub struct VfStatus {
     msg: *const c_char,
 }
 
+/// Ожидание значения таймлайна другого потока (см. `vf_run_stream`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VfSemWait {
+    pub stream: u32,
+    pub value: u64,
+}
+
 #[repr(C)]
 pub struct VfDispatch {
     pub pipeline: *mut c_void,
@@ -65,6 +73,32 @@ unsafe extern "C" {
     /// Отправить такт и не ждать: результат читается на следующем.
     pub fn vf_run_async(c: *mut c_void, list: *mut VfDispatch, count: u32) -> VfStatus;
     pub fn vf_wait_back(c: *mut c_void, back: u32) -> VfStatus;
+    /// Submit в конкретный поток: 0 — такт (compute, приоритет 0.0), 1 — кадр
+    /// (graphics, приоритет 1.0). `waits` — чужие значения таймлайнов, которых
+    /// этот submit ждёт ДО старта (сам он сигналит свой номер).
+    pub fn vf_run_stream(
+        c: *mut c_void,
+        list: *mut VfDispatch,
+        count: u32,
+        stream: u32,
+        waits: *const VfSemWait,
+        n_waits: u32,
+        wait_now: i32,
+    ) -> VfStatus;
+    pub fn vf_wait_stream(c: *mut c_void, stream: u32, back: u32) -> VfStatus;
+    pub fn vf_stream_value(c: *mut c_void, stream: u32) -> u64;
+    pub fn vf_wait_timeline(c: *mut c_void, stream: u32, value: u64, timeout_ns: u64) -> i32;
+    pub fn vf_split(c: *mut c_void) -> i32;
+    pub fn vf_ctx_semaphore(c: *mut c_void, stream: u32) -> *mut c_void;
+    pub fn vf_note_bank_read(c: *mut c_void, bank: u32, frame_value: u64);
+    pub fn vf_bank_read_value(c: *mut c_void, bank: u32) -> u64;
+    pub fn vf_queue_info(
+        c: *mut c_void,
+        gfx_family: *mut u32,
+        tick_family: *mut u32,
+        prio_gfx: *mut f32,
+        prio_tick: *mut f32,
+    );
 
     /* Диагностика стадий: таймстемпы по диспатчам такта. Значения читаются
      * на СЛЕДУЮЩЕМ такте (после fence), поэтому сбор не тормозит пайплайн. */
@@ -212,12 +246,17 @@ const P_SDFPAIRS: usize = 30;
 const P_STATWORK: usize = 31;
 const P_STATTIE: usize = 32;
 const P_STATEMIT: usize = 33;
+/// Публикация состояния такта в банк кадра (двойная буферизация).
+const P_PUBLISH: usize = 34;
+/// Кадровый проход по банку: интерполяция позы на тело (аналог вершинной
+/// выборки в окне, но headless — с результатом в буфер).
+const P_FRAMEREAD: usize = 35;
 
 /// Имена пайплайнов в порядке `pipes` — ТОТ ЖЕ порядок, что у `P_*` выше и у
 /// массива `names` на устройстве. По этому индексу ядро возвращает номер
 /// стадии в диагностике производительности, поэтому список — единственный
 /// источник правды и для загрузки, и для таблицы.
-pub const PIPE_NAMES: [&str; 34] = [
+pub const PIPE_NAMES: [&str; 36] = [
     "integrate",
     "clear",
     "count",
@@ -252,11 +291,13 @@ pub const PIPE_NAMES: [&str; 34] = [
     "static_work",
     "static_tie",
     "static_emit",
+    "publish",
+    "frame_read",
 ];
 /// Число storage-буферов у каждого пайплайна — в том же порядке.
-const PIPE_BUFNS: [u32; 34] = [
+const PIPE_BUFNS: [u32; 36] = [
     1, 2, 2, 3, 4, 2, 5, 4, 1, 1, 4, 4, 7, 3, 2, 4, 3, 6, 8, 6, 4, 1, 2, 3, 2, 2, 4, 8, 1, 7, 5, 6,
-    5, 6,
+    5, 6, 2, 2,
 ];
 /// Ячеек на блок в параллельном скане (совпадает с 16 * 64 в шейдере).
 pub const SCAN_BLOCK: usize = 1024;
@@ -289,6 +330,11 @@ pub const SDF_STRIDE: usize = 65536;
 /// Потолок пар тел в широком проходе SDF (64 тела → 2016; совпадает с
 /// MAX_SDF_PAIRS в common.glsl).
 pub const MAX_SDF_PAIRS: usize = MAX_BODIES * (MAX_BODIES - 1) / 2;
+
+/// Потоки submit'ов ядра (см. `vf_run_stream`): такт — compute с приоритетом
+/// 0.0, кадр — graphics с приоритетом 1.0.
+pub const VF_STREAM_TICK: u32 = 0;
+pub const VF_STREAM_FRAME: u32 = 1;
 
 /// Контактов на тело. Было 24 — в плотной куче этого мало: часть контактов
 /// просто не попадала в список. Память: 64 тела x 64 контакта x 48 Б ≈ 200 КБ.
@@ -466,6 +512,22 @@ pub struct GpuSim {
     /// Точек контакта в последнем такте окна. Читается из счётчиков списков
     /// только на границе окна печати, а не каждый такт.
     perf_contacts: u32,
+    /// Две очереди (такт на compute с приоритетом 0.0, кадр на graphics с 1.0)
+    /// и двойной банк состояния тел. Выключено — прежний путь: одна очередь,
+    /// кадр читает буфер физики напрямую.
+    pub split: bool,
+    /// Банки, которые ЧИТАЕТ кадр. Такт пишет в банк (tick % 2) последним
+    /// проходом такта и сигналит таймлайн; перезапись банка начинается
+    /// только после того, как кадр, читавший его, закрылся.
+    bank: [*mut c_void; 2],
+    /// Приёмник кадрового прохода (поза и кватернион на тело).
+    draw: *mut c_void,
+    /// Что опубликовано: номер такта и банк. Кадр ждёт это значение.
+    pub published: (u64, usize),
+    /// Время кадрового submit'а: от отправки до закрытия fence, мс.
+    pub frame_ms: f32,
+    pub frame_submits: u64,
+    frame_t0: std::time::Instant,
 }
 
 impl GpuSim {
@@ -607,6 +669,26 @@ impl GpuSim {
         /* Диагностика стадий: спрашиваем у драйвера, умеет ли он таймстемпы, и
          * включаем сбор, если попросили VF_PERF=1. По умолчанию выключено:
          * включённый сбор добавляет в такт count+1 метку и копирование. */
+        /* Две очереди и двойной банк. Ядро решает по драйверу и VF_SPLIT:
+         * на RADV такт уходит в отдельное compute-семейство (приоритет 0.0),
+         * кадр остаётся на graphics (1.0). Банк — буфер, который читает кадр;
+         * физика пишет его последним проходом такта. */
+        let split = unsafe { vf_split(ctx) } != 0;
+        let bank = [mk(n * BODY_BYTES, true), mk(n * BODY_BYTES, true)];
+        // Поза и кватернион на тело: 2 vec4.
+        let draw = mk(MAX_BODIES * 32, true);
+        if split {
+            unsafe {
+                for b in bank {
+                    let zeros = vec![0u8; n * BODY_BYTES];
+                    check_status(
+                        vf_buffer_write(ctx, b, 0, zeros.as_ptr() as *const c_void, zeros.len()),
+                        "bank zero",
+                    );
+                }
+            }
+        }
+
         let perf_ok = unsafe { vf_perf_supported(ctx) } != 0;
         let mut perf = crate::perf::Perf::new(perf_ok, false);
         let want_perf = matches!(std::env::var("VF_PERF").as_deref(), Ok(v) if v != "0");
@@ -708,6 +790,13 @@ impl GpuSim {
             perf_ms: vec![0.0; 4096],
             perf_ids: vec![0; 4096],
             perf_contacts: 0,
+            split,
+            bank,
+            draw,
+            published: (0, 0),
+            frame_ms: 0.0,
+            frame_submits: 0,
+            frame_t0: std::time::Instant::now(),
         }
     }
 
@@ -929,7 +1018,127 @@ impl GpuSim {
     /// Дождаться последнего отправленного такта: перед любой записью тел с
     /// CPU (спавн, раскол, сброс) — иначе побежим по буферу, который считает GPU.
     pub fn wait_idle(&mut self) {
-        unsafe { check_status(vf_wait_back(self.ctx, 0), "vf_wait_back") };
+        unsafe { check_status(vf_wait_stream(self.ctx, VF_STREAM_TICK, 0), "vf_wait_back") };
+    }
+
+    /// Опубликованный банк (номер такта, индекс банка) — то, что читает кадр.
+    pub fn published_bank(&self) -> (u64, usize) {
+        self.published
+    }
+
+    /// Буфер банка как VkBuffer: его привязывает окно (или кадровый проход).
+    pub fn bank_buffer(&self, bank: usize) -> *mut c_void {
+        unsafe { vf_buffer_handle(self.bank[bank & 1]) }
+    }
+
+    /// Кадровый проход по опубликованному банку: тот же читатель данных, что
+    /// вершинный шейдер окна, но headless (результат — в буфер draw).
+    ///
+    /// Ждёт НА GPU «такт N опубликован» (значение таймлайна такта), а не весь
+    /// текущий такт: если физика считает такт N+1, кадр всё равно стартует
+    /// сразу на банке такта N. Возвращает номер кадрового submit'а.
+    /// Одна очередь: кадр идёт в ту же очередь, что такт, и читает буфер
+    /// физики напрямую (прежний путь). Две: кадр на graphics, читает банк.
+    pub fn frame_submit(&mut self, alpha: f32, wait: bool) -> u64 {
+        let (src, stream, tick_no) = if self.split {
+            let (tick_no, bank) = self.published;
+            (self.bank[bank], VF_STREAM_FRAME, tick_no)
+        } else {
+            (self.bodies[0], VF_STREAM_TICK, 0u64)
+        };
+        let mut p = self.push(alpha, 0);
+        p.prm0[0] = alpha;
+        let bufs = [src, self.draw];
+        let mut d = VfDispatch {
+            pipeline: self.pipes[P_FRAMEREAD],
+            buffers: bufs.as_ptr() as *mut *mut c_void,
+            n_buffers: 2,
+            push: &p as *const Push as *const c_void,
+            push_bytes: 80,
+            groups: [((self.n as u32) + WG - 1) / WG, 1, 1],
+            stage: P_FRAMEREAD as u32,
+        };
+        let waits = [VfSemWait {
+            stream: VF_STREAM_TICK,
+            value: tick_no,
+        }];
+        let n_waits = if self.split { 1 } else { 0 };
+        self.frame_t0 = std::time::Instant::now();
+        unsafe {
+            let st = vf_run_stream(
+                self.ctx,
+                &mut d,
+                1,
+                stream,
+                if n_waits > 0 { waits.as_ptr() } else { std::ptr::null() },
+                n_waits,
+                if wait { 1 } else { 0 },
+            );
+            check_status(st, "frame_submit");
+            if wait {
+                self.frame_ms = self.frame_t0.elapsed().as_secs_f32() * 1000.0;
+            }
+            if self.split {
+                /* Кадр прочитал этот банк: такт ждёт это значение, прежде чем
+                 * писать в него снова. */
+                let (_, bank) = self.published;
+                let fv = vf_stream_value(self.ctx, VF_STREAM_FRAME);
+                vf_note_bank_read(self.ctx, bank as u32, fv);
+            }
+        }
+        if !self.split {
+            self.frame_ms = self.frame_t0.elapsed().as_secs_f32() * 1000.0;
+        }
+        self.frame_submits += 1;
+        unsafe { vf_stream_value(self.ctx, VF_STREAM_FRAME) }
+    }
+
+    /// Дождаться кадрового submit'а на хосте: время от отправки до fence, мс.
+    pub fn frame_wait(&mut self) -> f32 {
+        unsafe {
+            check_status(vf_wait_stream(self.ctx, VF_STREAM_FRAME, 0), "frame_wait");
+        }
+        self.frame_ms = self.frame_t0.elapsed().as_secs_f32() * 1000.0;
+        self.frame_ms
+    }
+
+    /// Дождаться на хосте публикации банка (окно, которому нужен буфер прямо
+    /// сейчас). Обычно значение уже достигнуто — стоит ноль.
+    pub fn wait_published(&mut self, tick_no: u64) {
+        unsafe {
+            let _ = vf_wait_timeline(self.ctx, VF_STREAM_TICK, tick_no, 2_000_000_000);
+        }
+    }
+
+    /// Сколько очередей и с какими приоритетами реально создано.
+    pub fn queues(&self) -> (u32, u32, f32, f32, bool) {
+        let (mut g, mut t, mut pg, mut pt) = (0u32, 0u32, 0f32, 0f32);
+        unsafe { vf_queue_info(self.ctx, &mut g, &mut t, &mut pg, &mut pt) };
+        (g, t, pg, pt, self.split)
+    }
+
+    /// Тела из банка (для сверки «банк равен физике») и из буфера физики.
+    pub fn read_bank(&self, bank: usize) -> Vec<GpuBody> {
+        let mut out = vec![GpuBody::from_cpu(&Body::new([0.0; 3], [0.0; 3], 1.0, 0.05)); self.n];
+        let bytes = self.n * BODY_BYTES;
+        unsafe {
+            let st = vf_buffer_read(
+                self.ctx,
+                self.bank[bank & 1],
+                0,
+                out.as_mut_ptr() as *mut c_void,
+                bytes,
+            );
+            if st.code != 0 {
+                return Vec::new();
+            }
+        }
+        out
+    }
+
+    /// Таймлайн-семафор потока (окну): кадровый — сигналить, тактовый — ждать.
+    pub fn stream_semaphore(&self, stream: u32) -> *mut c_void {
+        unsafe { vf_ctx_semaphore(self.ctx, stream) }
     }
 
     /// Дождаться такта, отправленного предыдущим (к этому моменту он обычно
@@ -1126,6 +1335,30 @@ impl GpuSim {
             });
         }
 
+        /* Публикация в банк кадра — последним проходом такта. Банк выбирается
+         * по номеру такта (N % 2), и перед записью такт ждёт кадр, который
+         * этот банк читал: иначе он перезапишет читаемое — ровно то, от чего
+         * первая попытка двух очередей падала в GPUVM fault. */
+        let mut waits: Vec<VfSemWait> = Vec::new();
+        if self.split {
+            let tick_no = unsafe { vf_stream_value(self.ctx, VF_STREAM_TICK) } + 1;
+            let bank = (tick_no % 2) as usize;
+            steps.push(Step {
+                pipe: P_PUBLISH,
+                bufs: vec![a, self.bank[bank]],
+                push,
+                groups: [g_body, 1, 1],
+            });
+            let read_by = unsafe { vf_bank_read_value(self.ctx, bank as u32) };
+            if read_by > 0 {
+                waits.push(VfSemWait {
+                    stream: VF_STREAM_FRAME,
+                    value: read_by,
+                });
+            }
+            self.published = (tick_no, bank);
+        }
+
         let mut keep: Vec<Vec<*mut c_void>> = steps.iter().map(|s| s.bufs.clone()).collect();
         let push_keep: Vec<Push> = steps.iter().map(|s| s.push).collect();
         let pipes = self.pipes.clone();
@@ -1149,8 +1382,22 @@ impl GpuSim {
                 },
             })
             .collect();
+        let wait_ptr = if waits.is_empty() { std::ptr::null() } else { waits.as_ptr() };
+        let wait_n = waits.len() as u32;
         unsafe {
-            let st = if async_submit {
+            let st = if self.split {
+                /* Такт — на compute-очереди с приоритетом 0.0. Кадр на graphics
+                 * (1.0) не ждёт его целиком: он берёт опубликованный банк. */
+                vf_run_stream(
+                    self.ctx,
+                    ds.as_mut_ptr(),
+                    ds.len() as u32,
+                    VF_STREAM_TICK,
+                    wait_ptr,
+                    wait_n,
+                    if async_submit { 0 } else { 1 },
+                )
+            } else if async_submit {
                 vf_run_async(self.ctx, ds.as_mut_ptr(), ds.len() as u32)
             } else {
                 vf_run(self.ctx, ds.as_mut_ptr(), ds.len() as u32)
