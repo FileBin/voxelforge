@@ -47,6 +47,7 @@ impl LiveBody {
             tets: self.tets.clone(),
             level_cap: self.level_cap,
             origin: self.origin,
+           sdf: Default::default(),
         };
         let c = tb.world_centroid();
         self.local = self
@@ -1042,6 +1043,7 @@ impl Live {
             tets: self.bodies[ti].tets.clone(),
             level_cap: self.bodies[ti].level_cap,
             origin: self.bodies[ti].origin,
+           sdf: Default::default(),
         };
         let c = tb.world_centroid();
         // точка удара в координатах решётки этого тела
@@ -1312,6 +1314,7 @@ impl Live {
             tets: b.tets.clone(),
             level_cap: b.level_cap,
             origin: b.origin,
+           sdf: Default::default(),
         };
         let c = tb.world_centroid();
         // без сглаживания: у скола должны быть грани, а не блоб

@@ -264,9 +264,21 @@ pub struct TetBody {
     pub level_cap: u8,
     /// Мировой центр, от которого отсчитываются координаты узлов.
     pub origin: [f32; 3],
+    /// SDF по узлам (точное расстояние до поверхности тела, знак по занятости).
+    /// Считается один раз и живёт вместе с телом: марчинг режет рёбра по этим
+    /// числам, а не по BFS-расстояниям сетки.
+    pub sdf: std::sync::OnceLock<field::NodeField>,
 }
 
 impl TetBody {
+    /// Поле расстояний по узлам, посчитанное один раз.
+    pub fn sdf(&self) -> &field::NodeField {
+        self.sdf.get_or_init(|| {
+            let flat: Vec<[Node; 4]> = self.tets.iter().map(|t| t.v).collect();
+            field::from_tets_exact(&flat, 6)
+        })
+    }
+
     /// Куб из `n³` кубических ячеек, каждая — 12 тетраэдров.
     pub fn cube(center: [f32; 3], n: i32, level: u8) -> Self {
         /* BCC-тет занимает ДВЕ кубические ячейки (его центры лежат в соседних
@@ -316,6 +328,7 @@ impl TetBody {
             // (нужен широкий проход на GPU).
             level_cap: level + 1,
             origin: center,
+            sdf: Default::default(),
         }
     }
 
@@ -354,6 +367,7 @@ impl TetBody {
             tets,
             level_cap: level,
             origin: center,
+            sdf: Default::default(),
         }
     }
 
@@ -475,6 +489,7 @@ impl TetBody {
                 tets,
                 level_cap: self.level_cap,
                 origin: self.origin,
+                sdf: Default::default(),
             })
             .collect()
     }
@@ -519,6 +534,7 @@ impl TetBody {
                 tets,
                 level_cap: self.level_cap,
                 origin: self.origin,
+                sdf: Default::default(),
             })
             .collect()
     }
@@ -646,12 +662,10 @@ impl TetBody {
         /* Поле по ОБЪЁМУ тетов: заполнение одними вершинами даёт дырявую
          * занятость, ноль поля не встречается и марчинг выдаёт ноль
          * треугольников. Запас 3 узла: тет заходит за своё основание. */
-        let tet_nodes: Vec<[Node; 4]> = self.tets.iter().map(|t| t.v).collect();
-        /* Запас 6 узлов, а не 3: тет BCC достаёт на 2–3 узла за своё
-         * основание, и при малом запасе внешний слой тетов тела отбрасывается
-         * фильтром «тет внутри блока» — тогда у поверхности пропадает через
-         * один треугольник (именно это видно в окне). */
-        let f = field::from_tets(&tet_nodes, 6);
+        /* Поле расстояний живёт вместе с телом и считается один раз. Ребро
+         * режется по НАСТОЯЩИМ расстояниям до поверхности, а не по сеточным
+         * BFS-значениям — отсюда гладкая интерполяция. */
+        let f = self.sdf();
         let level = self.tets.iter().map(|t| t.level).max().unwrap_or(0);
         let origin = self.origin;
 
@@ -1653,5 +1667,65 @@ mod marching_diag {
         println!("DIAG их габарит: {lo:?} .. {hi:?}");
         println!("DIAG габарит тела: {blo:?} .. {bhi:?}");
         println!("DIAG габарит меша: {:?}", m.positions.iter().fold([f32::MAX;3], |mut a,p| {for k in 0..3 {a[k]=a[k].min(p[k]);} a}));
+    }
+}
+
+#[cfg(test)]
+mod sdf_quality_tests {
+    use super::*;
+
+    /// Точность изоповерхности: каждая вершина меша обязана лежать на
+    /// поверхности тела (расстояние до тетов близко к нулю). Это и есть
+    /// проверка «плавной интерполяции по SDF»: с BFS-полем вершины уезжали на
+    /// полшага сетки, и ошибка была сравнима с шагом.
+    #[test]
+    fn marching_vertices_lie_on_the_surface() {
+        let body = TetBody::ball([0.0, 0.0, 0.0], 1.0, 0);
+        let step = node_step(0);
+        let flat: Vec<[[f32; 3]; 4]> = body
+            .tets
+            .iter()
+            .map(|t| std::array::from_fn(|i| node_pos(t.v[i], t.level, body.origin)))
+            .collect();
+        let m = body.extract_marching();
+        assert!(m.positions.len() > 100, "меш подозрительно бедный");
+        let mut worst: f32 = 0.0;
+        for p in &m.positions {
+            let d = field::dist_to_tets(&flat, *p);
+            worst = worst.max(d);
+        }
+        println!(
+            "SDF: вершин {}, худшее расстояние до поверхности {:.4} (шаг узла {:.4})",
+            m.positions.len(),
+            worst,
+            step
+        );
+        /* Ноль поля лежит между узлами (сдвиг полшага), поэтому вершины
+         * ожидаются на расстоянии около половины шага от поверхности; главное —
+         * ошибка НЕ должна быть сеточной (√2·шаг на диагоналях). */
+        assert!(
+            worst < step * 0.75,
+            "вершины ушли с поверхности: {worst} при шаге {step}"
+        );
+    }
+
+    /// SDF по узлам: расстояние евклидово, а не «шагами сетки». Проверяем на
+    /// диагональном узле: сетка дала бы 3 шага, метрика даёт √3.
+    #[test]
+    fn sdf_is_euclidean_not_grid() {
+        let body = TetBody::cube([0.0, 0.0, 0.0], 2, 0);
+        let f = body.sdf();
+        /* куб занимает узлы -2..2; узел (3,3,3) снаружи, ближайшая точка
+         * поверхности — угол (2,2,2), расстояние √3 ≈ 1.732 */
+        let got = f.at([3, 3, 3]);
+        println!("SDF у диагонального узла: {got:.3}, ожидаем ~{:.3}", 3f32.sqrt() + 0.5);
+        assert!(
+            (got - (3f32.sqrt() + 0.5)).abs() < 0.1,
+            "расстояние не евклидово: {got}"
+        );
+        /* и узел прямо над гранью: ровно один шаг */
+        let axis = f.at([0, 0, 3]);
+        println!("SDF у осевого узла: {axis:.3}, ожидаем ~1.5");
+        assert!((axis - 1.5).abs() < 0.1, "осевое расстояние сломано: {axis}");
     }
 }

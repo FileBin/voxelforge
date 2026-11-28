@@ -16,6 +16,7 @@
 use crate::tet::Node;
 
 /// Поле на прямоугольном блоке узлов.
+#[derive(Clone, Debug)]
 pub struct NodeField {
     /// Узел с минимальными координатами блока.
     pub lo: [i32; 3],
@@ -324,4 +325,192 @@ mod tests {
         assert!(f.min_abs() <= 0.51, "нет перехода через ноль: {}", f.min_abs());
         assert!(f.val.iter().any(|v| *v < 0.0), "нет внутренности поля");
     }
+}
+
+/// Расстояние от точки до треугольника (точка может лежать вне его плоскости).
+pub(crate) fn point_tri_dist(p: [f32; 3], a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f32 {
+    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+    let ap = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
+    let d1 = ab[0] * ap[0] + ab[1] * ap[1] + ab[2] * ap[2];
+    let d2 = ac[0] * ap[0] + ac[1] * ap[1] + ac[2] * ap[2];
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return (ap[0] * ap[0] + ap[1] * ap[1] + ap[2] * ap[2]).sqrt();
+    }
+    let bp = [p[0] - b[0], p[1] - b[1], p[2] - b[2]];
+    let d3 = ab[0] * bp[0] + ab[1] * bp[1] + ab[2] * bp[2];
+    let d4 = ac[0] * bp[0] + ac[1] * bp[1] + ac[2] * bp[2];
+    if d3 >= 0.0 && d4 <= d3 {
+        return (bp[0] * bp[0] + bp[1] * bp[1] + bp[2] * bp[2]).sqrt();
+    }
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        let t = d1 / (d1 - d3).max(1e-20);
+        let q = [a[0] + ab[0] * t, a[1] + ab[1] * t, a[2] + ab[2] * t];
+        return ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt();
+    }
+    let cp = [p[0] - c[0], p[1] - c[1], p[2] - c[2]];
+    let d5 = ab[0] * cp[0] + ab[1] * cp[1] + ab[2] * cp[2];
+    let d6 = ac[0] * cp[0] + ac[1] * cp[1] + ac[2] * cp[2];
+    if d6 >= 0.0 && d5 <= d6 {
+        return (cp[0] * cp[0] + cp[1] * cp[1] + cp[2] * cp[2]).sqrt();
+    }
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        let t = d2 / (d2 - d6).max(1e-20);
+        let q = [a[0] + ac[0] * t, a[1] + ac[1] * t, a[2] + ac[2] * t];
+        return ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt();
+    }
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+        let t = (d4 - d3) / ((d4 - d3) + (d5 - d6)).max(1e-20);
+        let q = [
+            b[0] + (c[0] - b[0]) * t,
+            b[1] + (c[1] - b[1]) * t,
+            b[2] + (c[2] - b[2]) * t,
+        ];
+        return ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt();
+    }
+    /* внутри проекции треугольника — расстояние до плоскости */
+    let n = [
+        ab[1] * ac[2] - ab[2] * ac[1],
+        ab[2] * ac[0] - ab[0] * ac[2],
+        ab[0] * ac[1] - ab[1] * ac[0],
+    ];
+    let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-20);
+    ((ap[0] * n[0] + ap[1] * n[1] + ap[2] * n[2]) / len).abs()
+}
+
+/// Точное расстояние от точки до поверхности набора тетов (минимум по 4 граням
+/// каждого тета). Это и есть SDF дистанция «до меша тела», без сеточной ошибки.
+pub(crate) fn dist_to_tets(tets: &[[[f32; 3]; 4]], p: [f32; 3]) -> f32 {
+    let mut best = f32::MAX;
+    for t in tets {
+        for (i, j, k) in [(0usize, 1usize, 2usize), (0, 1, 3), (0, 2, 3), (1, 2, 3)] {
+            let d = point_tri_dist(p, t[i], t[j], t[k]);
+            if d < best {
+                best = d;
+            }
+        }
+    }
+    best
+}
+
+/// Поле с ТОЧНЫМИ расстояниями до поверхности тела: в каждом узле блока лежит
+/// евклидово расстояние до ближайшей грани тетов со знаком по занятости.
+///
+/// Этим и режется ребро при марчинге: доля `t = d0 / (d0 - d1)` даёт точку
+/// пересечения реальной поверхности, а не середину ребра сетки. BFS-поле
+/// (`from_tets`) остаётся как быстрый черновик: оно меряет расстояние шагами
+/// сетки и на диагоналях врёт до √2.
+pub fn from_tets_exact(tets: &[[Node; 4]], pad: i32) -> NodeField {
+    use std::collections::HashMap as H;
+    assert!(!tets.is_empty(), "поле без тетов");
+    let (lo, dims) = bounds_of(tets.iter().flat_map(|t| t.iter()), pad);
+    let n = dims[0] * dims[1] * dims[2];
+    let idx = |x: i32, y: i32, z: i32| -> usize {
+        (((z - lo[2]) as usize) * dims[1] + ((y - lo[1]) as usize)) * dims[0]
+            + ((x - lo[0]) as usize)
+    };
+
+    /* 1. Занятость — по объёму тетов. */
+    let mut solid = vec![false; n];
+    for t in tets {
+        let pts: [[f32; 3]; 4] =
+            std::array::from_fn(|i| [t[i].0 as f32, t[i].1 as f32, t[i].2 as f32]);
+        let s0 = tet_vol(pts[0], pts[1], pts[2], pts[3]);
+        let (mut tlo, mut thi) = ([i32::MAX; 3], [i32::MIN; 3]);
+        for q in &pts {
+            for k in 0..3 {
+                tlo[k] = tlo[k].min(q[k].floor() as i32);
+                thi[k] = thi[k].max(q[k].ceil() as i32);
+            }
+        }
+        for z in tlo[2]..=thi[2] {
+            for y in tlo[1]..=thi[1] {
+                for x in tlo[0]..=thi[0] {
+                    let p = [x as f32, y as f32, z as f32];
+                    let d1 = tet_vol(p, pts[1], pts[2], pts[3]) * s0;
+                    let d2 = tet_vol(pts[0], p, pts[2], pts[3]) * s0;
+                    let d3 = tet_vol(pts[0], pts[1], p, pts[3]) * s0;
+                    let d4 = tet_vol(pts[0], pts[1], pts[2], p) * s0;
+                    if (d1 >= 0.0 && d2 >= 0.0 && d3 >= 0.0 && d4 >= 0.0)
+                        || (d1 <= 0.0 && d2 <= 0.0 && d3 <= 0.0 && d4 <= 0.0)
+                    {
+                        solid[idx(x, y, z)] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /* 2. ГРАНИЧНЫЕ грани: те, что встречаются у одного тета. Внутренние
+     * (общие для двух тетов) лежат внутри тела, и расстояние до них — не
+     * расстояние до поверхности: считать по всем граням значит опустить поле
+     * внутри тела и получить ложные срезы. */
+    let mut faces: H<[u64; 3], ([[f32; 3]; 3], u32)> = H::new();
+    for t in tets {
+        let p: [[f32; 3]; 4] =
+            std::array::from_fn(|i| [t[i].0 as f32, t[i].1 as f32, t[i].2 as f32]);
+        for (a, b, c) in [(0usize, 1usize, 2usize), (0, 1, 3), (0, 2, 3), (1, 2, 3)] {
+            let mut key = [0u64; 3];
+            for (k, v) in [a, b, c].iter().enumerate() {
+                let nd = t[*v];
+                key[k] = (((nd.0 as i64 + (1 << 20)) as u64) << 42)
+                    | (((nd.1 as i64 + (1 << 20)) as u64) << 21)
+                    | ((nd.2 as i64 + (1 << 20)) as u64);
+            }
+            key.sort();
+            faces
+                .entry(key)
+                .and_modify(|e| e.1 += 1)
+                .or_insert(([p[a], p[b], p[c]], 1));
+        }
+    }
+    let boundary: Vec<[[f32; 3]; 3]> = faces
+        .values()
+        .filter(|(_, cnt)| *cnt == 1)
+        .map(|(tri, _)| *tri)
+        .collect();
+
+    /* 3. Расстояние до граничных граней — только для узлов рядом с ними. */
+    let mut val = vec![f32::MAX; n];
+    for tri in &boundary {
+        let (mut tlo, mut thi) = ([i32::MAX; 3], [i32::MIN; 3]);
+        /* Запас 2 узла вокруг грани: узлы рядом с поверхностью обязаны получить
+         * настоящее расстояние, иначе они остаются «далеко» и ломают
+         * интерполяцию на соседних рёбрах. */
+        for q in tri {
+            for k in 0..3 {
+                tlo[k] = tlo[k].min(q[k].floor() as i32 - 2).max(lo[k]);
+                thi[k] = thi[k].max(q[k].ceil() as i32 + 2).min(lo[k] + dims[k] as i32 - 1);
+            }
+        }
+        for z in tlo[2]..=thi[2] {
+            for y in tlo[1]..=thi[1] {
+                for x in tlo[0]..=thi[0] {
+                    let p = [x as f32, y as f32, z as f32];
+                    let d = point_tri_dist(p, tri[0], tri[1], tri[2]);
+                    let v = &mut val[idx(x, y, z)];
+                    if d < *v {
+                        *v = d;
+                    }
+                }
+            }
+        }
+    }
+    /* Узлы, до которых грани не достали, далеко снаружи: значение обязано быть
+     * положительным и заведомо большим шага, чтобы не давать ложных срезов. */
+    /* Соглашение о нуле: он лежит МЕЖДУ узлами, а не на узлах. У тела на
+     * решётке поверхность проходит точно через узлы, и без сдвига значения в
+     * них равны нулю — срез вырождается, и поверхность рвётся (проверено:
+     * 1184 ребра кратности != 2). Сдвиг полшага узла — та же величина, что была
+     * у BFS-поля; меняется только ФОРМА поля: расстояния теперь евклидовы,
+     * поэтому интерполяция вдоль ребра идёт по реальной метрике. */
+    let far = (dims[0].max(dims[1]).max(dims[2])) as f32;
+    for i in 0..n {
+        let d = if val[i] == f32::MAX { far } else { val[i] };
+        val[i] = if solid[i] { -(d + 0.5) } else { d + 0.5 };
+    }
+    NodeField { lo, dims, val }
 }
