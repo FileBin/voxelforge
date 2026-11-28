@@ -222,8 +222,12 @@ const P_SOLVE: usize = 7;
 const P_SLEEP: usize = 8;
 const P_POS: usize = 9;
 /// Потолок тетраэдров в пуле. Плотный шар (шаг radius/12) занимает несколько
-/// тысяч тетов, поэтому на тело держим 4096: 64 тела × 4096 × 64 Б ≈ 16 МБ.
-pub const MAX_POOL_TETS: usize = 64 * 4096;
+/// тысяч тетов, плита сцены — 6144, осколок — ~168. Пул ОБЩИЙ: 1024 тета на
+/// слот ёмкости — это 512 × 1024 = 500 К тетов, т.е. ~80 целых плит или
+/// ~3000 осколков. Фактический расход считается по живым телам
+/// (`Live::tets_in_use`), и при исчерпании спавн честно отказывает в лог.
+/// Память: 512 К × 64 Б = 32 МБ.
+pub const MAX_POOL_TETS: usize = MAX_BODIES_CAP * 1024;
 const P_SOLVE_CONTACTS: usize = 10;
 const P_SOLVE_APPLY: usize = 11;
 const P_SAT: usize = 12;
@@ -313,13 +317,24 @@ const PIPE_BUFNS: [u32; 36] = [
 pub const SCAN_BLOCK: usize = 1024;
 /// Потолок изменений тел за одно событие (спавн/деспавн).
 pub const MAX_CHANGES: usize = 64;
-/// Потолок записей «тет x ячейка» за такт.
-pub const MAX_CELL_TETS: usize = 262144;
-/// Потолок тел в буферах GPU (совпадает с live::MAX_BODIES).
+/// Потолок записей «тет x ячейка» за такт. 1 Ми × 8 Б = 8 МБ: путь пар тетов
+/// (SAT) не основной (по умолчанию контакты по SDF), но и он не должен молча
+/// терять тела при больших сценах.
+pub const MAX_CELL_TETS: usize = 1048576;
 /// Ёмкость буферов под тела. Число ДЕЙСТВУЮЩИХ тел приходит в pc.grid.w и
-/// может быть любым до этой ёмкости: шейдеры уже масштабируются по n, ни
+/// может быть любым до этой ёмкости: шейдеры масштабируются по n_bodies, ни
 /// вариантов шейдеров, ни повторных запусков не нужно.
-pub const MAX_BODIES: usize = 64;
+///
+/// Ёмкость НЕ равна числу симулируемых тел: буферы с запасом (можно поднять
+/// до 512, если хватает памяти), а такт считает только занятые слоты
+/// (`Live` сообщает их через `GpuSim::set_active`).
+///
+/// Память при 512 слотах: SDF-пул 512 × 65536 × 4 = 128 МБ, геометрия
+/// 500 К тетов = 32 МБ, кандидаты 16 МБ, ячейки 8 МБ, пары 2 МБ — всего
+/// ≈ 190 МБ. Это укладывается в бюджет 300 МБ. Дальше (1024 слота) уже
+/// 260 МБ только под SDF — не поднимать без пересчёта.
+pub const MAX_BODIES_CAP: usize = 512;
+pub const MAX_BODIES: usize = MAX_BODIES_CAP;
 /// Потолок событий раскола в кольце за такт (совпадает с MAX_EVENTS в common.glsl).
 pub const MAX_EVENTS: usize = 128;
 /// Каналов контакта со статикой на тело: 4 диагонали опорной площадки пола и
@@ -330,12 +345,13 @@ const WORK_TAIL: u32 = 0xFFFF_FFFF;
 /// Порог энергии раскола, Дж. Финальное слово — у шейдера (pc.lo.w), CPU
 /// страхует только на всякий случай.
 pub const FRACTURE_ENERGY: f32 = 500.0;
-/// Потолок пар тетраэдров за такт.
-pub const MAX_PAIRS: usize = 65536;
-/// Слов поля SDF на слот тела в общем пуле. Поле плиты (куб 8 ячеек уровня 1)
-/// занимает ~29³ ≈ 24 К узлов, шар-снаряд — 19³ ≈ 7 К; потолок с двойным
-/// запасом. Память: 64 слота × 65536 × 4 Б = 16 МБ (совпадает с SDF_STRIDE
-/// в sdf_contact.comp).
+/// Потолок пар тетраэдров за такт. Пар растёт как тела×теты, поэтому с
+/// ёмкостью 256 потолок поднят вчетверо: 262144 × 8 Б = 2 МБ.
+pub const MAX_PAIRS: usize = 262144;
+/// Слов поля SDF на слот тела в общем пуле. Фактические размеры: плита —
+/// 59319 узлов, осколок — до ~52 000, шар-снаряд — ~7 000. Память при
+/// ёмкости 512: 512 × 65536 × 4 Б = 128 МБ (совпадает с SDF_STRIDE в
+/// sdf_contact.comp). Это и есть главный расход при подъёме ёмкости.
 pub const SDF_STRIDE: usize = 65536;
 /// Потолок пар тел в широком проходе SDF (64 тела → 2016; совпадает с
 /// MAX_SDF_PAIRS в common.glsl).
@@ -430,7 +446,12 @@ pub fn find_shaders(explicit: Option<&Path>) -> Option<PathBuf> {
 pub struct GpuSim {
     ctx: *mut c_void,
     pub name: String,
+    /// Сколько тел СЕЙЧАС считается: это число уходит в pc.grid.w и задаёт
+    /// размеры всех диспатчей. Меняется через `set_active` при спавне.
     pub n: usize,
+    /// Ёмкость буферов тел (>= n). Буферы выделены под неё, но шейдеры
+    /// читают только первые `n` слотов: ёмкость и число тел — разные вещи.
+    pub cap: usize,
     pub dims: [i32; 3],
     pub ncells: i32,
     pub params: Params,
@@ -553,6 +574,24 @@ impl GpuSim {
         self.ctx
     }
 
+    /// Сколько тел считается в такте (уходит в pc.grid.w).
+    pub fn active(&self) -> usize {
+        self.n
+    }
+
+    /// Ёмкость буферов тел.
+    pub fn capacity(&self) -> usize {
+        self.cap
+    }
+
+    /// Задать число ДЕЙСТВУЮЩИХ тел. Ёмкость при этом не меняется: буферы
+    /// остаются выделенными с запасом, а шейдеры (и все диспатчи) читают
+    /// только первые `n` слотов. Мёртвые слоты внутри `n` — это припаркованные
+    /// тела (спят далеко внизу), они есть и в прежней схеме.
+    pub fn set_active(&mut self, n: usize) {
+        self.n = n.clamp(1, self.cap);
+    }
+
     /// Буфер тел (`bodies[0]`) как VkBuffer: из него шейдер окна читает позу,
     /// поэтому CPU не присылает матрицы и не гоняет тела обратно.
     pub fn body_buffer(&self) -> *mut c_void {
@@ -577,6 +616,10 @@ impl GpuSim {
         windowed: bool,
     ) -> Self {
         let n = bodies.len();
+        /* Ёмкость буферов — с запасом над числом тел сцены: мир может
+         * досоздавать тела (осколки, снаряды) уже после создания GpuSim.
+         * Выделяем по ёмкости, считаем — по `n` (pc.grid.w). */
+        let cap = n.max(MAX_BODIES_CAP);
         let mut ctx: *mut c_void = std::ptr::null_mut();
         unsafe {
             let st = if windowed { vf_init_for_window(&mut ctx) } else { vf_init(&mut ctx) };
@@ -607,20 +650,20 @@ impl GpuSim {
             };
             b
         };
-        let bodies_a = mk(n * BODY_BYTES, true);
-        let bodies_b = mk(n * BODY_BYTES, true);
+        let bodies_a = mk(cap * BODY_BYTES, true);
+        let bodies_b = mk(cap * BODY_BYTES, true);
         // host-visible: контакты может заливать и CPU (столкновения по тетраэдрам)
-        let list = mk(n * CAP * 48, true);
+        let list = mk(cap * CAP * 48, true);
         // Две vec4 на точку контакта: приращение скорости и угловое.
-        let imp = mk(n * CAP * 32, false);
+        let imp = mk(cap * CAP * 32, false);
         // Пул геометрии: 4 vec4 на тетраэдр (a, b, c, d).
         let tets = mk(MAX_POOL_TETS * 64, true);
-        let span = mk(n * 8, true);
+        let span = mk(cap * 8, true);
         /* Работа контактов со статикой: список (тело, тет) + свёртки по
          * каналам. Свёртки — по 8 слотов НА ТЕЛО, поэтому размер считается от
          * числа тел сцены, а не от MAX_BODIES: в тестах куча — 1000 и 5000 тел.
          * Кандидатов — 8 u32 на элемент работы. */
-        let static_slots = ((n * STATIC_CH) + WG as usize - 1) / WG as usize * WG as usize;
+        let static_slots = ((cap * STATIC_CH) + WG as usize - 1) / WG as usize * WG as usize;
         let work = mk((MAX_POOL_TETS + WG as usize) * 4, true);
         let cand = mk((MAX_POOL_TETS + WG as usize) * STATIC_CH * 4, false);
         let static_score = mk(static_slots * 4, false);
@@ -642,11 +685,11 @@ impl GpuSim {
         let bslots = mk(MAX_CHANGES * 4, true);
         let bstage = mk(MAX_CHANGES * BODY_BYTES, true);
         let baabb = mk(MAX_BODIES * 32, false);
-        let lcount = mk(n * 4, true);
+        let lcount = mk(cap * 4, true);
         let cellcnt = mk(ncells as usize * 4, false);
         let starts = mk((ncells as usize + 1) * 4, false);
         let cursor = mk(ncells as usize * 4, false);
-        let cbody = mk(n * 4, false);
+        let cbody = mk(cap * 4, false);
         /* Таблица SDF-полей: дескриптор на тело, общий пул значений (слот на
          * тело), пары тел широкого прохода и счётчик. Пул создаётся пустым:
          * незанятые дескрипторы — нули (dims = 0 → поля нет), и шейдер пару
@@ -690,13 +733,13 @@ impl GpuSim {
          * кадр остаётся на graphics (1.0). Банк — буфер, который читает кадр;
          * физика пишет его последним проходом такта. */
         let split = unsafe { vf_split(ctx) } != 0;
-        let bank = [mk(n * BODY_BYTES, true), mk(n * BODY_BYTES, true)];
+        let bank = [mk(cap * BODY_BYTES, true), mk(cap * BODY_BYTES, true)];
         // Поза и кватернион на тело: 2 vec4.
         let draw = mk(MAX_BODIES * 32, true);
         if split {
             unsafe {
                 for b in bank {
-                    let zeros = vec![0u8; n * BODY_BYTES];
+                    let zeros = vec![0u8; cap * BODY_BYTES];
                     check_status(
                         vf_buffer_write(ctx, b, 0, zeros.as_ptr() as *const c_void, zeros.len()),
                         "bank zero",
@@ -748,6 +791,7 @@ impl GpuSim {
             ctx,
             name,
             n,
+            cap,
             dims,
             ncells,
             params,
@@ -886,8 +930,9 @@ impl GpuSim {
     /// таймстемпы живут в слоте кольца и перезаписываются следующим тактом.
     /// `awake` — число бодрствующих тел из `stat`, `alive` — сколько тел в сцене
     /// вообще (оба уже известны вызывающему): отдельных чтений ради строки тел
-    /// не нужно. Внимание: `self.n` — ёмкость буфера, а не число тел, поэтому
-    /// в сцене живут и «мёртвые» слоты — их за тело считать нельзя.
+    /// не нужно. Внимание: `self.n` — число СЧИТАЕМЫХ тел (pc.grid.w), а
+    /// ёмкость буферов — `self.cap`; мёртвые слоты внутри `n` припаркованы и
+    /// за тела не считаются.
     pub fn perf_sample(&mut self, awake: u32, alive: usize) {
         if !self.perf.enabled {
             return;
@@ -1241,9 +1286,12 @@ impl GpuSim {
         } else {
             ((self.n_pairs as u32) + WG - 1) / WG
         };
-        /* SDF: одна рабочая группа на пару тел (64 затравки), число пар шейдер
-         * читает из буфера — поэтому групп всегда по потолку пар. */
-        let g_sdf = ((MAX_SDF_PAIRS as u32) + WG - 1) / WG;
+        /* SDF: одна рабочая группа на пару тел (64 затравки), число пар
+         * шейдер читает из буфера. Групп — по ВОЗМОЖНОМУ числу пар текущей
+         * сцены (n·(n−1)/2), а не по ёмкости буфера: иначе при 20 телах
+         * запускались бы 2044 группы вместо 4, и слабое GPU уходило в TDR. */
+        let pairs_now = (self.n * self.n.saturating_sub(1) / 2) as u32;
+        let g_sdf = (pairs_now + WG - 1) / WG;
         let push = self.push(h, g_body);
         {
             let zero = vec![0u8; MAX_BODIES * 32];
@@ -2452,8 +2500,14 @@ impl GpuSim {
     }
 
     pub fn write_bodies(&mut self, bodies: &[GpuBody]) {
-        self.bytes_up += (bodies.len() * BODY_BYTES) as u64;
-        assert_eq!(bodies.len(), self.n, "число тел изменилось посреди прогона");
+        assert!(
+            bodies.len() <= self.cap,
+            "тел больше ёмкости буфера: {} > {}",
+            bodies.len(),
+            self.cap
+        );
+        let n = bodies.len().max(1).min(self.cap);
+        self.bytes_up += (n * BODY_BYTES) as u64;
         unsafe {
             check_status(
                 vf_buffer_write(
@@ -2461,11 +2515,11 @@ impl GpuSim {
                     self.bodies[0],
                     0,
                     bodies.as_ptr() as *const c_void,
-                    self.n * BODY_BYTES,
+                    n * BODY_BYTES,
                 ),
                 "write_bodies",
             )
-        };
+        }
     }
 
     /// Две цифры такта (8 Б): максимум |v| и число бодрствующих тел.
