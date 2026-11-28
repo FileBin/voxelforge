@@ -23,9 +23,24 @@ typedef struct vf_input {
     int shift, ctrl;
 } vf_input;
 
+/* Строка оверлея диагностики: имя стадии и её время за последнюю секунду.
+ * Строки копируются внутрь окна, поэтому указатель нужен только на время
+ * вызова vf_view_perf. name — ASCII (встроенный шрифт 5x7), с нулём. */
+typedef struct {
+    char name[24];
+    float mean_ms;
+    float max_ms;
+    float share;
+} vf_perf_row;
+
 vf_status vf_view_new(vf_view **out, vf_ctx *core, int w, int h, const char *title,
                       const char *shader_dir);
 void vf_view_free(vf_view *v);
+
+/* Оверлей диагностики стадий: rows == NULL или n == 0 — скрыть. Вызывать каждый
+ * кадр между vf_view_begin и vf_view_end; числа дублируются в консоль, здесь
+ * они для глаза. */
+void vf_view_perf(vf_view *v, const vf_perf_row *rows, uint32_t n, float tick_ms);
 
 // Опросить события. Возвращает 0, если окно закрыто.
 int vf_view_poll(vf_view *v, vf_input *in);

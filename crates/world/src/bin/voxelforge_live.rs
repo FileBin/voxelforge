@@ -7,6 +7,7 @@
 use std::ffi::{c_char, c_void, CString};
 
 use voxelforge_world::live::{model_matrix, Live};
+use voxelforge_world::perf::VfPerfRow;
 use voxelforge_world::sim::find_shaders;
 
 #[repr(C)]
@@ -74,6 +75,8 @@ unsafe extern "C" {
     fn vf_view_present_mode(v: *mut c_void) -> i32;
     fn vf_view_draw_lines(v: *mut c_void, lines: i32, model: *const f32, tint: *const f32);
     fn vf_view_end(v: *mut c_void);
+    /// Оверлей стадий (F3 / VF_PERF=1): строки копируются внутрь окна.
+    fn vf_view_perf(v: *mut c_void, rows: *const VfPerfRow, n: u32, tick_ms: f32);
 }
 
 // ---------------------------------------------------------------- матрицы
@@ -245,6 +248,9 @@ struct Shared {
     lines_on: bool,
     /// Диагностика стадий включена (F3 / VF_PERF=1): показывать оверлей.
     perf_on: bool,
+    /// Строки последнего окна диагностики и среднее время такта.
+    perf_rows: Vec<VfPerfRow>,
+    perf_tick_ms: f32,
     log: String,
 }
 
@@ -268,6 +274,8 @@ struct SnapOut {
     alive: usize,
     lines_on: bool,
     perf_on: bool,
+    perf_rows: Vec<VfPerfRow>,
+    perf_tick_ms: f32,
     log: String,
     near: f32,
     far: f32,
@@ -367,6 +375,8 @@ impl Sim {
             alive: 0,
             lines_on,
             perf_on: live.gpu.perf_on(),
+            perf_rows: Vec::new(),
+            perf_tick_ms: 0.0,
             log: String::new(),
         }));
         let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
@@ -446,6 +456,12 @@ impl Sim {
                         g.alive = live.alive_count();
                         g.lines_on = live.lines_on;
                         g.perf_on = live.gpu.perf_on();
+                        if g.perf_on {
+                            g.perf_rows = live.gpu.perf_overlay();
+                            g.perf_tick_ms = live.gpu.perf_tick_ms();
+                        } else {
+                            g.perf_rows.clear();
+                        }
                         if !live.last_log.is_empty() {
                             g.log = std::mem::take(&mut live.last_log);
                         }
@@ -550,6 +566,8 @@ impl Sim {
                     alive: l.alive_count(),
                     lines_on: l.lines_on,
                     perf_on: l.gpu.perf_on(),
+                    perf_rows: if l.gpu.perf_on() { l.gpu.perf_overlay() } else { Vec::new() },
+                    perf_tick_ms: l.gpu.perf_tick_ms(),
                     log: String::new(),
                     near: l.near,
                     far: l.far,
@@ -602,6 +620,8 @@ impl Sim {
                     alive: g.alive,
                     lines_on: g.lines_on,
                     perf_on: g.perf_on,
+                    perf_rows: g.perf_rows.clone(),
+                    perf_tick_ms: g.perf_tick_ms,
                     log: std::mem::take(&mut g.log),
                     near: 0.0,
                     far: 60.0,
@@ -657,7 +677,7 @@ fn main() {
     let shaders = find_shaders(explicit.as_deref())
         .expect("нет SPIR-V: nix build .#spirv или --shaders DIR");
     let shaders_c = CString::new(shaders.display().to_string()).unwrap();
-    let title = CString::new("voxelforge — WASD полёт, мышь обзор, клик/пробел выстрел").unwrap();
+    let title = CString::new("voxelforge — WASD полёт, мышь обзор, клик/пробел выстрел, F3 стадии").unwrap();
 
     // Мир (и вместе с ним девайс Vulkan) создаётся ДО окна: окно рендерит на
     // том же девайсе, иначе буферы тел физически недоступны графике.
@@ -730,7 +750,7 @@ fn main() {
     }
     let grid_id = unsafe { vf_view_add_lines(view, grid.as_ptr(), (grid.len() / 6) as u32) };
 
-    println!("voxelforge live · WASD полёт (Shift быстрее, Ctrl медленнее, Q/E вниз/вверх), мышь обзор, клик/пробел выстрел, T каркас, R сброс");
+    println!("voxelforge live · WASD полёт (Shift быстрее, Ctrl медленнее, Q/E вниз/вверх), мышь обзор, клик/пробел выстрел, T каркас, F3 стадии, R сброс");
 
     let mut prev_lmb = 0;
     let mut pressed = false;
@@ -1010,6 +1030,17 @@ fn main() {
                     vf_view_draw_lines(view, line_id, m.as_ptr(), [0.35, 0.42, 0.5, 0.0].as_ptr());
                 }
             }
+            /* Оверлей стадий: рисуется последним, поверх сцены. Числа те же,
+             * что в консольной таблице, — F3 включает и выключает оба. Пустой
+             * указатель при включённой диагностике значит «такт ещё не пришёл»:
+             * панель так и скажет, а не исчезнет молча. */
+            let prow = &out.perf_rows;
+            let ptr = if out.perf_on {
+                prow.as_ptr()
+            } else {
+                std::ptr::null()
+            };
+            vf_view_perf(view, ptr, prow.len() as u32, out.perf_tick_ms);
             vf_view_end(view);
         }
 

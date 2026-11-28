@@ -204,12 +204,20 @@ const P_SDFFILL: usize = 28;
 const P_SDFCONTACT: usize = 29;
 /// Широкий проход SDF: пары ТЕЛ (не тетов).
 const P_SDFPAIRS: usize = 30;
+/// Контакты со статикой, нарезанные по тетам: свёртка, выбор победителя и
+/// выброс контактов (сброс свёрток — это сам `static_contacts`, проход 0).
+/// Все четыре шага идут под номером стадии `P_STATIC`, поэтому таблица
+/// F3/VF_PERF=1 показывает их одной строкой `static_contacts` — так же, как
+/// в старой схеме с одним диспатчем на тело.
+const P_STATWORK: usize = 31;
+const P_STATTIE: usize = 32;
+const P_STATEMIT: usize = 33;
 
 /// Имена пайплайнов в порядке `pipes` — ТОТ ЖЕ порядок, что у `P_*` выше и у
 /// массива `names` на устройстве. По этому индексу ядро возвращает номер
 /// стадии в диагностике производительности, поэтому список — единственный
 /// источник правды и для загрузки, и для таблицы.
-pub const PIPE_NAMES: [&str; 31] = [
+pub const PIPE_NAMES: [&str; 34] = [
     "integrate",
     "clear",
     "count",
@@ -241,10 +249,14 @@ pub const PIPE_NAMES: [&str; 31] = [
     "sdf_fill",
     "sdf_contact",
     "sdf_pairs",
+    "static_work",
+    "static_tie",
+    "static_emit",
 ];
 /// Число storage-буферов у каждого пайплайна — в том же порядке.
-const PIPE_BUFNS: [u32; 31] = [
-    1, 2, 2, 3, 4, 5, 5, 4, 1, 1, 4, 4, 7, 3, 2, 4, 3, 6, 8, 6, 4, 1, 2, 3, 2, 2, 4, 8, 1, 7, 5,
+const PIPE_BUFNS: [u32; 34] = [
+    1, 2, 2, 3, 4, 1, 5, 4, 1, 1, 4, 4, 7, 3, 2, 4, 3, 6, 8, 6, 4, 1, 2, 3, 2, 2, 4, 8, 1, 7, 5, 6,
+    4, 6,
 ];
 /// Ячеек на блок в параллельном скане (совпадает с 16 * 64 в шейдере).
 pub const SCAN_BLOCK: usize = 1024;
@@ -259,6 +271,14 @@ pub const MAX_CELL_TETS: usize = 262144;
 pub const MAX_BODIES: usize = 64;
 /// Потолок событий раскола в кольце за такт (совпадает с MAX_EVENTS в common.glsl).
 pub const MAX_EVENTS: usize = 128;
+/// Каналов контакта со статикой на тело: 4 диагонали опорной площадки пола и
+/// 4 стенки. В common.glsl это же число зашито в `SLOTS`.
+pub const STATIC_CH: usize = 8;
+/// Слотов свёртки контактов со статикой: тело × канал. Должно совпадать с
+/// `SLOTS` в common.glsl — по этому числу аллоцируется буфер свёрток.
+pub const STATIC_SLOTS: usize = MAX_BODIES * STATIC_CH;
+/// Пустой элемент списка работы (хвост, добитый до кратности группы).
+const WORK_TAIL: u32 = 0xFFFF_FFFF;
 /// Порог энергии раскола, Дж. Финальное слово — у шейдера (pc.lo.w), CPU
 /// страхует только на всякий случай.
 pub const FRACTURE_ENERGY: f32 = 500.0;
@@ -374,6 +394,18 @@ pub struct GpuSim {
     tets: *mut c_void,
     /// На тело: смещение в пуле и число тетраэдров.
     span: *mut c_void,
+    /// Нарезка контактов со статикой по РАБОТЕ: на каждый элемент — пара
+    /// (тело << 16 | локальный тет), хвост добит `WORK_TAIL`. Строится при
+    /// заливке геометрии, поэтому на такт её не пересобираем.
+    work: *mut c_void,
+    /// Свёртки по каналам: на (тет, канал) — максимум в монотонных битах float
+    /// (0 — кандидата нет). Пишется `static_work`, читается `static_tie`.
+    cand: *mut c_void,
+    /// Победитель по каналу: тела × каналы. x — максимум (биты float), y —
+    /// индекс тета в пуле (0xFFFFFFFF — пусто).
+    pick: *mut c_void,
+    /// Сколько рабочих групп шлёт static_work/static_tie (0 — работы нет).
+    work_groups: u32,
     /// Счётчики сетки тетов (host-visible, для раскладки и сверки).
     tetcnt: *mut c_void,
     /// Префиксные суммы и курсоры раскладки по ячейкам.
@@ -503,6 +535,12 @@ impl GpuSim {
         // Пул геометрии: 4 vec4 на тетраэдр (a, b, c, d).
         let tets = mk(MAX_POOL_TETS * 64, true);
         let span = mk(n * 8, true);
+        /* Работа контактов со статикой: список (тело, тет) + свёртки по
+         * каналам. Две uint на слот свёртки (максимум и индекс тета) —
+         * 4 КБ; кандидатов — 8 u32 на элемент работы. */
+        let work = mk((MAX_POOL_TETS + WG as usize) * 4, true);
+        let cand = mk((MAX_POOL_TETS + WG as usize) * STATIC_CH * 4, false);
+        let pick = mk(STATIC_SLOTS * 2 * 4, false);
         let pairs = mk(MAX_PAIRS * 8, true);
         let tetcnt = mk(ncells as usize * 4, true);
         let tetstart = mk((ncells as usize + 1) * 4, true);
@@ -617,6 +655,10 @@ impl GpuSim {
             imp,
             tets,
             span,
+            work,
+            cand,
+            pick,
+            work_groups: 0,
             tetcnt,
             tetstart,
             tetcursor,
@@ -691,6 +733,16 @@ impl GpuSim {
         &self.perf.rows
     }
 
+    /// Копия строк в C-раскладке для оверлея окна.
+    pub fn perf_overlay(&self) -> Vec<crate::perf::VfPerfRow> {
+        self.perf.overlay_rows()
+    }
+
+    /// Среднее время такта последнего окна, мс (заголовок оверлея).
+    pub fn perf_tick_ms(&self) -> f32 {
+        self.perf.tick_ms()
+    }
+
     /// Забрать таймстемпы последнего ЗАКРЫТОГО такта и раз в секунду напечатать
     /// таблицу. Вызывать сразу после ожидания fence и ДО любого нового submit:
     /// таймстемпы живут в слоте кольца и перезаписываются следующим тактом.
@@ -716,6 +768,45 @@ impl GpuSim {
         self.perf
             .record(&self.perf_ids[..n], &self.perf_ms[..n], tick_ms);
         self.perf.maybe_print(std::time::Instant::now());
+    }
+
+    /// Контакты со статикой: четыре прохода по списку РАБОТЫ (тетам), а не
+    /// один диспатч по телам. Раньше invocation на тело обходила все его теты
+    /// последовательно — на плите это десятки тысяч вершин одним потоком, и
+    /// стадия съедала ~80 % такта при одной занятой рабочей группе.
+    ///
+    /// Все четыре шага помечены стадией `P_STATIC`, поэтому таблица
+    /// F3/VF_PERF=1 показывает их одной строкой `static_contacts` — числа
+    /// остаются сравнимыми со старой схемой.
+    fn push_static(&self, steps: &mut Vec<Step>, a: *mut c_void, push: Push, g_body: u32) {
+        steps.push(Step {
+            pipe: P_STATIC, /* проход 0 — сброс свёрток (см. static_contacts.comp) */
+            bufs: vec![self.pick],
+            push,
+            groups: [(STATIC_SLOTS as u32 + WG - 1) / WG, 1, 1],
+        });
+        let g_work = self.work_groups;
+        if g_work == 0 {
+            return; /* тетов нет — и контактов со статикой нет */
+        }
+        steps.push(Step {
+            pipe: P_STATWORK,
+            bufs: vec![a, self.tets, self.span, self.work, self.cand, self.pick],
+            push,
+            groups: [g_work, 1, 1],
+        });
+        steps.push(Step {
+            pipe: P_STATTIE,
+            bufs: vec![self.span, self.work, self.cand, self.pick],
+            push,
+            groups: [g_work, 1, 1],
+        });
+        steps.push(Step {
+            pipe: P_STATEMIT,
+            bufs: vec![a, self.tets, self.span, self.pick, self.list, self.lcount],
+            push,
+            groups: [g_body, 1, 1],
+        });
     }
 
     fn push(&self, h: f32, cell_groups: u32) -> Push {
@@ -914,12 +1005,7 @@ impl GpuSim {
                 push,
                 groups: [g_body, 1, 1],
             });
-            steps.push(Step {
-                pipe: P_STATIC,
-                bufs: vec![a, self.tets, self.span, self.list, self.lcount],
-                push,
-                groups: [g_body, 1, 1],
-            });
+            self.push_static(&mut steps, a, push, g_body);
             if self.sdf_collide {
                 /* Контакты по полям: пары тел уже лежат в буфере, число пар
                  * шейдер читает сам — CPU его не знает и не ждёт. */
@@ -1019,7 +1105,14 @@ impl GpuSim {
                 push: &push_keep[k] as *const Push as *const c_void,
                 push_bytes: 80,
                 groups: s.groups,
-                stage: s.pipe as u32,
+                /* Три прохода контактов со статикой (work/tie/emit) помечаем
+                 * стадией `static_contacts`, чтобы таблица F3/VF_PERF=1
+                 * показывала стадию ОДНОЙ суммой, как при одном диспатче. */
+                stage: if s.pipe >= P_STATWORK {
+                    P_STATIC as u32
+                } else {
+                    s.pipe as u32
+                },
             })
             .collect();
         unsafe {
@@ -1082,12 +1175,7 @@ impl GpuSim {
             });
             }
             if !external_contacts {
-                steps.push(Step {
-                    pipe: P_STATIC,
-                    bufs: vec![a, self.tets, self.span, self.list, self.lcount],
-                    push,
-                    groups: [g_body, 1, 1],
-                });
+                self.push_static(&mut steps, a, push, g_body);
             }
             if !external_contacts {
                 steps.push(Step {
@@ -1161,7 +1249,14 @@ impl GpuSim {
                 push: &push_keep[i] as *const Push as *const c_void,
                 push_bytes: 80,
                 groups: s.groups,
-                stage: s.pipe as u32,
+                /* Три прохода контактов со статикой (work/tie/emit) помечаем
+                 * стадией `static_contacts`, чтобы таблица F3/VF_PERF=1
+                 * показывала стадию ОДНОЙ суммой, как при одном диспатче. */
+                stage: if s.pipe >= P_STATWORK {
+                    P_STATIC as u32
+                } else {
+                    s.pipe as u32
+                },
             })
             .collect();
         unsafe { check_status(vf_run(self.ctx, ds.as_mut_ptr(), ds.len() as u32), "vf_run") };
@@ -1187,7 +1282,28 @@ impl GpuSim {
             spans[bi] = [start as u32, count as u32];
         }
         let n = flat.len().min(MAX_POOL_TETS * 4);
-        self.bytes_up += (n * 16 + spans.len() * 8) as u64;
+        /* Нарезка контактов со статикой по РАБОТЕ (один элемент = один тет).
+         * Строится здесь, потому что геометрия меняется ровно здесь (спавн,
+         * раскол, сброс), а в такте список только читается. Хвост добит до
+         * кратности рабочей группы: шейдеру не нужен счётчик работы в
+         * push-константах, он просто выходит на WORK_TAIL. */
+        let wg = WG as usize;
+        let mut work: Vec<u32> = Vec::with_capacity((flat.len() / 4).min(MAX_POOL_TETS) + wg);
+        for (bi, s) in spans.iter().enumerate().take(MAX_BODIES) {
+            let start = s[0] as usize;
+            let cnt = (s[1] as usize).min(0xFFFF);
+            for t in 0..cnt {
+                if start + t >= MAX_POOL_TETS {
+                    break; /* пул кончился — сверх потолка тетов не читаем */
+                }
+                work.push(((bi as u32) << 16) | t as u32);
+            }
+        }
+        while work.len() % wg != 0 {
+            work.push(WORK_TAIL);
+        }
+        self.work_groups = (work.len() / wg) as u32;
+        self.bytes_up += (n * 16 + spans.len() * 8 + work.len() * 4) as u64;
         unsafe {
             check_status(
                 vf_buffer_write(self.ctx, self.tets, 0, flat.as_ptr() as *const c_void, n * 16),
@@ -1203,6 +1319,18 @@ impl GpuSim {
                 ),
                 "upload_spans",
             );
+            if !work.is_empty() {
+                check_status(
+                    vf_buffer_write(
+                        self.ctx,
+                        self.work,
+                        0,
+                        work.as_ptr() as *const c_void,
+                        work.len() * 4,
+                    ),
+                    "upload_work",
+                );
+            }
         }
     }
 
@@ -1395,7 +1523,14 @@ impl GpuSim {
                 push: &push_keep[k] as *const Push as *const c_void,
                 push_bytes: 80,
                 groups: s.groups,
-                stage: s.pipe as u32,
+                /* Три прохода контактов со статикой (work/tie/emit) помечаем
+                 * стадией `static_contacts`, чтобы таблица F3/VF_PERF=1
+                 * показывала стадию ОДНОЙ суммой, как при одном диспатче. */
+                stage: if s.pipe >= P_STATWORK {
+                    P_STATIC as u32
+                } else {
+                    s.pipe as u32
+                },
             })
             .collect();
         unsafe {
@@ -1467,7 +1602,14 @@ impl GpuSim {
                 push: &push_keep[k] as *const Push as *const c_void,
                 push_bytes: 80,
                 groups: s.groups,
-                stage: s.pipe as u32,
+                /* Три прохода контактов со статикой (work/tie/emit) помечаем
+                 * стадией `static_contacts`, чтобы таблица F3/VF_PERF=1
+                 * показывала стадию ОДНОЙ суммой, как при одном диспатче. */
+                stage: if s.pipe >= P_STATWORK {
+                    P_STATIC as u32
+                } else {
+                    s.pipe as u32
+                },
             })
             .collect();
         unsafe {
@@ -1647,7 +1789,14 @@ impl GpuSim {
                 push: &push_keep[k] as *const Push as *const c_void,
                 push_bytes: 80,
                 groups: s.groups,
-                stage: s.pipe as u32,
+                /* Три прохода контактов со статикой (work/tie/emit) помечаем
+                 * стадией `static_contacts`, чтобы таблица F3/VF_PERF=1
+                 * показывала стадию ОДНОЙ суммой, как при одном диспатче. */
+                stage: if s.pipe >= P_STATWORK {
+                    P_STATIC as u32
+                } else {
+                    s.pipe as u32
+                },
             })
             .collect();
         unsafe {

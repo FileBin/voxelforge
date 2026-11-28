@@ -43,6 +43,18 @@ pub struct PerfRow {
     pub imbal: f32,
 }
 
+/// Строка для оверлея в окне. Раскладка 1:1 с `vf_perf_row` в
+/// `c/voxelforge_view.h`: имя — ASCII в фиксированном буфере, чтобы не
+/// передавать через границу указатели на Rust-строки.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VfPerfRow {
+    pub name: [u8; 24],
+    pub mean_ms: f32,
+    pub max_ms: f32,
+    pub share: f32,
+}
+
 pub struct Perf {
     /// Драйвер умеет таймстемпы на этой очереди.
     pub supported: bool,
@@ -207,6 +219,30 @@ impl Perf {
     /// Период окна для тестов: пока окно не закрыто, печати нет.
     pub fn window_elapsed(&self, now: Instant) -> Duration {
         now.duration_since(self.window_start)
+    }
+
+    /// Среднее время такта в последнем закрытом окне, мс.
+    pub fn tick_ms(&self) -> f32 {
+        self.tick_mean_ms
+    }
+
+    /// Строки для оверлея в окне (копия — данные переживают границу FFI).
+    pub fn overlay_rows(&self) -> Vec<VfPerfRow> {
+        self.rows
+            .iter()
+            .map(|r| {
+                let mut name = [0u8; 24];
+                let s = PIPE_NAMES.get(r.stage).copied().unwrap_or("?");
+                let n = s.len().min(23);
+                name[..n].copy_from_slice(&s.as_bytes()[..n]);
+                VfPerfRow {
+                    name,
+                    mean_ms: r.mean_ms,
+                    max_ms: r.max_ms,
+                    share: r.share,
+                }
+            })
+            .collect()
     }
 }
 

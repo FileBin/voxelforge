@@ -1,6 +1,7 @@
 // Живое окно движка: SDL3 + Vulkan. Логики мира здесь нет — только
 // поверхность, swapchain, два конвейера (меши и линии) и ввод.
 #include "voxelforge_view.h"
+#include "vf_font5x7.h"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
@@ -12,6 +13,11 @@
 
 #define MAX_SHAPES 512
 #define MAX_SWAP 8
+/* Оверлей стадий: не больше стольких строк и столько байт под его вершины.
+ * Потолок держим с запасом: строка текста в 18 знаков при scale 2 — это
+ * ~600 вершин, 16 строк — ~10 тыс. вершин, 240 КБ. Буфер 2 МБ заведомо выше. */
+#define VF_PERF_MAX_ROWS 24
+#define VF_UI_VBUF_BYTES (2u * 1024u * 1024u)
 
 typedef struct gpu_shape {
     VkBuffer vbuf, ibuf;
@@ -49,6 +55,21 @@ struct vf_view {
 
     VkPipeline pipe_mesh, pipe_line;
     VkPipelineLayout lay_mesh, lay_line;
+    /* Оверлей диагностики: треугольники в NDC с цветом на вершине, без
+     * дескрипторов и push-констант. Вершины собираются на CPU каждый кадр. */
+    VkPipeline pipe_ui;
+    VkPipelineLayout lay_ui;
+    VkBuffer ui_vbuf;
+    VkDeviceMemory ui_vmem;
+    float *ui_ptr;
+    uint32_t ui_n;      /* вершин в буфере за этот кадр */
+    uint32_t ui_cap;    /* вершин максимум */
+    vf_perf_row perf_rows[VF_PERF_MAX_ROWS];
+    uint32_t perf_n;
+    float perf_tick_ms;
+    /* Оверлей запрошен этим кадром (F3 / VF_PERF), даже если данных ещё нет:
+     * тогда панель показывает «ждём такт», а не исчезает молча. */
+    int perf_show;
     VkDescriptorSetLayout dsl;
     VkDescriptorPool dpool;
     VkDescriptorSet dset;
@@ -67,6 +88,10 @@ struct vf_view {
 
     gpu_shape shapes[MAX_SHAPES];
     int n_shapes;
+    /* Прошлое состояние F3 для фронта: событие SDL приходит и с автоповтором, а
+     * опрос состояния — только «зажата», поэтому переключение ловим по фронту
+     * 0→1, а не по самому факту удержания. */
+    int f3_prev;
 
     float vp[16];
     float eye[4];
@@ -363,6 +388,87 @@ static VkPipeline make_pipeline(vf_view *v, VkPipelineLayout lay, VkShaderModule
     return p;
 }
 
+/* Конвейер оверлея: NDC-треугольники с цветом на вершине, без дескрипторов,
+ * без глубины, с альфа-смешением (панель полупрозрачная). */
+static VkPipeline make_ui_pipeline(vf_view *v, VkPipelineLayout lay, VkShaderModule vs,
+                                   VkShaderModule fs) {
+    VkPipelineShaderStageCreateInfo st[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+                                             {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+    st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    st[0].module = vs;
+    st[0].pName = "main";
+    st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    st[1].module = fs;
+    st[1].pName = "main";
+
+    VkVertexInputBindingDescription bind = {0, sizeof(float) * 6, VK_VERTEX_INPUT_RATE_VERTEX};
+    VkVertexInputAttributeDescription attr[2] = {
+        {0, 0, VK_FORMAT_R32G32_SFLOAT, 0},
+        {1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, sizeof(float) * 2},
+    };
+    VkPipelineVertexInputStateCreateInfo vin = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    vin.vertexBindingDescriptionCount = 1;
+    vin.pVertexBindingDescriptions = &bind;
+    vin.vertexAttributeDescriptionCount = 2;
+    vin.pVertexAttributeDescriptions = attr;
+
+    VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vp.viewportCount = 1;
+    vp.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    ds.depthTestEnable = VK_FALSE;
+    ds.depthWriteEnable = VK_FALSE;
+
+    VkPipelineColorBlendAttachmentState cba = {0};
+    cba.blendEnable = VK_TRUE;
+    cba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    cba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    cba.colorBlendOp = VK_BLEND_OP_ADD;
+    cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    cba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    cba.alphaBlendOp = VK_BLEND_OP_ADD;
+    cba.colorWriteMask = 0xF;
+    VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cb.attachmentCount = 1;
+    cb.pAttachments = &cba;
+
+    VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dv = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dv.dynamicStateCount = 2;
+    dv.pDynamicStates = dyn;
+
+    VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    ci.stageCount = 2;
+    ci.pStages = st;
+    ci.pVertexInputState = &vin;
+    ci.pInputAssemblyState = &ia;
+    ci.pViewportState = &vp;
+    ci.pRasterizationState = &rs;
+    ci.pMultisampleState = &ms;
+    ci.pDepthStencilState = &ds;
+    ci.pColorBlendState = &cb;
+    ci.pDynamicState = &dv;
+    ci.layout = lay;
+    ci.renderPass = v->rp;
+    VkPipeline p = VK_NULL_HANDLE;
+    if (!ok(vkCreateGraphicsPipelines(v->dev, VK_NULL_HANDLE, 1, &ci, NULL, &p), "ui pipeline"))
+        return VK_NULL_HANDLE;
+    return p;
+}
+
 static int make_swapchain(vf_view *v) {
     VkSurfaceCapabilitiesKHR caps;
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(v->phys, v->surf, &caps);
@@ -574,6 +680,16 @@ vf_status vf_view_new(vf_view **out, vf_ctx *core, int w, int h, const char *tit
     wd.pBufferInfo = &dbi;
     vkUpdateDescriptorSets(v->dev, 1, &wd, 0, NULL);
 
+    /* Вершинный буфер оверлея: host-visible и постоянно замапен — вершины
+     * собираются на CPU каждый кадр, а кадр начинается после fence, так что
+     * прошлый кадр этот буфер уже не читает. */
+    if (!make_buffer(v, VF_UI_VBUF_BYTES, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &v->ui_vbuf,
+                     &v->ui_vmem,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+        return st(18, "ui vbuf");
+    vkMapMemory(v->dev, v->ui_vmem, 0, VK_WHOLE_SIZE, 0, (void **)&v->ui_ptr);
+    v->ui_cap = VF_UI_VBUF_BYTES / (sizeof(float) * 6);
+
     // Порядок важен: конвейерам нужен render pass, а ему — формат swapchain.
     if (!make_depth(v)) return st(13, "depth");
     if (!make_render_pass(v)) return st(14, "render pass");
@@ -618,7 +734,22 @@ static int make_swapchain_shaders(vf_view *v) {
     vkDestroyShaderModule(v->dev, fs, NULL);
     vkDestroyShaderModule(v->dev, lvs, NULL);
     vkDestroyShaderModule(v->dev, lfs, NULL);
-    return v->pipe_mesh && v->pipe_line;
+    if (!v->pipe_mesh || !v->pipe_line) return 0;
+
+    /* Оверлей диагностики — необязателен: если SPIR-V для него нет, окно
+     * обязано подняться, а оверлей просто не рисуется (числа остаются в
+     * консоли). Поэтому ошибки здесь не валят инициализацию. */
+    VkShaderModule uvs = load_shader(v->dev, v->shader_dir, "view_ui.vert.spv");
+    VkShaderModule ufs = load_shader(v->dev, v->shader_dir, "view_ui.frag.spv");
+    if (uvs && ufs) {
+        VkPipelineLayoutCreateInfo lci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        if (ok(vkCreatePipelineLayout(v->dev, &lci, NULL, &v->lay_ui), "pipeline layout(ui)"))
+            v->pipe_ui = make_ui_pipeline(v, v->lay_ui, uvs, ufs);
+    }
+    if (uvs) vkDestroyShaderModule(v->dev, uvs, NULL);
+    if (ufs) vkDestroyShaderModule(v->dev, ufs, NULL);
+    if (!v->pipe_ui) fprintf(stderr, "[view] оверлей стадий недоступен (нет view_ui SPIR-V)\n");
+    return 1;
 }
 
 /* Режим показа: 0 — FIFO (развёртка сама задаёт ритм, ограничитель кадра
@@ -638,12 +769,15 @@ void vf_view_free(vf_view *v) {
     drop_swapchain(v);
     if (v->pipe_mesh) vkDestroyPipeline(v->dev, v->pipe_mesh, NULL);
     if (v->pipe_line) vkDestroyPipeline(v->dev, v->pipe_line, NULL);
+    if (v->pipe_ui) vkDestroyPipeline(v->dev, v->pipe_ui, NULL);
     if (v->lay_mesh) vkDestroyPipelineLayout(v->dev, v->lay_mesh, NULL);
     if (v->lay_line) vkDestroyPipelineLayout(v->dev, v->lay_line, NULL);
+    if (v->lay_ui) vkDestroyPipelineLayout(v->dev, v->lay_ui, NULL);
     if (v->rp) vkDestroyRenderPass(v->dev, v->rp, NULL);
     if (v->dpool) vkDestroyDescriptorPool(v->dev, v->dpool, NULL);
     if (v->dsl) vkDestroyDescriptorSetLayout(v->dev, v->dsl, NULL);
     free_buffer(v, v->ubo, v->ubo_mem);
+    free_buffer(v, v->ui_vbuf, v->ui_vmem);
     if (v->sem_ready) vkDestroySemaphore(v->dev, v->sem_ready, NULL);
     if (v->sem_done) vkDestroySemaphore(v->dev, v->sem_done, NULL);
     if (v->fence) vkDestroyFence(v->dev, v->fence, NULL);
@@ -694,6 +828,9 @@ int vf_view_poll(vf_view *v, vf_input *in) {
             case SDLK_ESCAPE: in->alive = 0; break;
             default: break;
             }
+            /* Раскладка может дать другой keycode на той же физической клавише —
+             * F3 ловим ещё и по scancode. */
+            if (e.key.scancode == SDL_SCANCODE_F3 && !e.key.repeat) in->key_f3 = 1;
             break;
         default:
             break;
@@ -711,6 +848,11 @@ int vf_view_poll(vf_view *v, vf_input *in) {
         in->key_e = ks[SDL_SCANCODE_E];
         in->shift = ks[SDL_SCANCODE_LSHIFT] || ks[SDL_SCANCODE_RSHIFT];
         in->ctrl = ks[SDL_SCANCODE_LCTRL] || ks[SDL_SCANCODE_RCTRL];
+        /* F3 — переключатель, поэтому важен только фронт нажатия: удержание
+         * (и автоповтор) не должны мигать диагностикой. */
+        int f3 = ks[SDL_SCANCODE_F3] ? 1 : 0;
+        if (f3 && !v->f3_prev) in->key_f3 = 1;
+        v->f3_prev = f3;
     }
     SDL_MouseButtonFlags flags = SDL_GetMouseState(&in->mx, &in->my);
     in->lmb = (flags & SDL_BUTTON_LMASK) != 0;
@@ -890,8 +1032,151 @@ void vf_view_draw_lines(vf_view *v, int32_t lines, const float *model, const flo
     vkCmdDraw(v->cmd, g->n_idx, 1, 0, 0);
 }
 
+// ---------------------------------------------------------------- оверлей стадий
+//
+// Текст рисуется встроенным растровым шрифтом 5x7: каждый включённый пиксель
+// знака — квад. Примитивов много, зато нет ни SDL_ttf, ни файлов шрифтов, и
+// оверлей работает везде, где работает окно.
+
+static void ui_quad(vf_view *v, float x, float y, float w, float h, const float *c) {
+    if (!v->ui_ptr || v->ui_n + 6 > v->ui_cap) return;
+    float W = (float)v->extent.width, H = (float)v->extent.height;
+    float x0 = 2.0f * x / W - 1.0f;
+    float y0 = 2.0f * y / H - 1.0f;
+    float x1 = 2.0f * (x + w) / W - 1.0f;
+    float y1 = 2.0f * (y + h) / H - 1.0f;
+    const float px[6][2] = {{x0, y0}, {x1, y0}, {x1, y1}, {x0, y0}, {x1, y1}, {x0, y1}};
+    for (int i = 0; i < 6; i++) {
+        float *p = v->ui_ptr + (size_t)v->ui_n * 6;
+        p[0] = px[i][0];
+        p[1] = px[i][1];
+        p[2] = c[0];
+        p[3] = c[1];
+        p[4] = c[2];
+        p[5] = c[3];
+        v->ui_n++;
+    }
+}
+
+/* Строка ASCII-текста. c — цвет, scale — целое увеличение пикселя шрифта. */
+static void ui_text(vf_view *v, float x, float y, float scale, const float *c, const char *t) {
+    for (; *t; t++) {
+        unsigned char ch = (unsigned char)*t;
+        if (ch < VF_FONT_FIRST || ch > VF_FONT_LAST) ch = '?';
+        const unsigned char *g = &vf_font5x7[(ch - VF_FONT_FIRST) * 5];
+        for (int col = 0; col < 5; col++) {
+            /* Вертикальные серии бит рисуем одним квадом, а не по пикселю:
+             * вершин втрое меньше при том же виде. */
+            int row = 0;
+            while (row < 7) {
+                if ((g[col] >> row) & 1) {
+                    int run = 1;
+                    while (row + run < 7 && ((g[col] >> (row + run)) & 1)) run++;
+                    ui_quad(v, x + col * scale, y + row * scale, scale, run * scale, c);
+                    row += run;
+                } else {
+                    row++;
+                }
+            }
+        }
+        x += 6.0f * scale;
+    }
+}
+
+static void draw_perf_overlay(vf_view *v) {
+    if (!v->pipe_ui || !v->ui_ptr || !v->perf_show || !v->recording) return;
+    v->ui_n = 0;
+
+    const float bg[4] = {0.035f, 0.05f, 0.075f, 0.88f};
+    const float title[4] = {0.78f, 0.86f, 1.0f, 1.0f};
+    const float head[4] = {0.55f, 0.62f, 0.72f, 1.0f};
+    const float text[4] = {0.90f, 0.93f, 0.97f, 1.0f};
+    static const float pal[8][3] = {
+        {0.95f, 0.42f, 0.35f}, {0.98f, 0.68f, 0.30f}, {0.92f, 0.86f, 0.35f},
+        {0.48f, 0.82f, 0.44f}, {0.36f, 0.78f, 0.80f}, {0.42f, 0.60f, 0.95f},
+        {0.70f, 0.55f, 0.95f}, {0.92f, 0.50f, 0.75f},
+    };
+
+    const float sc = 2.0f, lh = 18.0f;
+    const float x0 = 10.0f, y0 = 10.0f, w = 550.0f;
+    uint32_t nrows = v->perf_n;
+    float h = 30.0f + lh * (float)(nrows ? nrows + 1 : 1) + 8.0f;
+    ui_quad(v, x0, y0, w, h, bg);
+
+    char line[96];
+    if (v->perf_tick_ms > 0.0f) {
+        snprintf(line, sizeof line, "GPU STAGES   tick %.2f ms   F3 toggle",
+                 (double)v->perf_tick_ms);
+    } else {
+        snprintf(line, sizeof line, "GPU STAGES   no tick yet   F3 toggle");
+    }
+    ui_text(v, x0 + 10, y0 + 8, sc, title, line);
+
+    const float yhead = y0 + 30.0f;
+    if (nrows == 0) {
+        /* Такт ещё не закрыт (мир спит или диагностику только включили) — это
+         * не «нет данных», а именно «такт не приходил», и так и говорим. */
+        ui_text(v, x0 + 12, yhead + lh, sc, head, "waiting for a physics tick");
+        vkCmdBindPipeline(v->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v->pipe_ui);
+        VkDeviceSize off0 = 0;
+        vkCmdBindVertexBuffers(v->cmd, 0, 1, &v->ui_vbuf, &off0);
+        vkCmdDraw(v->cmd, v->ui_n, 1, 0, 0);
+        v->ui_n = 0;
+        return;
+    }
+    ui_text(v, x0 + 12, yhead, sc, head, "stage");
+    ui_text(v, x0 + 260, yhead, sc, head, "mean");
+    ui_text(v, x0 + 355, yhead, sc, head, "max");
+    ui_text(v, x0 + 460, yhead, sc, head, "share");
+
+    for (uint32_t i = 0; i < v->perf_n; i++) {
+        const vf_perf_row *r = &v->perf_rows[i];
+        float y = yhead + lh * (float)(i + 1);
+        float share = r->share;
+        if (share < 0.0f) share = 0.0f;
+        if (share > 100.0f) share = 100.0f;
+        /* Цвет — по имени стадии (сумма букв): у solve_contacts и solve_apply
+         * общий префикс, но полосы должны различаться. */
+        unsigned hsh = 0;
+        for (const char *p = r->name; *p; p++) hsh = hsh * 31u + (unsigned char)*p;
+        float bar[4] = {pal[hsh % 8][0], pal[hsh % 8][1], pal[hsh % 8][2], 0.30f};
+        float bw = (w - 24.0f) * share / 100.0f;
+        if (bw > 1.0f) ui_quad(v, x0 + 12, y, bw, lh - 5.0f, bar);
+
+        char name[24];
+        snprintf(name, sizeof name, "%.18s", r->name);
+        ui_text(v, x0 + 12, y + 4, sc, text, name);
+        snprintf(line, sizeof line, "%7.2f", (double)r->mean_ms);
+        ui_text(v, x0 + 260, y + 4, sc, text, line);
+        snprintf(line, sizeof line, "%7.2f", (double)r->max_ms);
+        ui_text(v, x0 + 355, y + 4, sc, text, line);
+        snprintf(line, sizeof line, "%5.1f%%", (double)share);
+        ui_text(v, x0 + 460, y + 4, sc, text, line);
+    }
+
+    vkCmdBindPipeline(v->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v->pipe_ui);
+    VkDeviceSize off = 0;
+    vkCmdBindVertexBuffers(v->cmd, 0, 1, &v->ui_vbuf, &off);
+    vkCmdDraw(v->cmd, v->ui_n, 1, 0, 0);
+    v->ui_n = 0;
+}
+
+void vf_view_perf(vf_view *v, const vf_perf_row *rows, uint32_t n, float tick_ms) {
+    if (!v) return;
+    /* rows == NULL — оверлей выключен; непустой указатель при n == 0 — включён,
+     * но такта ещё не было (панель так и скажет). */
+    v->perf_show = rows != NULL;
+    v->perf_n = 0;
+    v->perf_tick_ms = tick_ms;
+    if (!rows || n == 0) return;
+    if (n > VF_PERF_MAX_ROWS) n = VF_PERF_MAX_ROWS;
+    memcpy(v->perf_rows, rows, (size_t)n * sizeof(*rows));
+    v->perf_n = n;
+}
+
 void vf_view_end(vf_view *v) {
     if (!v->recording) return;
+    draw_perf_overlay(v);
     vkCmdEndRenderPass(v->cmd);
     vkEndCommandBuffer(v->cmd);
     VkPipelineStageFlags wait = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
