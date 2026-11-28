@@ -416,6 +416,18 @@ impl TetBody {
 
     /// Шар из тетраэдров: всё, что ближе радиуса к центру.
     pub fn ball(center: [f32; 3], radius: f32, level: u8) -> Self {
+        /* Уровень подбираем ПО РАДИУСУ: при крупном шаге шар сэмплируется
+         * двумя-тремя узлами и выходит многогранником (на снаряде это видно
+         * как угловатый бок). Целимся в ~6 узлов на радиус: шаг <= radius/6. */
+        let mut lv = level;
+        while lv < level.saturating_add(6) {
+            let a_lv = BASE / (1u32 << lv) as f32;
+            if a_lv * 0.5 <= radius / 6.0 {
+                break;
+            }
+            lv += 1;
+        }
+        let level = lv;
         let a = BASE / (1u32 << level) as f32;
         let n = (radius / a).ceil() as i32 + 1;
         let mut tets = Vec::new();
