@@ -9,6 +9,7 @@
 //! Кубических вокселей здесь нет: ячейка — ячейка Вороного решётки BCC.
 
 pub mod bcc;
+pub mod field;
 pub mod collide;
 pub mod live;
 pub mod sim;
