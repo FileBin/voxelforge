@@ -781,9 +781,11 @@ impl Perf {
              * «0 fps» скрывают разницу между 0.3 и 9. */
             let f = |v: f32| if v >= 10.0 { format!("{v:.0}") } else { format!("{v:.1}") };
             /* «frame» здесь — работа кадра, а не период: период задаёт
-             * развёртка (16.7 мс), и печатать его рядом с fps бессмысленно. */
+             * развёртка (16.7 мс), и печатать его рядом с fps бессмысленно.
+             * У такта — та же тройка, что в оверлее и в строке «ИТОГО такт»:
+             * среднее без краёв прячет и всплеск, и пустой такт. */
             println!(
-                "[perf] fps {} (min {} max {}) · tps {} (min {} max {}) · frame ms {:.2} (min {:.2} max {:.2}) · tick ms {:.2}",
+                "[perf] fps {} (min {} max {}) · tps {} (min {} max {}) · frame ms {:.2} (min {:.2} max {:.2}) · tick ms {:.2} (min {:.2} max {:.2})",
                 f(r.fps_mean),
                 f(r.fps_min),
                 f(r.fps_max),
@@ -793,7 +795,9 @@ impl Perf {
                 r.frame_mean_ms,
                 r.frame_min_ms,
                 r.frame_max_ms,
-                r.tick_mean_ms
+                r.tick_mean_ms,
+                r.tick_min_ms,
+                r.tick_max_ms
             );
         } else {
             println!("[perf] fps — (окно кадров ещё не закрыто) · tps —");
