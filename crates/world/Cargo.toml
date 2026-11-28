@@ -17,3 +17,8 @@ cpu-solver = []
 name = "voxelforge-live"
 path = "src/bin/voxelforge_live.rs"
 required-features = ["live"]
+
+[[bin]]
+name = "vf-bench"
+path = "src/bin/vf_bench.rs"
+required-features = ["live"]

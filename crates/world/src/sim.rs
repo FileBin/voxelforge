@@ -434,10 +434,17 @@ pub struct GpuSim {
     flat_pairs: bool,
     /// Параллельный скан (по умолчанию). VF_SCAN=serial — старый однопоточный.
     par_scan: bool,
+    /// Счётчики прохода пар (VF_PAIR_STATS=1): сколько итераций, какая ячейка
+    /// самая большая, сколько пар не влезло в буфер. Выключено — шейдер не
+    /// делает ни одной атомарной операции сверх записи самой пары.
+    pub pair_stats: bool,
     /// AABB тел для префильтра пар (2 vec4 на тело).
     baabb: *mut c_void,
     /// Пары и их число известны только устройству (SAT берёт число из буфера).
     pub pairs_on_gpu: bool,
+    /// Время всей цепочки пар (сетка + испускание) в прошлом такте, мс.
+    /// `run_tet_pairs` ждёт fence, поэтому число честное.
+    pub last_pairs_ms: f32,
     /// Пары тетраэдров, посчитанные CPU один раз на такт.
     pairs: *mut c_void,
     pub n_pairs: usize,
@@ -552,7 +559,8 @@ impl GpuSim {
         let tetstart = mk((ncells as usize + 1) * 4, true);
         let tetcursor = mk(ncells as usize * 4, false);
         let cell_tets = mk(MAX_CELL_TETS * 8, true);
-        let pair_count = mk(4, true);
+        /* 8 слов: [0] пары, [1..] — диагностика прохода пар (см. bench). */
+        let pair_count = mk(256, true);
         let impact = mk(MAX_BODIES * 32, true);
         let impact_ring = mk(MAX_EVENTS * 3 * 16, true);
         let impact_cnt = mk(4, true);
@@ -687,8 +695,10 @@ impl GpuSim {
              * возвращает старый однопоточный проход (для сверки). */
             flat_pairs: !matches!(std::env::var("VF_PAIRGEN").as_deref(), Ok("cell")),
             par_scan: !matches!(std::env::var("VF_SCAN").as_deref(), Ok("serial")),
+            pair_stats: matches!(std::env::var("VF_PAIR_STATS").as_deref(), Ok(v) if v != "0"),
             baabb,
             pairs_on_gpu: false,
+            last_pairs_ms: 0.0,
             pairs,
             n_pairs: 0,
             sdf_desc,
@@ -865,7 +875,9 @@ impl GpuSim {
             /* lo.w — порог энергии раскола: отдельного vec4 в push-константах
              * нет (128 Б — гарантированный минимум), а это поле пустовало. */
             lo: [p.lo[0], p.lo[1], p.lo[2], FRACTURE_ENERGY],
-            hi: [p.hi[0], p.hi[1], p.hi[2], 0.0],
+            /* hi.w — флаг диагностики прохода пар: в такте это поле больше
+             * никто не читает (число тел для body_init ставит write_slots). */
+            hi: [p.hi[0], p.hi[1], p.hi[2], if self.pair_stats { 1.0 } else { 0.0 }],
         }
     }
 
@@ -1747,10 +1759,10 @@ impl GpuSim {
 
     /// Пары тетов целиком на устройстве: сетка -> пары. Возвращает их число.
     pub fn run_tet_pairs(&mut self, dt: f32) -> usize {
-        let zero = vec![0u8; 4];
+        let zero = vec![0u8; 256];
         unsafe {
             check_status(
-                vf_buffer_write(self.ctx, self.pair_count, 0, zero.as_ptr() as *const c_void, 4),
+                vf_buffer_write(self.ctx, self.pair_count, 0, zero.as_ptr() as *const c_void, zero.len()),
                 "zero_pairs",
             );
         }
@@ -1845,9 +1857,15 @@ impl GpuSim {
                 },
             })
             .collect();
+        let t0 = std::time::Instant::now();
         unsafe {
             check_status(vf_run(self.ctx, ds.as_mut_ptr(), ds.len() as u32), "run_tet_pairs");
         }
+        /* `vf_run` ждёт fence, поэтому это ЧЕСТНОЕ время всей цепочки пар
+         * (сетка + испускание), а не «отправлено и забыто». В таблице стадий
+         * F3 эта цепочка не видна: она уходит отдельным submit'ом, и
+         * `vf_perf_read` к моменту чтения возвращает уже метки такта. */
+        self.last_pairs_ms = t0.elapsed().as_secs_f32() * 1000.0;
         /* Счётчик не читаем: SAT берёт число пар из буфера. */
         self.pairs_on_gpu = true;
         self.n_pairs = MAX_PAIRS;
@@ -1864,6 +1882,30 @@ impl GpuSim {
             );
         }
         out
+    }
+
+    /// Сколько пар тетов насчитал проход пар за последний такт (4 Б).
+    /// Нужен замерам: `n_pairs` на CPU — это потолок буфера, а не число пар.
+    pub fn read_pair_debug(&self) -> [u32; 8] {
+        let mut c = [0u32; 8];
+        unsafe {
+            check_status(
+                vf_buffer_read(self.ctx, self.pair_count, 0, c.as_mut_ptr() as *mut c_void, 32),
+                "read_pair_debug",
+            );
+        }
+        c
+    }
+
+    pub fn read_pair_count(&self) -> u32 {
+        let mut c = [0u32; 1];
+        unsafe {
+            check_status(
+                vf_buffer_read(self.ctx, self.pair_count, 0, c.as_mut_ptr() as *mut c_void, 4),
+                "read_pair_count",
+            );
+        }
+        c[0]
     }
 
     /// События раскола из кольца: читаем счётчик 4 Б и, только если он

@@ -67,9 +67,17 @@ void main() {
     if (idx >= total) return;
     if (total < 2u) return;
 
+    /* Диагностика (VF_PAIR_STATS=1): pcnt[1..] — счётчики прохода. */
+    bool dbg = pc.hi.w > 0.5;
+    if (dbg) atomicAdd(pcnt[4], 1u);
+
     uint c = cell_of(idx, nc);
     uint s = start[c];
     uint e = start[c + 1u];
+    if (dbg) {
+        atomicMax(pcnt[2], e - s);
+        atomicAdd(pcnt[1], e - idx);
+    }
     if (e - s < 2u) return;
 
     ivec3 dims = pc.grid.xyz;
@@ -80,6 +88,7 @@ void main() {
         uvec2 A = cell_tets[i];
         for (uint j = i + 1u; j < e; j++) {
             uvec2 B = cell_tets[j];
+            if (dbg) atomicAdd(pcnt[6], 1u);
             if (A.x == B.x) continue;
             vec3 alo_p = baabb[A.x * 2u].xyz, ahi_p = baabb[A.x * 2u + 1u].xyz;
             vec3 blo_p = baabb[B.x * 2u].xyz, bhi_p = baabb[B.x * 2u + 1u].xyz;
@@ -102,6 +111,7 @@ void main() {
             int canon = (canon3.z * dims.y + canon3.y) * dims.x + canon3.x;
             if (uint(canon) != c) continue;
 
+            if (dbg) atomicAdd(pcnt[5], 1u);
             uint k = atomicAdd(pcnt[0], 1u);
             if (k >= MAX_PAIRS) continue;
             pairs[k] = uvec2((A.x << 20) | ta, (B.x << 20) | tb);
