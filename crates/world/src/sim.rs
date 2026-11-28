@@ -306,7 +306,7 @@ pub const PIPE_NAMES: [&str; 36] = [
 ];
 /// Число storage-буферов у каждого пайплайна — в том же порядке.
 const PIPE_BUFNS: [u32; 36] = [
-    1, 2, 2, 3, 4, 2, 5, 4, 1, 1, 4, 4, 7, 3, 2, 4, 3, 6, 8, 6, 4, 1, 2, 3, 2, 2, 4, 8, 1, 7, 5, 6,
+    1, 2, 2, 3, 4, 2, 5, 4, 1, 1, 4, 4, 7, 3, 2, 4, 3, 6, 8, 6, 5, 1, 2, 3, 2, 2, 4, 8, 1, 7, 5, 6,
     5, 6, 2, 2,
 ];
 /// Ячеек на блок в параллельном скане (совпадает с 16 * 64 в шейдере).
@@ -794,9 +794,9 @@ impl GpuSim {
             sdf_vals,
             sdf_pairs,
             sdf_paircnt,
-            /* По умолчанию — SAT (рабочий режим пользователя). VF_COLLIDE=sdf
-             * переключает контакты на поля; старый путь остаётся для сверки. */
-            sdf_collide: matches!(std::env::var("VF_COLLIDE").as_deref(), Ok("sdf")),
+            /* По умолчанию — контакты по SDF-полям. Тет-путь (SAT) остаётся за
+             * VF_COLLIDE=gpu: он «жидкий», тела проходят друг сквозь друга. */
+            sdf_collide: !matches!(std::env::var("VF_COLLIDE").as_deref(), Ok("gpu")),
             lcount,
             cellcnt,
             starts,
@@ -1306,7 +1306,7 @@ impl GpuSim {
              * дороже самих контактов. */
             steps.push(Step {
                 pipe: P_BODYAABB,
-                bufs: vec![a, self.tets, self.span, self.baabb],
+                bufs: vec![a, self.tets, self.span, self.baabb, self.sdf_desc],
                 push,
                 groups: [g_body, 1, 1],
             });
@@ -1936,7 +1936,7 @@ impl GpuSim {
         let mut steps = vec![
             Step {
                 pipe: P_BODYAABB,
-                bufs: vec![self.bodies[0], self.tets, self.span, self.baabb],
+                bufs: vec![self.bodies[0], self.tets, self.span, self.baabb, self.sdf_desc],
                 push,
                 groups: [g_body, 1, 1],
             },
@@ -2099,7 +2099,7 @@ impl GpuSim {
         let mut steps = vec![
             Step {
                 pipe: P_BODYAABB,
-                bufs: vec![self.bodies[0], self.tets, self.span, self.baabb],
+                bufs: vec![self.bodies[0], self.tets, self.span, self.baabb, self.sdf_desc],
                 push,
                 groups: [g_body, 1, 1],
             },

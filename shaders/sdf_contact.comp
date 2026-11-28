@@ -3,49 +3,39 @@
 
 /* Контакты SDF↔SDF — перенос CPU-оракула crates/world/src/sdf_contact.rs.
  *
- * Логика ровно та же, что проверена тестами на CPU:
- *   1. затравки — узлы сетки ОДНОГО тела внутри пересечения AABB обоих
- *      (f_a < 0 и f_b < 0) — топологически нейтрально (тор, зацепления);
- *   2. 4 итерации спуска p -= 0.5*(f_a*n_a + f_b*n_b), n = градиент (в метрах);
- *   3. валидность по обоим полям, глубина = (-f_a) + (-f_b),
- *      нормаль = normalize(n_a - n_b);
- *   4. контакты пишутся в ТОТ ЖЕ список тела, что заполняет sat.comp, поэтому
- *      contact_select, impact, depenetrate и солвер не меняются.
+ * Что считается (и почему так):
+ *   1. ЗАТРАВКИ — узлы сетки тела с БОЛЕЕ МЕЛКИМ шагом поля, рядом с чужим
+ *      AABB. Годен узел, где `fs + ft < marg`: сумма ЗНАКОВЫХ расстояний до
+ *      двух поверхностей — это зазор между телами в этой точке (минус внутри
+ *      пересечения). Прежнее условие «оба поля < 0» требовало, чтобы узел лежал
+ *      ВНУТРИ обоих тел: у шара r=0.14 внутри ровно один узел (центр), он
+ *      попадал внутрь партнёра только при перекрытии на радиус — на 20 м/с
+ *      (0.125 м за подшаг) аппарат пролетал это окно за один подшаг, пар 3,
+ *      контактов 0, реакции нет («тела проходят сквозь друга»).
+ *   2. МАРЖА `marg = шаг узла + относительный путь за подшаг`. Путь нужен,
+ *      чтобы пара находилась ДО удара; шаг — потому что затравки дискретны.
+ *   3. СПУСК 4 итерации `p -= 0.5*(f_a*n_a + f_b*n_b)` — к паре ближайших
+ *      точек поверхностей. Шаг ограничен половиной шага узла.
+ *   4. Глубина ЗНАКОВАЯ: `-(va + vb)` — плюс внутри, минус в зазоре. Минус —
+ *      законный СПЕКУЛЯТИВНЫЙ контакт: солвер по нему разрешает сближение
+ *      ровно на зазор (solve_contacts.comp, ветка pen<0).
+ *   5. ОДНА НОРМАЛЬ НА ПАРУ — нормаль самого глубокого контакта. Иначе у шара,
+ *      утопленного в плиту, два десятка точек «шапки» дают каждая свою
+ *      наклонную нормаль, моменты не сокращаются, и шар раскручивается от
+ *      вертикального удара (измерено: спин −11.8 рад/с, дальше нормализация
+ *      кватерниона и NaN). SAT по той же причине берёт ОДНУ ось на пару.
  *
- * Раскладка (sim.rs: GpuSim::upload_sdf):
- *   binding 0 — тела (поза и поворот берутся здесь, а не из дескриптора:
- *               тела двигаются каждый такт, таблица заливается только при спавне)
- *   binding 1 — дескрипторы полей: ivec4 lo_dims (lo.xyz, dims.x),
- *               ivec4 dims2 (dims.yz, 0, 0), vec4 step, vec4 shift
- *               (shift — центр поля относительно центроида тела, в системе тела)
- *   binding 2 — значения полей подряд: слот тела * SDF_STRIDE + (z*dims.y+y)*dims.x+x
- *   binding 3 — пары тел из sdf_pairs.comp
- *   binding 4 — список контактов тела (C)
- *   binding 5 — счётчики контактов
- *   binding 6 — число пар (из буфера, как у sat: чтения на CPU нет)
- *
- * ЗАТРАВКИ БЕЗ ПРОХОДА ПО ВСЕМ УЗЛАМ. Наивный перебор всей сетки тела — это
- * десятки тысяч узлов × ~100 выборок поля на узел; на кадр это миллионы
- * выборок даже для одной пары. Поэтому:
- *   - перебираем узлы тела с МЕНЬШИМ полем (кто реже — тот сетка затравок);
- *   - только внутри пересечения AABB (8 углов чужого поля в свою систему);
- *   - не больше 64 затравок на пару (одна invocation = одна затравка), шаг
- *     перебора равномерно растянут по всему пересечению.
- * Остальное делает contact_select: он оставляет KEEP самых глубоких с
- * отбрасыванием дублей ближе 0.02 м.
+ * Раскладка буферов — как раньше (sim.rs GpuSim::upload_sdf): тела,
+ * дескрипторы полей, значения полей, пары тел, список контактов, счётчики.
+ * Контакты пишутся в ТОТ ЖЕ список, что заполняет sat.comp, поэтому
+ * contact_select / impact / depenetrate / солвер не меняются.
  */
 layout(local_size_x = 64) in;
 
-/* Слов на слот в пуле значений. Должно совпадать с sim::SDF_STRIDE
- * (64 слота × 65536 × 4 Б = 16 МБ). */
+/* Слов на слот в пуле значений (sim::SDF_STRIDE). */
 const uint SDF_STRIDE = 65536u;
 /* Затравок на пару: одна рабочая группа, каждому потоку — свой кусок сетки. */
 const uint SEEDS = 64u;
-/* Контактов с одного потока. Потолок на пару — 64×это, дальше режет
- * contact_select (KEEP = 24 самых глубоких с отбрасыванием дублей).
- * Без потолка поток, попавший в толщу перекрытия, считал бы спуск на каждом
- * узле — а это ~100 выборок поля на узел. */
-const uint PER_LANE = 2u;
 
 layout(std430, set = 0, binding = 0) buffer Bodies { Body b[]; };
 layout(std430, set = 0, binding = 1) readonly buffer Descs { SdfDesc descs[]; };
@@ -55,7 +45,10 @@ layout(std430, set = 0, binding = 4) buffer Lists { C list[]; };
 layout(std430, set = 0, binding = 5) buffer ListCount { uint lc[]; };
 layout(std430, set = 0, binding = 6) readonly buffer PairCount { uint pcnt[]; };
 
-/* кватернион в common.glsl лежит как (w, x, y, z) */
+/* Общая нормаль пары: зазор и нормаль самого глубокого контакта. */
+shared float s_gap[SEEDS];
+shared vec3 s_nrm[SEEDS];
+
 vec3 qrot(vec4 q, vec3 v) {
     vec3 u = q.yzw;
     float w = q.x;
@@ -67,13 +60,10 @@ vec3 qinv_rot(vec4 q, vec3 v) { return qrot(vec4(q.x, -q.yzw), v); }
 
 ivec3 dims_of(SdfDesc d) { return sdf_dims(d); }
 
-uint node_count(SdfDesc d) {
-    ivec3 dm = dims_of(d);
-    if (dm.x <= 0 || dm.y <= 0 || dm.z <= 0) return 0u;
-    return uint(dm.x) * uint(dm.y) * uint(dm.z);
-}
+/* Шаг узла для маржи: сетка затравок — по более мелкому полю. */
+float ds_step(SdfDesc da, SdfDesc db) { return min(da.step_pad.x, db.step_pad.x); }
 
-/* узел (в координатах узлов сетки поля) → мир */
+/* узел (в координатах узлов) → мир */
 vec3 node_to_world(Body bd, SdfDesc d, vec3 n) {
     return qrot(bd.quat, d.shift.xyz + n * d.step_pad.x) + bd.pos_r.xyz;
 }
@@ -83,8 +73,8 @@ vec3 world_to_node(Body bd, SdfDesc d, vec3 w) {
     return (qinv_rot(bd.quat, w - bd.pos_r.xyz) - d.shift.xyz) / d.step_pad.x;
 }
 
-/* значение в узле сетки: индексы локальные (n - lo), край — зажим, как в
- * NodeField::at на CPU (иначе на границе поля выборка улетает в чужое тело) */
+/* значение в узле: индексы локальные (n - lo), край — зажим, как в
+ * NodeField::at на CPU */
 float at_node(SdfDesc d, uint base, ivec3 n) {
     ivec3 dm = dims_of(d);
     ivec3 c = clamp(n, ivec3(0), dm - 1);
@@ -129,43 +119,25 @@ void push_contact(uint self, uint other, vec3 p, vec3 n, float depth) {
     if (slot < uint(CAP)) list[self * uint(CAP) + slot] = c;
 }
 
-void main() {
-    uint id = gl_GlobalInvocationID.x;
-    uint pair = id / SEEDS;
-    uint lane = id % SEEDS;
-    if (pair >= pcnt[0]) return;
-    if (lane >= SEEDS) return;
+/* Самый глубокий (наименьший зазор) контакт ЭТОГО потока. */
+struct Best {
+    float gap;
+    vec3 p;
+    vec3 n;
+    bool ok;
+};
 
-    uvec2 pr = pairs[pair];
-    uint ia = pr.x;
-    uint ib = pr.y;
-    uint nbody = uint(pc.grid.w);
-    if (ia >= nbody || ib >= nbody || ia == ib) return;
+Best scan(
+    uint is, uint it,
+    SdfDesc ds, SdfDesc dt,
+    Body Bs, Body Bt,
+    uint base_s, uint base_t,
+    uint lane, float marg
+) {
+    Best best;
+    best.gap = 1e30; best.p = vec3(0.0); best.n = vec3(0.0); best.ok = false;
 
-    SdfDesc da = descs[ia];
-    SdfDesc db = descs[ib];
-    uint na = node_count(da);
-    uint nb = node_count(db);
-    if (na == 0u || nb == 0u) return;   /* у тела нет запечённого поля */
-
-    Body A = b[ia];
-    Body B = b[ib];
-    bool sleep_a = A.misc.y > 0.5;
-    bool sleep_b = B.misc.y > 0.5;
-    if (sleep_a && sleep_b) return;
-
-    /* затравки — по телу с меньшим полем: перебор его сетки дешевле */
-    bool a_seed = na <= nb;
-    uint is = a_seed ? ia : ib;
-    uint it = a_seed ? ib : ia;
-    SdfDesc ds = a_seed ? da : db;
-    SdfDesc dt = a_seed ? db : da;
-    Body Bs = a_seed ? A : B;
-    Body Bt = a_seed ? B : A;
-    uint base_s = is * SDF_STRIDE;
-    uint base_t = it * SDF_STRIDE;
-
-    /* AABB второго поля в мире — из его собственной сетки (8 углов) */
+    /* AABB партнёра в мире — из его сетки (8 углов) */
     vec3 dmax = vec3(dims_of(dt) - ivec3(1));
     vec3 tlo = vec3(1e30);
     vec3 thi = vec3(-1e30);
@@ -176,7 +148,7 @@ void main() {
         tlo = min(tlo, w);
         thi = max(thi, w);
     }
-    /* его же — в систему узлов тела-затравки, и пересекаем с её сеткой */
+    /* …и в систему узлов тела-затравки, пересекая с её сеткой */
     vec3 slo = vec3(1e30);
     vec3 shi = vec3(-1e30);
     for (int c = 0; c < 8; c++) {
@@ -189,41 +161,62 @@ void main() {
     }
     vec3 flo = vec3(ds.lo_dims.xyz);
     vec3 fhi = flo + vec3(dims_of(ds) - ivec3(1));
-    ivec3 lo_i = ivec3(ceil(max(slo, flo) - vec3(1e-3)));
-    ivec3 hi_i = ivec3(floor(min(shi, fhi) + vec3(1e-3)));
-    if (any(greaterThan(lo_i, hi_i))) return;
+    /* пересечение РАСШИРЯЕМ на маржу: у грубых полей боксы могут не
+     * пересечься даже когда поверхности уже почти касаются (два шара r=0.14 с
+     * зазором 2 см: боксы полей расходятся на 4 мм — и контактов не было). */
+    float mp = marg / ds.step_pad.x;
+    ivec3 lo_i = ivec3(ceil(max(slo - vec3(mp), flo) - vec3(1e-3)));
+    ivec3 hi_i = ivec3(floor(min(shi + vec3(mp), fhi) + vec3(1e-3)));
+    if (any(greaterThan(lo_i, hi_i))) return best;
 
     ivec3 span = hi_i - lo_i + ivec3(1);
     uint total = uint(span.x) * uint(span.y) * uint(span.z);
-    /* Кусок сетки на поток — СПЛОШНОЙ, а не «каждый 64-й узел». Выборка с
-     * шагом пропускала перекрытия, которые занимают малую долю сетки (шар,
-     * утопленный в плиту: внутри его поля ~4% узлов) — контактов не было
-     * вовсе. Сплошной кусок просматривает ВСЕ узлы пересечения, а стоимость
-     * ограничивает потолок контактов на поток. */
+    /* Кусок сетки на поток — СПЛОШНОЙ (не «каждый 64-й узел»). */
     uint per = max(1u, (total + SEEDS - 1u) / SEEDS);
     uint begin = lane * per;
     uint end = min(total, begin + per);
-    if (begin >= end) return;
+    if (begin >= end) return best;
 
     uint sx = uint(span.x);
     uint sy = uint(span.y);
-    uint found = 0u;
 
     for (uint k = begin; k < end; k++) {
         ivec3 ln = ivec3(int(k % sx), int((k / sx) % sy), int(k / (sx * sy)));
         ivec3 node = lo_i + ln;
 
-        float fs = at_node(ds, base_s, node - ds.lo_dims.xyz);
+        /* В МЕТРАХ: у двух тел РАЗНЫЕ шаги узла, и складывать значения в
+         * узловых единицах нельзя — это была ошибка (марж сравнивался с
+         * суммой разных масштабов). */
+        float fs = at_node(ds, base_s, node - ds.lo_dims.xyz) * ds.step_pad.x;
         vec3 w = node_to_world(Bs, ds, vec3(node));
-        float ft = sample_node(dt, base_t, world_to_node(Bt, dt, w));
-        if (fs >= 0.0 || ft >= 0.0) continue;   /* узел не в пересечении объёмов */
+        float ft = sample_node(dt, base_t, world_to_node(Bt, dt, w)) * dt.step_pad.x;
+        float gap0 = fs + ft;
+        if (gap0 >= marg) continue;
 
-        /* спуск к паре ближайших точек поверхностей (метры, мировые градиенты).
-         * Шаг ограничен половиной шага узла: на глубоком перекрытии сумма
-         * заглублений больше самого перекрытия, и без предела точка улетает
-         * из пересечения за одну итерацию (проверено: шар, утопленный на
-         * 0.25 м, не давал ни одного контакта). */
+        /* БЫСТРЫЙ ВЫХОД на глубоком перекрытии: искать «ещё глубже» в толще
+         * перекрытия незачем — там десятки узлов, каждый со спуском. Достаточно
+         * одного узла глубиной в шаг сетки. Это главный ограничитель цены:
+         * без него проход по толще поля стоит десятки миллисекунд на пару. */
+        if (gap0 <= -ds.step_pad.x) {
+            if (gap0 < best.gap) {
+                vec3 na0 = world_to_node(Bs, ds, w);
+                vec3 nb0 = world_to_node(Bt, dt, w);
+                vec3 ga0 = qrot(Bs.quat, gradient_node(ds, base_s, na0));
+                vec3 gb0 = qrot(Bt.quat, gradient_node(dt, base_t, nb0));
+                vec3 n0 = normalize(ga0 - gb0 + vec3(1e-9));
+                if (!any(isnan(n0)) && !any(isinf(n0))) {
+                    best.gap = gap0;
+                    best.p = w;
+                    best.n = n0;
+                    best.ok = true;
+                }
+            }
+            break;
+        }
+
+        /* спуск к паре ближайших точек поверхностей */
         vec3 p = w;
+        bool bad = false;
         for (int it2 = 0; it2 < 4; it2++) {
             vec3 na = world_to_node(Bs, ds, p);
             vec3 nb = world_to_node(Bt, dt, p);
@@ -236,7 +229,9 @@ void main() {
             float len = length(d);
             if (len > lim) d *= lim / len;
             p -= d;
+            if (any(isnan(p)) || any(isinf(p))) { bad = true; break; }
         }
+        if (bad) continue;
 
         vec3 na = world_to_node(Bs, ds, p);
         vec3 nb = world_to_node(Bt, dt, p);
@@ -244,23 +239,127 @@ void main() {
         vec3 gb = qrot(Bt.quat, gradient_node(dt, base_t, nb));
         float va = sample_node(ds, base_s, na) * ds.step_pad.x;
         float vb = sample_node(dt, base_t, nb) * dt.step_pad.x;
-        if (va >= 0.0 || vb >= 0.0) continue;   /* спуск вывел из пересечения */
-
-        /* глубина пары — СУММА заглублений обеих сторон (сдвигать надо на неё);
-         * нормаль n_a - n_b смотрит от затравки к партнёру */
-        vec3 n = normalize(ga - gb + vec3(1e-9));
-        float depth = (-va) + (-vb);
-        push_contact(is, it, p, n, depth);
-        push_contact(it, is, p, -n, depth);
-        if (++found >= PER_LANE) break;
+        float gap = va + vb;
+        /* Спуск ищет пару БЛИЖАЙШИХ точек поверхностей: у двух выпуклых тел это
+         * окружность пересечения поверхностей, где сумма = 0, — а настоящая
+         * глубина сидит в глубине перекрытия (у двух шаров с перекрытием 0.1 м
+         * спуск даёт 0.002). Поэтому берём БОЛЬШУЮ глубину из двух: узла-затравки
+         * и спущенной точки. Для «шар на плите» глубины совпадают, для
+         * «шар в шар» работает затравка. */
+        vec3 n_here = normalize(ga - gb + vec3(1e-9));
+        if (isnan(gap) || isinf(gap) || any(isnan(n_here)) || any(isinf(n_here))) continue;
+        if (gap >= marg) continue;
+        if (gap < gap0) {
+            if (gap < best.gap) {
+                best.gap = gap;
+                best.p = p;
+                best.n = n_here;
+                best.ok = true;
+            }
+        } else if (gap0 < best.gap) {
+            vec3 na0 = world_to_node(Bs, ds, w);
+            vec3 nb0 = world_to_node(Bt, dt, w);
+            vec3 ga0 = qrot(Bs.quat, gradient_node(ds, base_s, na0));
+            vec3 gb0 = qrot(Bt.quat, gradient_node(dt, base_t, nb0));
+            vec3 n0 = normalize(ga0 - gb0 + vec3(1e-9));
+            if (any(isnan(n0)) || any(isinf(n0))) continue;
+            best.gap = gap0;
+            best.p = w;
+            best.n = n0;
+            best.ok = true;
+        }
     }
-    if (found == 0u) return;
+    return best;
+}
 
-    /* Пробуждение на устройстве — как в sat.comp: спящее тело, которого
-     * коснулся движущийся сосед, просыпается здесь же. Запись идемпотентна. */
-    float sp_a = length(A.vel_m.xyz);
-    float sp_b = length(B.vel_m.xyz);
-    if (sleep_a && !sleep_b && sp_b > 0.35) {
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint pair = id / SEEDS;
+    uint lane = id % SEEDS;
+
+    /* ВСЕ потоки группы обязаны дойти до barrier() — выход только через флаг
+     * (условия ниже одинаковы для всей группы). */
+    bool live = true;
+    if (pair >= pcnt[0] || lane >= SEEDS) live = false;
+
+    uint ia = 0u, ib = 0u, nbody = uint(pc.grid.w);
+    if (live) {
+        uvec2 pr = pairs[pair];
+        ia = pr.x;
+        ib = pr.y;
+        if (ia >= nbody || ib >= nbody || ia == ib) live = false;
+    }
+
+    SdfDesc da, db;
+    Body A, B;
+    bool sleep_a = false, sleep_b = false;
+    float marg = 0.0;
+    bool a_seed = true;
+    if (live) {
+        da = descs[ia];
+        db = descs[ib];
+        if (!sdf_has_field(da) || !sdf_has_field(db)) live = false;
+    }
+    if (live) {
+        A = b[ia];
+        B = b[ib];
+        sleep_a = A.misc.y > 0.5;
+        sleep_b = B.misc.y > 0.5;
+        if (sleep_a && sleep_b) live = false;
+    }
+    /* Маржа: шаг узла (затравки дискретны) + относительный путь за подшаг
+     * (пара обязана найтись ДО удара). */
+    /* Маржа: 3 шага узла (затравки дискретны, и «нуль поля» лежит между узлами)
+     * + относительный путь за подшаг. Большая маржа безопасна: контакт с
+     * pen<0 солвер трактует как «сближаться можно ровно на зазор», а не как
+     * «стоп» — поэтому лишние спекулятивные контакты не подвешивают тело,
+     * зато покоящийся контакт НЕ ПРОПАДАЕТ через такт (без этого шар дрожал
+     * на месте: контакт есть через такт, скорость гуляет 0.1–0.5 м/с). */
+    if (live) marg = 3.0 * ds_step(da, db) + length(A.vel_m.xyz - B.vel_m.xyz) * pc.prm0.x;
+    if (live) a_seed = da.step_pad.x <= db.step_pad.x;   /* затравки — по мелкому полю */
+
+    Best best;
+    best.gap = 1e30; best.p = vec3(0.0); best.n = vec3(0.0); best.ok = false;
+    if (live) {
+        uint is = a_seed ? ia : ib;
+        uint it = a_seed ? ib : ia;
+        SdfDesc ds = a_seed ? da : db;
+        SdfDesc dt = a_seed ? db : da;
+        Body Bs = a_seed ? A : B;
+        Body Bt = a_seed ? B : A;
+        best = scan(is, it, ds, dt, Bs, Bt, is * SDF_STRIDE, it * SDF_STRIDE, lane, marg);
+    }
+
+    /* Одна нормаль на пару: нормаль САМОГО ГЛУБОКОГО контакта. */
+    s_gap[lane] = best.ok ? best.gap : 1e30;
+    s_nrm[lane] = best.ok ? best.n : vec3(0.0);
+    barrier();
+
+    float g0 = 1e30;
+    vec3 n0 = vec3(0.0);
+    for (uint k = 0u; k < SEEDS; k++) {
+        float g = s_gap[k];
+        if (g < g0) { g0 = g; n0 = s_nrm[k]; }
+    }
+
+    if (!live || !best.ok || g0 >= 1e30) return;
+
+    /* Точки, далёкие от самой глубокой, не нужны: они дают момент вбок. */
+    float reach = g0 + ds_step(da, db) * 2.0;
+    if (best.gap > reach) return;
+
+    /* Нормаль считалась ОТ ЗАТРАВКИ к партнёру. Солвер ждёт нормаль ОТ ТЕЛА к
+     * партнёру (и по ней же берётся плечо импульса), поэтому при затравке из
+     * второго тела её надо развернуть. Раньше знак не разворачивался: у пары
+     * «плита (мелкая сетка) + шар» нормаль выходила НАРУЖУ, vn получалась
+     * положительной, dl = max(push - vn, 0) = 0 — солвер молчал, и шар
+     * проходил сквозь плиту при живых контактах в списке. */
+    vec3 n_ab = a_seed ? n0 : -n0;   /* от ia к ib */
+    push_contact(ia, ib, best.p, n_ab, -best.gap);
+    push_contact(ib, ia, best.p, -n_ab, -best.gap);
+
+    /* Пробуждение на месте — как в sat.comp (запись идемпотентна). */
+    if (sleep_a && length(B.vel_m.xyz) > 0.35) {
         A.misc.y = 0.0;
         A.misc.x = 0.0;
         A.vel_m.w = A.misc.z;
@@ -268,7 +367,7 @@ void main() {
         A.anchor = vec4(A.pos_r.xyz, 0.0);
         b[ia] = A;
     }
-    if (sleep_b && !sleep_a && sp_a > 0.35) {
+    if (sleep_b && length(A.vel_m.xyz) > 0.35) {
         B.misc.y = 0.0;
         B.misc.x = 0.0;
         B.vel_m.w = B.misc.z;

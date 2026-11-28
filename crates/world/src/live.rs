@@ -520,8 +520,22 @@ impl Live {
         };
         let mut gpu = gpu;
         /* Режим контактов задаётся здесь один раз: у мира и у устройства он
-         * обязан совпадать, иначе такт соберёт проходы одного режима. */
-        gpu.set_sdf_collide(matches!(std::env::var("VF_COLLIDE").as_deref(), Ok("sdf")));
+         * обязан совпадать, иначе такт соберёт проходы одного режима.
+         *
+         * ПО УМОЛЧАНИЮ — SDF-поля. Тет-путь (SAT) остаётся за VF_COLLIDE=gpu
+         * для сверки: он «жидкий» — тела проходят друг сквозь друга. */
+        let sdf_on = !matches!(std::env::var("VF_COLLIDE").as_deref(), Ok("gpu"));
+        gpu.set_sdf_collide(sdf_on);
+        if windowed {
+            println!(
+                "[контакты] путь: {}",
+                if sdf_on {
+                    "SDF-поля (по умолчанию; старый тет-путь — VF_COLLIDE=gpu)"
+                } else {
+                    "тет-путь SAT (VF_COLLIDE=gpu)"
+                }
+            );
+        }
         /* Пары тетов строятся ВНУТРИ такта одним submit'ом: отдельный submit с
          * ожиданием fence держал поток физики до GPU на каждом такте. */
         let gpu_pairs = std::env::var("VF_PAIRS").map(|v| v == "gpu").unwrap_or(false);
@@ -534,11 +548,12 @@ impl Live {
             next_id: 1 + (MAX_BODIES as u64),
             frames: 0,
             bullets: std::collections::VecDeque::new(),
-            gpu_collide: matches!(
-                std::env::var("VF_COLLIDE").as_deref(),
-                Ok("gpu") | Ok("sdf")
-            ),
-            sdf_collide: matches!(std::env::var("VF_COLLIDE").as_deref(), Ok("sdf")),
+            /* Контакты считает устройство в ОБОИХ режимах (меняется только
+             * проход: sdf_contact или sat). Раньше здесь стояло «окружение
+             * равно gpu|sdf», и с новым умолчанием (переменная не задана) мир
+             * молча уходил на CPU-солвер. */
+            gpu_collide: true,
+            sdf_collide: !matches!(std::env::var("VF_COLLIDE").as_deref(), Ok("gpu")),
             gpu_pairs,
             pairs_old,
             geom_dirty: true,
@@ -2082,6 +2097,56 @@ impl Live {
         self.refresh_vmax();
         self.last_awake = self.last_awake.max(1);
         true
+    }
+
+    /// Поставить в мир готовое тело (пробы и тесты): та же запись слота, что у
+    /// снаряда, но форма приходит снаружи. Поле берётся запечённое в `tb`
+    /// (без него SDF-контактам у тела нечего считать, и оно живёт только на
+    /// тет-пути).
+    pub fn spawn_tet(
+        &mut self,
+        tb: &TetBody,
+        pos: [f64; 3],
+        vel: [f64; 3],
+        kind: Kind,
+    ) -> Option<usize> {
+        let slot = self.free_slot()?;
+        let id = self.new_id();
+        let mut body = LiveBody {
+            id,
+            crack_after: 0,
+            pos,
+            quat: [1.0, 0.0, 0.0, 0.0],
+            vel,
+            mass: DENSITY * tb.volume(),
+            radius: 0.5,
+            tets: tb.tets.clone(),
+            origin: tb.origin,
+            level_cap: tb.level_cap,
+            sdf: tb.sdf.get().cloned(),
+            sdf_shift: [0.0; 3],
+            local: Vec::new(),
+            mesh: -1,
+            lines: -1,
+            kind,
+            alive: true,
+        };
+        body.rebuild();
+        body.radius = body.radius_of();
+        if slot < self.bodies.len() {
+            self.bodies[slot] = body;
+        } else {
+            self.bodies.push(body);
+        }
+        let gb = gpu_body(&self.bodies[slot]);
+        if !self.gpu_collide {
+            self.mirror[slot] = gb;
+        }
+        self.gpu.write_slots(&[(slot, gb)]);
+        self.geom_dirty = true;
+        self.refresh_vmax();
+        self.last_awake = self.last_awake.max(1);
+        Some(slot)
     }
 
     /// Сброс: снова один цельный объект.
