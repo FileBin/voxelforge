@@ -419,7 +419,10 @@ impl TetBody {
         let step = node_step(level);
         /* half - полшага: тогда ноль поля НЕ попадает в узлы решётки (иначе
          * значения в них ровно 0, срез вырождается и поверхность рвётся). */
-        let half = n as f32 * step - 0.5 * step;
+        /* Куб сдвинут на полшага относительно узлов: тогда ни одна грань и ни
+         * один угол не совпадают с узлом, и марчинг строит плоскость по
+         * четырём соседним узлам, а не «задевает краем вокселя» угол. */
+        let half = n as f32 * step;
         let nf = (half / step).ceil() as i32 + 6;
         let dim = (2 * nf + 1) as usize;
         let mut val = vec![0.0f32; dim * dim * dim];
@@ -427,9 +430,9 @@ impl TetBody {
             for y in -nf..=nf {
                 for x in -nf..=nf {
                     let q = [
-                        (x as f32).abs() - half / step,
-                        (y as f32).abs() - half / step,
-                        (z as f32).abs() - half / step,
+                        ((x as f32 - 0.5).abs()) - half / step,
+                        ((y as f32 - 0.5).abs()) - half / step,
+                        ((z as f32 - 0.5).abs()) - half / step,
                     ];
                     let outside = (q[0].max(0.0).powi(2) + q[1].max(0.0).powi(2)
                         + q[2].max(0.0).powi(2))
