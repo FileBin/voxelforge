@@ -1,0 +1,402 @@
+#version 450
+#include "common.glsl"
+
+/* CCD по SDF на устройстве — перенос crates/world/src/ccd.rs.
+ *
+ * Почему на GPU: раньше CPU читал ВЕСЬ буфер тел (зеркало поз), искал бисекцией
+ * первый момент касания и писал тела обратно. На такте касания это давало пик
+ * 33 мс — чтение поз, десятки тысяч выборок поля на CPU и обратная запись.
+ * Здесь позы не покидают устройство: шейдер сам двигает тело в позу касания,
+ * гасит нормальную скорость и пишет наружу СОБЫТИЕ (48 Б). CPU читает только
+ * событие — из него берётся энергия удара для раскола.
+ *
+ * Раскладка диспатча: одна рабочая группа (64 потока) на тело. Потоки вместе
+ * собирают пробные точки тела (узлы поля у поверхности, как `probe_points`),
+ * вместе ищут минимум зазора вдоль пути и вместе ведут бисекцию; решение и
+ * запись делает поток 0.
+ *
+ * Тот же закон, что на CPU:
+ *   * проба берётся с тела с МЕНЬШИМ полем (у него точки плотнее), и пара
+ *     считается ровно один раз — в группе этого тела;
+ *   * зазор g(s) = min по пробным точкам (f_партнёра(w) - глубина точки), s —
+ *     доля шага; g < 0 значит поверхности пересеклись;
+ *   * сферный трейсинг вперёд шагом g, потолок 64 шага; не сошёлся — грубый
+ *     равномерный проход (48 проб);
+ *   * бисекция найденного отрезка до 1e-3 шага, но не больше 12 итераций.
+ *
+ * Пара и оба её тела достаются ОДНОМУ претенденту (буфер claims, atomicCompSwap):
+ * иначе два тела, летящих навстречу, применили бы импульс дважды, а два разных
+ * удара в одно тело потеряли бы один из импульсов.
+ */
+
+layout(local_size_x = 64) in;
+
+/* Слов на слот в пуле значений — как `sim::SDF_STRIDE`. */
+const uint SDF_STRIDE = 65536u;
+/* Пробных точек на тело: столько же, сколько PROBE_POINTS на CPU. */
+const uint PROBES = 256u;
+const uint PER_LANE = PROBES / 64u;
+/* Потолки шагов — из ccd.rs: TRACE_STEPS = 48 (брифа — 64), SCAN_STEPS = 48. */
+const uint TRACE_STEPS = 64u;
+const uint SCAN_STEPS = 48u;
+const uint MAX_BISECT = 12u;
+const float T_TOL = 1e-3;
+/* Слов под претензии пар: 64 тела → 64*64 возможных пар. Тела лежат следом. */
+const uint PAIR_SLOTS = 4096u;
+
+layout(std430, set = 0, binding = 0) buffer Bodies { Body b[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Descs { SdfDesc descs[]; };
+layout(std430, set = 0, binding = 2) readonly buffer Values { float vals[]; };
+/* Кольцо событий: 3 vec4 на событие, формат как у impact.comp:
+ *   ev0 = (энергия Дж, тело, партнёр, t доли шага)
+ *   ev1 = (нормаль от тела к партнёру, глубина м)
+ *   ev2 = (точка касания, модуль импульса)
+ * Один формат на оба источника — CPU разбирает их одним кодом. */
+layout(std430, set = 0, binding = 3) buffer Events { vec4 ev[]; };
+layout(std430, set = 0, binding = 4) buffer EventCount { uint nevents; };
+layout(std430, set = 0, binding = 5) buffer Claims { uint claim[]; };
+
+shared vec4 s_probe[PROBES];   /* xyz — точка в системе тела, w — глубина м */
+shared vec4 s_pt[64];          /* мир: точка минимума зазора (w — зазор) */
+shared float s_val[8];
+
+vec3 qrot(vec4 q, vec3 v) {
+    vec3 u = q.yzw;
+    float w = q.x;
+    vec3 t = 2.0 * cross(u, v);
+    return v + w * t + cross(u, t);
+}
+vec3 qinv_rot(vec4 q, vec3 v) { return qrot(vec4(q.x, -q.yzw), v); }
+
+ivec3 dims_of(SdfDesc d) { return sdf_dims(d); }
+uint node_count(SdfDesc d) {
+    ivec3 dm = dims_of(d);
+    if (dm.x <= 0 || dm.y <= 0 || dm.z <= 0) return 0u;
+    return uint(dm.x) * uint(dm.y) * uint(dm.z);
+}
+
+/* Край поля — зажим, как NodeField::at на CPU (иначе на границе выборка
+ * улетает в чужой слот пула). */
+float at_node(SdfDesc d, uint base, ivec3 n) {
+    ivec3 dm = dims_of(d);
+    ivec3 c = clamp(n, ivec3(0), dm - ivec3(1));
+    uint i = (uint(c.z) * uint(dm.y) + uint(c.y)) * uint(dm.x) + uint(c.x);
+    return vals[base + i];
+}
+
+float sample_node(SdfDesc d, uint base, vec3 n) {
+    vec3 p = n - vec3(d.lo_dims.xyz);
+    vec3 f = floor(p);
+    vec3 t = p - f;
+    ivec3 i = ivec3(f);
+    float v000 = at_node(d, base, i + ivec3(0, 0, 0));
+    float v100 = at_node(d, base, i + ivec3(1, 0, 0));
+    float v010 = at_node(d, base, i + ivec3(0, 1, 0));
+    float v110 = at_node(d, base, i + ivec3(1, 1, 0));
+    float v001 = at_node(d, base, i + ivec3(0, 0, 1));
+    float v101 = at_node(d, base, i + ivec3(1, 0, 1));
+    float v011 = at_node(d, base, i + ivec3(0, 1, 1));
+    float v111 = at_node(d, base, i + ivec3(1, 1, 1));
+    float a = mix(mix(v000, v100, t.x), mix(v010, v110, t.x), t.y);
+    float c = mix(mix(v001, v101, t.x), mix(v011, v111, t.x), t.y);
+    return mix(a, c, t.z);
+}
+
+vec3 gradient_node(SdfDesc d, uint base, vec3 p) {
+    const float h = 0.5;
+    float gx = sample_node(d, base, p + vec3(h, 0, 0)) - sample_node(d, base, p - vec3(h, 0, 0));
+    float gy = sample_node(d, base, p + vec3(0, h, 0)) - sample_node(d, base, p - vec3(0, h, 0));
+    float gz = sample_node(d, base, p + vec3(0, 0, h)) - sample_node(d, base, p - vec3(0, 0, h));
+    return vec3(gx, gy, gz);
+}
+
+/* мир → узел (дробный) */
+vec3 world_to_node(Body bd, SdfDesc d, vec3 w) {
+    return (qinv_rot(bd.quat, w - bd.pos_r.xyz) - d.shift.xyz) / d.step_pad.x;
+}
+
+/* Значение поля тела в мировой точке, метры. */
+float value_at(Body bd, SdfDesc d, uint base, vec3 w) {
+    return sample_node(d, base, world_to_node(bd, d, w)) * d.step_pad.x;
+}
+
+/* Полуразмер габарита поля (метры) — «свой размер» для порога continuous. */
+float half_of(SdfDesc d) {
+    ivec3 dm = dims_of(d);
+    vec3 h = vec3(dm - ivec3(1)) * d.step_pad.x * 0.5;
+    return max(h.x, max(h.y, h.z));
+}
+
+/* --- фаза 1: пробные точки тела ------------------------------------------
+ * Узлы поля с отрицательным значением, ближайшие к поверхности. Каждый поток
+ * просматривает свою долю узлов и держит PER_LANE самых мелких по глубине:
+ * полная сортировка на GPU не нужна, а прореживание (как на CPU) заменяется
+ * тем, что узлы идут вразбивку по потокам. */
+void build_probes(SdfDesc d, uint base) {
+    ivec3 dm = dims_of(d);
+    uint total = uint(dm.x) * uint(dm.y) * uint(dm.z);
+    float bd[PER_LANE];
+    vec3 bp[PER_LANE];
+    for (uint k = 0u; k < PER_LANE; k++) {
+        bd[k] = 1e30;
+        bp[k] = vec3(0.0);
+    }
+    for (uint n = gl_LocalInvocationID.x; n < total; n += 64u) {
+        float v = vals[base + n];
+        if (v >= 0.0) continue;
+        float depth = -v * d.step_pad.x;
+        if (depth >= bd[PER_LANE - 1u]) continue;
+        ivec3 c = ivec3(int(n % uint(dm.x)),
+                        int((n / uint(dm.x)) % uint(dm.y)),
+                        int(n / (uint(dm.x) * uint(dm.y))));
+        vec3 local = d.shift.xyz + vec3(c + d.lo_dims.xyz) * d.step_pad.x;
+        int at = int(PER_LANE) - 1;
+        for (int k = int(PER_LANE) - 1; k >= 0; k--) {
+            if (depth < bd[k]) at = k;
+        }
+        for (int k = int(PER_LANE) - 1; k > at; k--) {
+            bd[k] = bd[k - 1];
+            bp[k] = bp[k - 1];
+        }
+        bd[at] = depth;
+        bp[at] = local;
+    }
+    for (uint k = 0u; k < PER_LANE; k++) {
+        s_probe[gl_LocalInvocationID.x * PER_LANE + k] = vec4(bp[k], bd[k]);
+    }
+}
+
+/* Зазор вдоль пути: минимум по пробным точкам (f_партнёра - глубина).
+ * Возвращает зазор в метрах и точку мира, где он минимален. base_j — слот
+ * партнёра в пуле значений. */
+void deepest(Body me, Body other, SdfDesc dj, uint base_j, float s,
+             out float over, out vec3 wp_out) {
+    uint lane = gl_LocalInvocationID.x;
+    vec3 pp = me.pos_r.xyz + me.vel_m.xyz * (pc.prm0.x * s);
+    vec3 op = other.pos_r.xyz + other.vel_m.xyz * (pc.prm0.x * s);
+    float best = 1e30;
+    vec3 bestw = pp;
+    for (uint k = 0u; k < PER_LANE; k++) {
+        vec4 pr = s_probe[lane * PER_LANE + k];
+        if (pr.w >= 1e29) continue;
+        vec3 wp = pp + qrot(me.quat, pr.xyz);
+        float ov = value_at(other, dj, base_j, wp) - pr.w;
+        if (ov < best) { best = ov; bestw = wp; }
+    }
+    s_pt[lane] = vec4(bestw, best);
+    barrier();
+    for (uint st = 32u; st > 0u; st >>= 1u) {
+        if (lane < st && s_pt[lane + st].w < s_pt[lane].w) s_pt[lane] = s_pt[lane + st];
+        barrier();
+    }
+    over = s_pt[0].w;
+    wp_out = s_pt[0].xyz;
+    barrier();
+}
+
+/* Решение по найденному касанию — только поток 0, без барьеров: все ранние
+ * выходы здесь локальные (иначе следующий barrier() встретит не все потоки). */
+void resolve(Body me, Body other, uint i, uint j, SdfDesc dj, float hi_s, vec3 w0,
+             float over0) {
+    Body a = b[i];
+    Body c = b[j];
+    float ima = a.misc.y > 0.5 ? a.misc.z : a.vel_m.w;
+    float iia = a.misc.y > 0.5 ? a.misc.w : a.ang_i.w;
+    float imb = c.misc.y > 0.5 ? c.misc.z : c.vel_m.w;
+    float iib = c.misc.y > 0.5 ? c.misc.w : c.ang_i.w;
+    if (ima <= 0.0 && imb <= 0.0) return;
+
+    /* поза пробного тела — в момент касания */
+    vec3 pos_a = a.pos_r.xyz + a.vel_m.xyz * (pc.prm0.x * hi_s);
+    vec3 pos_b = c.pos_r.xyz + c.vel_m.xyz * (pc.prm0.x * hi_s);
+
+    /* нормаль — из поля партнёра в точке, куда упёрлась поверхность пробного
+     * тела (не в его центре: центр может быть вне сетки) */
+    vec3 nd = world_to_node(c, dj, w0);
+    vec3 g = qrot(c.quat, gradient_node(dj, j * SDF_STRIDE, nd));
+    if (dot(g, g) < 1e-12) {
+        vec3 d = w0 - pos_b;
+        g = dot(d, d) > 1e-12 ? normalize(d) : vec3(0.0, 1.0, 0.0);
+    }
+    g = normalize(g);
+    vec3 nrm = -g;   /* от пробного тела к партнёру */
+
+    /* точка касания — центр пробного тела, спроецированный на поверхность
+     * партнёра вдоль нормали (4 шага Ньютона) */
+    vec3 q = pos_a;
+    for (int k = 0; k < 4; k++) {
+        q -= g * value_at(c, dj, j * SDF_STRIDE, q);
+    }
+
+    /* импульс — та же математика, что contact_impulse/solve.comp */
+    vec3 ra = q - pos_a;
+    vec3 rb = q - pos_b;
+    vec3 va = a.vel_m.xyz + cross(a.ang_i.xyz, ra);
+    vec3 vb = c.vel_m.xyz + cross(c.ang_i.xyz, rb);
+    float vn = dot(vb - va, nrm);
+    float energy = 0.0;
+    float jmag = 0.0;
+    if (vn < 0.0) {
+        float mu = (ima + imb) > 0.0 ? 1.0 / (ima + imb) : 0.0;
+        energy = 0.5 * mu * vn * vn;
+        vec3 ran = cross(ra, nrm);
+        vec3 rbn = cross(rb, nrm);
+        float wn = ima + imb + dot(ran, ran) * iia + dot(rbn, rbn) * iib;
+        if (wn > 0.0) {
+            jmag = -vn / wn;
+            vec3 imp = nrm * jmag;
+            a.vel_m.xyz -= imp * ima;
+            a.ang_i.xyz -= cross(ra, imp) * iia;
+            c.vel_m.xyz += imp * imb;
+            c.ang_i.xyz += cross(rb, imp) * iib;
+        }
+    }
+
+    a.pos_r.xyz = pos_a;
+    a.prev_pos_r.xyz = pos_a;
+    if (c.misc.y > 0.5) {
+        c.misc.y = 0.0;
+        c.misc.x = 0.0;
+        c.vel_m.w = c.misc.z;
+        c.ang_i.w = c.misc.w;
+        c.anchor = vec4(c.pos_r.xyz, 0.0);
+    }
+    b[i] = a;
+    b[j] = c;
+
+    uint slot = atomicAdd(nevents, 1u);
+    if (slot < uint(MAX_EVENTS)) {
+        ev[slot * 3u] = vec4(energy, float(i), float(j), hi_s);
+        ev[slot * 3u + 1u] = vec4(nrm, -over0);
+        ev[slot * 3u + 2u] = vec4(q, jmag);
+    }
+}
+
+void main() {
+    uint i = gl_WorkGroupID.x;
+    uint nbody = uint(pc.grid.w);
+    if (i >= nbody) return;
+    uint lane = gl_LocalInvocationID.x;
+
+    if (!(pc.hi.w > 0.5)) return;                 /* VF_CCD=0 */
+    SdfDesc di = descs[i];
+    uint ni = node_count(di);
+    if (ni == 0u) return;
+    Body me = b[i];
+    if (me.misc.y > 0.5) return;                  /* спящее тело не пробует */
+    float my_speed = length(me.vel_m.xyz);
+    float half_i = half_of(di);
+    if (half_i <= 0.0) return;
+    /* Порог тот же, что `needs_continuous` на CPU: относительное смещение за
+     * такт больше ДВУХ размеров тела. На 5 м/с CCD не включается — тело
+     * приходит в обычный проход контактов, как и раньше. */
+    if (my_speed * pc.prm0.x <= 2.0 * half_i) return;
+
+    /* --- есть ли вообще пара, которую стоит считать ------------------------
+     * Дешёвая проверка ДО сборки пробных точек: она зависит только от поз и
+     * скоростей, поля не касается. Нет пары — работа группы нулевая. */
+    if (lane == 0u) {
+        uint cnt = 0u;
+        for (uint j = 0u; j < nbody; j++) {
+            if (j == i) continue;
+            SdfDesc dj = descs[j];
+            uint nj = node_count(dj);
+            if (nj == 0u || nj < ni) continue;   /* пара — в группе меньшего поля */
+            Body other = b[j];
+            if (other.misc.y > 0.5 && me.misc.y > 0.5) continue;
+            float half_j = half_of(dj);
+            vec3 rel = other.vel_m.xyz - me.vel_m.xyz;
+            if (length(rel) * pc.prm0.x <= 2.0 * min(half_i, half_j)) continue;
+            vec3 vd = me.vel_m.xyz * pc.prm0.x;
+            vec3 w = other.pos_r.xyz - me.pos_r.xyz;
+            float dd = dot(vd, vd);
+            float tt = dd > 1e-12 ? clamp(dot(w, vd) / dd, 0.0, 1.0) : 0.0;
+            if (length(w - vd * tt) > (half_i + half_j) * 1.5 + 0.05) continue;
+            cnt++;
+        }
+        s_val[0] = float(cnt);
+    }
+    barrier();
+    if (s_val[0] < 0.5) return;
+
+    build_probes(di, i * SDF_STRIDE);
+    barrier();
+
+    for (uint j = 0u; j < nbody; j++) {
+        if (j == i) continue;
+        SdfDesc dj = descs[j];
+        uint nj = node_count(dj);
+        if (nj == 0u || nj < ni) continue;
+        Body other = b[j];
+        if (other.misc.y > 0.5 && me.misc.y > 0.5) continue;
+        float half_j = half_of(dj);
+        vec3 rel = other.vel_m.xyz - me.vel_m.xyz;
+        if (length(rel) * pc.prm0.x <= 2.0 * min(half_i, half_j)) continue;
+        vec3 vd = me.vel_m.xyz * pc.prm0.x;
+        vec3 w = other.pos_r.xyz - me.pos_r.xyz;
+        float dd = dot(vd, vd);
+        float tt = dd > 1e-12 ? clamp(dot(w, vd) / dd, 0.0, 1.0) : 0.0;
+        if (length(w - vd * tt) > (half_i + half_j) * 1.5 + 0.05) continue;
+
+        /* пара и оба тела — одному претенденту */
+        if (lane == 0u) {
+            uint ia = min(i, j);
+            uint ib = max(i, j);
+            uint pid = ia * 64u + ib;
+            bool ok = atomicCompSwap(claim[pid], 0u, 1u) == 0u;
+            ok = ok && atomicCompSwap(claim[PAIR_SLOTS + ia], 0u, 1u) == 0u;
+            ok = ok && atomicCompSwap(claim[PAIR_SLOTS + ib], 0u, 1u) == 0u;
+            s_val[1] = ok ? 1.0 : 0.0;
+        }
+        barrier();
+        if (s_val[1] < 0.5) continue;
+
+        float path = length(me.vel_m.xyz - other.vel_m.xyz) * pc.prm0.x;
+        float over0;
+        vec3 w0;
+        deepest(me, other, dj, j * SDF_STRIDE, 0.0, over0, w0);
+        if (path <= 1e-9 || over0 < 0.0) continue;   /* уже в контакте */
+
+        float lo_s = 0.0, hi_s = 0.0;
+        bool bracket = false;
+        float s = 0.0, prev = 0.0;
+        for (uint k = 0u; k < TRACE_STEPS; k++) {
+            float g;
+            vec3 ww;
+            deepest(me, other, dj, j * SDF_STRIDE, s, g, ww);
+            if (g < 0.0) { lo_s = prev; hi_s = s; bracket = true; break; }
+            /* шаг в долях пути: g метров — гарантированный запас до касания */
+            prev = s;
+            s += max(max(g, 1e-3) / path, 1e-6);
+            if (s >= 1.0) break;
+        }
+        if (!bracket) {
+            prev = 0.0;
+            for (uint k = 1u; k <= SCAN_STEPS; k++) {
+                s = float(k) / float(SCAN_STEPS);
+                float g;
+            vec3 ww;
+                deepest(me, other, dj, j * SDF_STRIDE, s, g, ww);
+                if (g < 0.0) { lo_s = prev; hi_s = s; bracket = true; break; }
+                prev = s;
+            }
+        }
+        if (!bracket) continue;
+
+        for (uint k = 0u; k < MAX_BISECT && (hi_s - lo_s) > T_TOL; k++) {
+            float mid = 0.5 * (lo_s + hi_s);
+            float g;
+            vec3 ww;
+            deepest(me, other, dj, j * SDF_STRIDE, mid, g, ww);
+            if (g < 0.0) hi_s = mid; else lo_s = mid;
+        }
+
+        /* зазор и точка минимума на найденной позе — глубина события */
+        float overh;
+        vec3 wh;
+        deepest(me, other, dj, j * SDF_STRIDE, hi_s, overh, wh);
+
+        /* решение — поток 0, без барьеров внутри (uniform-поток соблюдён) */
+        if (lane == 0u) resolve(me, other, i, j, dj, hi_s, wh, overh);
+    }
+}

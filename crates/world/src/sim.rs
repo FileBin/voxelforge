@@ -212,12 +212,15 @@ const P_SDFPAIRS: usize = 30;
 const P_STATWORK: usize = 31;
 const P_STATTIE: usize = 32;
 const P_STATEMIT: usize = 33;
+/// CCD по SDF на устройстве: зазор вдоль пути, сферный трейсинг, бисекция и
+/// событие касания в кольцо. Позы не покидают GPU.
+const P_CCD: usize = 34;
 
 /// Имена пайплайнов в порядке `pipes` — ТОТ ЖЕ порядок, что у `P_*` выше и у
 /// массива `names` на устройстве. По этому индексу ядро возвращает номер
 /// стадии в диагностике производительности, поэтому список — единственный
 /// источник правды и для загрузки, и для таблицы.
-pub const PIPE_NAMES: [&str; 34] = [
+pub const PIPE_NAMES: [&str; 35] = [
     "integrate",
     "clear",
     "count",
@@ -252,11 +255,12 @@ pub const PIPE_NAMES: [&str; 34] = [
     "static_work",
     "static_tie",
     "static_emit",
+    "ccd",
 ];
 /// Число storage-буферов у каждого пайплайна — в том же порядке.
-const PIPE_BUFNS: [u32; 34] = [
+const PIPE_BUFNS: [u32; 35] = [
     1, 2, 2, 3, 4, 2, 5, 4, 1, 1, 4, 4, 7, 3, 2, 4, 3, 6, 8, 6, 4, 1, 2, 3, 2, 2, 4, 8, 1, 7, 5, 6,
-    5, 6,
+    5, 6, 6,
 ];
 /// Ячеек на блок в параллельном скане (совпадает с 16 * 64 в шейдере).
 pub const SCAN_BLOCK: usize = 1024;
@@ -289,6 +293,9 @@ pub const SDF_STRIDE: usize = 65536;
 /// Потолок пар тел в широком проходе SDF (64 тела → 2016; совпадает с
 /// MAX_SDF_PAIRS в common.glsl).
 pub const MAX_SDF_PAIRS: usize = MAX_BODIES * (MAX_BODIES - 1) / 2;
+/// Слов под претензии CCD: пары (64×64) и следом тела (по одному на слот).
+/// Совпадает с PAIR_SLOTS в ccd.comp и сбрасывается в нули перед каждым тактом.
+pub const CCD_PAIR_SLOTS: usize = 4096;
 
 /// Контактов на тело. Было 24 — в плотной куче этого мало: часть контактов
 /// просто не попадала в список. Память: 64 тела x 64 контакта x 48 Б ≈ 200 КБ.
@@ -451,6 +458,12 @@ pub struct GpuSim {
     sdf_paircnt: *mut c_void,
     /// Контакты считает `sdf_contact` по полям вместо `sat` (VF_COLLIDE=sdf).
     pub sdf_collide: bool,
+    /// CCD по SDF на устройстве (по умолчанию включён; VF_CCD=0 выключает).
+    pub ccd: bool,
+    /// Претензии CCD: пары и тела. Сбрасывается в нули перед тактом.
+    ccd_claim: *mut c_void,
+    /// Готовые нули под сброс претензий (не аллоцируем каждый такт).
+    ccd_zero: Vec<u8>,
     lcount: *mut c_void,
     cellcnt: *mut c_void,
     starts: *mut c_void,
@@ -577,6 +590,9 @@ impl GpuSim {
         let sdf_vals = mk(MAX_BODIES * SDF_STRIDE * 4, true);
         let sdf_pairs = mk(MAX_SDF_PAIRS * 8, true);
         let sdf_paircnt = mk(4, true);
+        /* Претензии CCD: пары (4096) + тела (MAX_BODIES). Своя память, чтобы
+         * atomicCompSwap в шейдере никого не толкал локтем. */
+        let ccd_claim = mk((CCD_PAIR_SLOTS + MAX_BODIES) * 4, true);
         // Тела обязаны попасть на устройство до первого dispatch.
         unsafe {
             check_status(
@@ -698,6 +714,9 @@ impl GpuSim {
             /* По умолчанию — SAT (рабочий режим пользователя). VF_COLLIDE=sdf
              * переключает контакты на поля; старый путь остаётся для сверки. */
             sdf_collide: matches!(std::env::var("VF_COLLIDE").as_deref(), Ok("sdf")),
+            ccd: !matches!(std::env::var("VF_CCD").as_deref(), Ok("0")),
+            ccd_claim,
+            ccd_zero: vec![0u8; (CCD_PAIR_SLOTS + MAX_BODIES) * 4],
             lcount,
             cellcnt,
             starts,
@@ -853,7 +872,10 @@ impl GpuSim {
             /* lo.w — порог энергии раскола: отдельного vec4 в push-константах
              * нет (128 Б — гарантированный минимум), а это поле пустовало. */
             lo: [p.lo[0], p.lo[1], p.lo[2], FRACTURE_ENERGY],
-            hi: [p.hi[0], p.hi[1], p.hi[2], 0.0],
+            /* hi.w — флаг CCD (1 — считать контакты по SDF вдоль пути). Поле
+             * пустовало; body_init ставит сюда своё число записей в СВОЁМ
+             * push, поэтому они не сталкиваются. */
+            hi: [p.hi[0], p.hi[1], p.hi[2], if self.ccd { 1.0 } else { 0.0 }],
         }
     }
 
@@ -974,6 +996,18 @@ impl GpuSim {
                 vf_buffer_write(self.ctx, self.impact_cnt, 0, [0u8; 4].as_ptr() as *const c_void, 4);
                 /* статистика такта: 8 Б на запись и 8 Б на чтение */
                 vf_buffer_write(self.ctx, self.stat, 0, [0u8; 8].as_ptr() as *const c_void, 8);
+                if self.ccd {
+                    /* претензии прошлого такта — в ноль (16 КБ, memcpy в
+                     * отображённую память; без этого пары не считались бы
+                     * дважды, а не считались бы вовсе) */
+                    vf_buffer_write(
+                        self.ctx,
+                        self.ccd_claim,
+                        0,
+                        self.ccd_zero.as_ptr() as *const c_void,
+                        self.ccd_zero.len(),
+                    );
+                }
                 if self.sdf_collide {
                     /* счётчик пар тел — 4 Б; пары строятся один раз на такт
                      * (внутри такта позы меняются, но пересборка пар каждый
@@ -991,6 +1025,29 @@ impl GpuSim {
 
         let mut steps: Vec<Step> = Vec::new();
         let (a, b) = (self.bodies[0], self.bodies[1]);
+
+        /* CCD — ПЕРВЫМ: он двигает тело в позу касания и гасит нормальную
+         * скорость до того, как такт начнёт интегрировать. Позы при этом не
+         * покидают устройство: наружу уходит только событие (48 Б). */
+        if self.ccd {
+            /* CCD ищет касание вдоль ВСЕГО шага такта, а не подшага: такт потом
+             * дробится на подшаги, и тело, прошедшее партнёра за подшаг, снова
+             * окажется за ним. Push — с полным dt (на CPU-этапе было то же). */
+            let push_ccd = self.push(dt, g_body);
+            steps.push(Step {
+                pipe: P_CCD,
+                bufs: vec![
+                    a,
+                    self.sdf_desc,
+                    self.sdf_vals,
+                    self.impact_ring,
+                    self.impact_cnt,
+                    self.ccd_claim,
+                ],
+                push: push_ccd,
+                groups: [self.n as u32, 1, 1],
+            });
+        }
 
         /* Поза на начало такта: рендер интерполирует от неё, а не от снимка,
          * который CPU раньше читал обратно каждые 50 мс. */

@@ -89,7 +89,10 @@ fn surface_is_watertight_and_exact() {
 #[test]
 fn shatter_covers_all_tets() {
     let body = TetBody::cube([0.0, 1.0, 0.0], 3, 0);
-    let shards = body.shatter(12, 0xC0FF_EE00_1234);
+    /* `shatter` заменён на дробление ПО ПОЛЮ (`shatter_fields`), у которого
+     * затравки задаются явно; `shatter_biased` кладёт их вокруг точки удара.
+     * Точка удара здесь — центр тела, чтобы затравки разошлись равномерно. */
+    let shards = body.shatter_biased(12, 0xC0FF_EE00_1234, body.world_centroid());
     let total: usize = shards.iter().map(|s| s.tets.len()).sum();
     assert_eq!(total, body.tets.len(), "тетраэдры потерялись");
     assert!(shards.len() >= 6, "осколков мало: {}", shards.len());
