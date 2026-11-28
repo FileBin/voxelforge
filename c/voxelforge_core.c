@@ -7,13 +7,28 @@
  * с окном — это появится вместе с окном, а не раньше.
  */
 
+/* clock_gettime/CLOCK_MONOTONIC: -std=c11 без этого прячет POSIX-объявления в
+ * glibc, и сборка падает на «implicit declaration». Определять ДО первого
+ * системного заголовка. */
+#define _POSIX_C_SOURCE 199309L
+
 #include "voxelforge_core.h"
 
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <vulkan/vulkan.h>
+
+/* Настенное время CPU в миллисекундах: им меряются фазы кадра и такта
+ * (запись команд, замок, submit, fence). GPU-время — отдельно, таймстемпами. */
+static double vf_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
 
 #define VF_MAX_BINDINGS 16
 /* Сколько тактов может быть в полёте. 3 — с запасом: CPU успевает прочитать
@@ -64,6 +79,10 @@ struct vf_pass {
      * шейдером (на lavapipe это SIGSEGV в handle_descriptor_sets). Слот
      * сбрасывается только после того, как его fence закрылся. */
     VkDescriptorPool desc_pool[VF_FRAMES];
+    /* Стадии последнего submit'а этого потока (CPU, мс): запись команд,
+     * ожидание замка очереди, сам vkQueueSubmit и ожидание fence (режим
+     * «ждать сразу»). Хост читает их из таблицы диагностики. */
+    double st_record, st_lock, st_submit, st_fence;
 };
 
 struct vf_ctx {
@@ -109,6 +128,13 @@ struct vf_ctx {
     /* Очередь одна и на физику, и на кадр: submit'ы из двух потоков
      * взаимоисключающие. Fence ждём вне замка. */
     pthread_mutex_t lock;
+    /* Замки ОЧЕРЕДЕЙ: Vulkan требует внешней синхронизации VkQueue, но только
+     * внутри одной очереди. При двух очередях у каждого потока свой замок —
+     * кадр, стоящий в present (FIFO ждёт развёртку), больше не держит такт, а
+     * такт, записывающий 200+ диспатчей, не держит кадр. При одной очереди оба
+     * берут общий c->lock. */
+    pthread_mutex_t qlock[VF_STREAMS];
+
     char name[256];
     uint32_t api;
 };
@@ -143,6 +169,8 @@ vf_status vf_init_ext(vf_ctx **out, const char **inst_ext, uint32_t n_ext,
     vf_ctx *c = calloc(1, sizeof(*c));
     if (!c) return ERR(-1, "vmf: нет памяти под контекст");
     pthread_mutex_init(&c->lock, NULL);
+    for (uint32_t s = 0; s < VF_STREAMS; s++) pthread_mutex_init(&c->qlock[s], NULL);
+
 
     for (uint32_t i = 0; i < n_ext; i++) {
         if (!has_instance_ext(inst_ext[i])) {
@@ -222,11 +250,15 @@ vf_status vf_init_ext(vf_ctx **out, const char **inst_ext, uint32_t n_ext,
         c->prio_gfx = 1.0f;
         c->prio_tick = 1.0f;
         c->split = 0;
-        /* Две очереди включает VF_SPLIT (1 — да). По умолчанию путь прежний:
-         * одна очередь, кадр читает буфер физики напрямую — тот путь проверен
-         * окном, а окно из headless-сессии агента не поднять. */
-        const char *sp = getenv("VF_SPLIT");
-        int want_split = sp && strcmp(sp, "0") != 0 && strcmp(sp, "one") != 0;
+        /* Две очереди включены ПО УМОЛЧАНИЮ: на RADV у compute своё семейство
+         * (приоритет 0.0 против 1.0 у кадра), и кадр перестаёт стоять за
+         * тактом. Пользователь запускает `nix run .#live` без переменных, так
+         * что новое поведение обязано быть дефолтом, а флаг остаётся на СТАРЫЙ
+         * путь для сравнения: VF_QUEUES=one (или VF_SPLIT=0). */
+        const char *qenv = getenv("VF_QUEUES");
+        const char *sp = qenv ? qenv : getenv("VF_SPLIT");
+        int want_split = 1;
+        if (sp) want_split = !(strcmp(sp, "0") == 0 || strcmp(sp, "one") == 0);
         if (!want_split) {
             c->tick_family = c->family;
         } else if (!gfx_is_fallback && tick >= 0) {
@@ -413,6 +445,7 @@ void vf_shutdown(vf_ctx *c) {
     if (c->dev) vkDestroyDevice(c->dev, NULL);
     if (c->instance) vkDestroyInstance(c->instance, NULL);
     pthread_mutex_destroy(&c->lock);
+    for (uint32_t s = 0; s < VF_STREAMS; s++) pthread_mutex_destroy(&c->qlock[s]);
     free(c);
 }
 
@@ -452,6 +485,45 @@ void *vf_ctx_queue(vf_ctx *c) { return c->queue; }
 uint32_t vf_ctx_family(vf_ctx *c) { return c->family; }
 void vf_ctx_lock(vf_ctx *c) { pthread_mutex_lock(&c->lock); }
 void vf_ctx_unlock(vf_ctx *c) { pthread_mutex_unlock(&c->lock); }
+
+/* Замок ОЧЕРЕДИ потока. Vulkan требует внешней синхронизации VkQueue, но не
+ * между разными очередями. При двух очередях у такта и кадра свои замки:
+ * кадр, стоящий в present (FIFO ждёт развёртку), больше не блокирует submit
+ * такта, а долгая запись такта не блокирует кадр. При одной очереди очередь
+ * одна — берём общий замок, как раньше. */
+void vf_queue_lock(vf_ctx *c, uint32_t stream) {
+    if (!c) return;
+    if (c->split && stream < VF_STREAMS)
+        pthread_mutex_lock(&c->qlock[stream]);
+    else
+        pthread_mutex_lock(&c->lock);
+}
+void vf_queue_unlock(vf_ctx *c, uint32_t stream) {
+    if (!c) return;
+    if (c->split && stream < VF_STREAMS)
+        pthread_mutex_unlock(&c->qlock[stream]);
+    else
+        pthread_mutex_unlock(&c->lock);
+}
+
+/* Стадии последнего submit'а потока, мс: запись команд, ожидание замка
+ * очереди, vkQueueSubmit, ожидание fence. 0 — submit'а ещё не было. */
+void vf_submit_stats(vf_ctx *c, uint32_t stream, float *record_ms, float *lock_ms,
+                     float *submit_ms, float *fence_ms) {
+    if (!c || stream >= VF_STREAMS) {
+        if (record_ms) *record_ms = 0.0f;
+        if (lock_ms) *lock_ms = 0.0f;
+        if (submit_ms) *submit_ms = 0.0f;
+        if (fence_ms) *fence_ms = 0.0f;
+        return;
+    }
+    struct vf_pass *q = &c->q[stream];
+    if (record_ms) *record_ms = (float)q->st_record;
+    if (lock_ms) *lock_ms = (float)q->st_lock;
+    if (submit_ms) *submit_ms = (float)q->st_submit;
+    if (fence_ms) *fence_ms = (float)q->st_fence;
+}
+
 
 vf_status vf_device_info(vf_ctx *c, char *name, size_t name_len, uint32_t *api_version) {
     if (!c) return ERR(-1, "нет контекста");
@@ -651,7 +723,9 @@ static vf_status submit(vf_ctx *c, vf_dispatch *list, uint32_t count, uint32_t s
     vkResetDescriptorPool(c->dev, q->desc_pool[slot], 0);
     vkResetCommandBuffer(q->cb[slot], 0);
 
+    double t_rec = vf_now_ms();
     VkCommandBuffer cb = q->cb[slot];
+
 
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -785,18 +859,27 @@ static vf_status submit(vf_ctx *c, vf_dispatch *list, uint32_t count, uint32_t s
     }
 
     VkQueue vkq = stream == VF_TICK ? c->tick_queue : c->queue;
-    /* Submit'ы потоков взаимоисключающие (одна очередь или две — замок общий,
-     * сама отправка занимает микросекунды); ожидание fence — ВНЕ замка. */
-    vf_ctx_lock(c);
+    /* Submit'ы ОДНОЙ очереди взаимоисключающие: при двух очередях у каждого
+     * потока свой замок, при одной — общий (см. vf_queue_lock). Ожидание fence —
+     * ВНЕ замка. */
+    q->st_record = vf_now_ms() - t_rec;
+    double t_lock = vf_now_ms();
+    vf_queue_lock(c, stream);
+    q->st_lock = vf_now_ms() - t_lock;
+    double t_sub = vf_now_ms();
     vkResetFences(c->dev, 1, &q->fence[slot]);
     VkResult sres = vkQueueSubmit(vkq, 1, &si, q->fence[slot]);
-    vf_ctx_unlock(c);
+    q->st_submit = vf_now_ms() - t_sub;
+    vf_queue_unlock(c, stream);
     if (sres != VK_SUCCESS)
         return ERR(-7, "vulkan: submit провалился");
     q->submitted++;
+    q->st_fence = 0.0;
     if (wait_now) {
+        double t_f = vf_now_ms();
         if (vkWaitForFences(c->dev, 1, &q->fence[slot], VK_TRUE, UINT64_MAX) != VK_SUCCESS)
             return ERR(-8, "vulkan: fence не дождались");
+        q->st_fence = vf_now_ms() - t_f;
     }
     return OK;
 }

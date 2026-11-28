@@ -71,6 +71,17 @@ vf_status vf_idle(vf_ctx *c);
 void vf_ctx_lock(vf_ctx *c);
 void vf_ctx_unlock(vf_ctx *c);
 
+/* Замок ОЧЕРЕДИ потока: при двух очередях (c->split) кадр и такт берут свои,
+ * при одной — общий. Брать вокруг submit/present СВОЕЙ очереди; ожидание fence
+ * и acquire — вне замка. */
+void vf_queue_lock(vf_ctx *c, uint32_t stream);
+void vf_queue_unlock(vf_ctx *c, uint32_t stream);
+
+/* Стадии последнего submit'а потока, мс: запись команд, ожидание замка,
+ * vkQueueSubmit, ожидание fence. Для таблицы «фазы такта на CPU». */
+void vf_submit_stats(vf_ctx *c, uint32_t stream, float *record_ms, float *lock_ms,
+                     float *submit_ms, float *fence_ms);
+
 void vf_shutdown(vf_ctx *c);
 vf_status vf_device_info(vf_ctx *c, char *name, size_t name_len,
                          uint32_t *api_version);
