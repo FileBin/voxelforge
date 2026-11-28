@@ -85,6 +85,8 @@ unsafe extern "C" {
         tick_max_ms: f32,
         scene: *const VfSceneCounts,
     );
+    /// Строка CCD под таблицей стадий (CPU-время прохода, не стадия GPU).
+    fn vf_view_ccd(v: *mut c_void, line: *const c_char);
 }
 
 // ---------------------------------------------------------------- матрицы
@@ -261,6 +263,8 @@ struct Shared {
     perf_tick: (f32, f32, f32),
     /// Счётчики сцены: всего тел, бодрствующих, точек контакта.
     perf_scene: VfSceneCounts,
+    /// Строка CCD (CPU-фазы прохода) для панели диагностики.
+    ccd_line: String,
     log: String,
 }
 
@@ -287,6 +291,7 @@ struct SnapOut {
     perf_rows: Vec<VfPerfRow>,
     perf_tick: (f32, f32, f32),
     perf_scene: VfSceneCounts,
+    ccd_line: String,
     log: String,
     near: f32,
     far: f32,
@@ -389,6 +394,7 @@ impl Sim {
             perf_rows: Vec::new(),
             perf_tick: (0.0, 0.0, 0.0),
             perf_scene: VfSceneCounts::default(),
+            ccd_line: String::new(),
             log: String::new(),
         }));
         let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
@@ -472,9 +478,11 @@ impl Sim {
                             g.perf_rows = live.gpu.perf_overlay();
                             g.perf_tick = live.gpu.perf_tick_range();
                             g.perf_scene = live.gpu.perf_scene();
+                            g.ccd_line = live.ccd_stat.line.clone();
                         } else {
                             g.perf_rows.clear();
                             g.perf_scene = VfSceneCounts::default();
+                            g.ccd_line.clear();
                         }
                         if !live.last_log.is_empty() {
                             g.log = std::mem::take(&mut live.last_log);
@@ -583,6 +591,7 @@ impl Sim {
                     perf_rows: if l.gpu.perf_on() { l.gpu.perf_overlay() } else { Vec::new() },
                     perf_tick: l.gpu.perf_tick_range(),
                     perf_scene: l.gpu.perf_scene(),
+                    ccd_line: if l.gpu.perf_on() { l.ccd_stat.line.clone() } else { String::new() },
                     log: String::new(),
                     near: l.near,
                     far: l.far,
@@ -638,6 +647,7 @@ impl Sim {
                     perf_rows: g.perf_rows.clone(),
                     perf_tick: g.perf_tick,
                     perf_scene: g.perf_scene,
+                    ccd_line: g.ccd_line.clone(),
                     log: std::mem::take(&mut g.log),
                     near: 0.0,
                     far: 60.0,
@@ -1064,6 +1074,16 @@ fn main() {
                 out.perf_tick.1,
                 out.perf_tick.2,
                 &out.perf_scene,
+            );
+            /* Строка CCD: CPU-фазы прохода, отдельно от стадий GPU. */
+            let ccd = std::ffi::CString::new(out.ccd_line.as_str()).unwrap_or_default();
+            vf_view_ccd(
+                view,
+                if out.perf_on && !out.ccd_line.is_empty() {
+                    ccd.as_ptr()
+                } else {
+                    std::ptr::null()
+                },
             );
             vf_view_end(view);
         }

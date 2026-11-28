@@ -71,6 +71,8 @@ struct vf_view {
     /* Строка тел/контактов под таблицей; scene_ok == 0 — не рисовать. */
     vf_scene_counts perf_scene;
     int perf_scene_ok;
+    int ccd_ok;                /* есть строка CCD (CPU-время прохода) */
+    char ccd_line[128];
     /* Оверлей запрошен этим кадром (F3 / VF_PERF), даже если данных ещё нет:
      * тогда панель показывает «ждём такт», а не исчезает молча. */
     int perf_show;
@@ -1117,7 +1119,7 @@ static void draw_perf_overlay(vf_view *v) {
     const float x0 = 10.0f, y0 = 10.0f, w = 620.0f;
     uint32_t nrows = v->perf_n;
     /* Шапка + строки стадий + строка ИТОГО такта (+ строка тел, если есть). */
-    float h = 30.0f + lh * (float)(nrows ? nrows + 2 + (v->perf_scene_ok ? 1 : 0) : 1) + 8.0f;
+    float h = 30.0f + lh * (float)(nrows ? nrows + 2 + (v->perf_scene_ok ? 1 : 0) + (v->ccd_ok ? 1 : 0) : 1) + 8.0f;
     ui_quad(v, x0, y0, w, h, bg);
 
     char line[96];
@@ -1201,6 +1203,14 @@ static void draw_perf_overlay(vf_view *v) {
         ui_text(v, x0 + 12, y + 4, sc, head, line);
     }
 
+    /* CCD на CPU: отдельной строкой — в стадии GPU он не попадает. */
+    if (v->ccd_ok) {
+        float y = yhead + lh * (float)(nrows + 2 + (v->perf_scene_ok ? 1 : 0));
+        char cl[160];
+        snprintf(cl, sizeof cl, "%.120s", v->ccd_line);
+        ui_text(v, x0 + 12, y + 4, sc, text, cl);
+    }
+
     vkCmdBindPipeline(v->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v->pipe_ui);
     VkDeviceSize off = 0;
     vkCmdBindVertexBuffers(v->cmd, 0, 1, &v->ui_vbuf, &off);
@@ -1225,6 +1235,16 @@ void vf_view_perf(vf_view *v, const vf_perf_row *rows, uint32_t n,
     if (n > VF_PERF_MAX_ROWS) n = VF_PERF_MAX_ROWS;
     memcpy(v->perf_rows, rows, (size_t)n * sizeof(*rows));
     v->perf_n = n;
+}
+
+void vf_view_ccd(vf_view *v, const char *line) {
+    if (!v) return;
+    v->ccd_ok = line != NULL;
+    if (!line) {
+        v->ccd_line[0] = '\0';
+        return;
+    }
+    snprintf(v->ccd_line, sizeof(v->ccd_line), "%s", line);
 }
 
 void vf_view_end(vf_view *v) {
