@@ -1552,6 +1552,10 @@ impl GpuSim {
             };
             stage.extend_from_slice(bytes);
         }
+        /* Запись в host-visible память, которую в этот момент читает GPU
+         * (такт отправляется асинхронно), — гонка: на RADV такие записи
+         * роняли процесс. Это событие, а не такт, поэтому ждём устройство. */
+        self.wait_idle();
         self.bytes_up += (n * BODY_BYTES) as u64;
         let mut push = self.push(0.0, 0);
         push.hi[3] = n as f32;
