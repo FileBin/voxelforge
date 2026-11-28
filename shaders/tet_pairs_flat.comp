@@ -39,6 +39,9 @@ layout(std430, set = 0, binding = 8) buffer CellId { uint cellid[]; };
  * писалось за границу буфера — в соседнюю раскладку сетки, — а SAT читал
  * этот мусор как пары. */
 const uint MAX_PAIRS = 65536u;
+/* Потолок записей раскладки — ровно размер `cell_tets`/`cellid`
+ * (sim::MAX_CELL_TETS). Больше tet_fill всё равно не пишет. */
+const uint MAX_CELL_TETS = 262144u;
 
 vec3 qrot(vec4 q, vec3 v) {
     vec3 u = q.yzw;
@@ -68,7 +71,10 @@ void main() {
     if (idx >= total) return;
 
     uint c = cellid[idx]; /* O(1): ячейку записал tet_fill */
-    uint e = start[c + 1u];
+    /* Потолок записей — как у tet_fill: если раскладка переполнена, хвост
+     * ячейки в буфер не попал, и читать его нельзя (это был бы выход за
+     * буфер, то есть GPUVM fault на RADV). */
+    uint e = min(start[c + 1u], MAX_CELL_TETS);
     /* Дальше в ячейке записей нет — пар у этой не будет. */
     if (idx + 1u >= e) return;
 
