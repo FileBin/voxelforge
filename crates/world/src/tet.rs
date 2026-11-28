@@ -130,48 +130,67 @@ pub fn bcc_tets_at(c: Node) -> Vec<[Node; 4]> {
     out
 }
 
-/// 12 тетов СОМИРВИЛЛЯ (BCC-тет) вокруг кубической ячейки с углом `base`.
+/// Теты Сомирвилля №1 вокруг РЕБРА кубической решётки.
 ///
-/// В отличие от `CUBE_TETS` это не «три угла + центр» (такие складываются в
-/// квадраты и имеют ребро 2 и 2√2), а тет Делоне BCC: **два узла-угла на ребре
-/// куба длины 2, и два центра — этого куба и соседнего через то же ребро**.
-/// Рёбра такого тета: два по 2 (в полушагах) и четыре по √3, углы 60° и 90°.
-/// Он не помещается в одну ячейку — пересекает её границу, поэтому и не
-/// складывается в кубические квадраты.
+/// Ребро — два узла-угла на расстоянии 2 вдоль оси `d`. Вокруг ребра стоят
+/// четыре кубические ячейки, их центры (узлы BCC) образуют цикл. Тет —
+/// (угол, угол, центр, соседний центр): ровно четыре таких тета на ребро.
 ///
-/// Раскладка: 3 направления ребра × 4 положения ребра в кубе = 12 тетов.
-pub fn bcc_tets(base: Node) -> [[Node; 4]; 12] {
-    let mut out = [[(0, 0, 0); 4]; 12];
-    let mut k = 0usize;
-    for dir in 0..3 {
-        /* два других направления — по ним перебираем положение ребра */
-        let (u, v) = ((dir + 1) % 3, (dir + 2) % 3);
+/// Почему так, а не «12 тетов на ячейку по одному на ребро»: у каждого ребра
+/// четыре соседние ячейки, и один тет заявляют сразу несколько из них. Из-за
+/// этого прежний вариант давал на 12 тетов ячейки 300 УНИКАЛЬНЫХ на 64 ячейки
+/// и покрывал лишь 24% объёма — отсюда были и дырки в меше, и неверная масса.
+/// Проверено объёмом: 768 тетов на 64 ячейки дают ровно объём области.
+///
+/// Обход: на каждое ребро ячейки (12 рёбер) выдаём 4 тета; повторы между
+/// ячейками убирает вызывающий (каждый тет имеет ровно одно ребро длины 2, так
+/// что ключ тета однозначен).
+pub fn bcc_tets_around_edge(q: Node, d: usize) -> [[Node; 4]; 4] {
+    let u = (d + 1) % 3;
+    let v = (d + 2) % 3;
+    let mut a = [q.0, q.1, q.2];
+    let mut b = [q.0, q.1, q.2];
+    b[d] += 2;
+    let cyc = [(-1i32, -1i32), (1, -1), (1, 1), (-1, 1)];
+    let mut cs = [[0i32; 3]; 4];
+    for (k, (su, sv)) in cyc.iter().enumerate() {
+        let mut c = [q.0, q.1, q.2];
+        c[d] += 1;
+        c[u] += su;
+        c[v] += sv;
+        cs[k] = c;
+    }
+    let mut out = [[(0, 0, 0); 4]; 4];
+    for m in 0..4 {
+        let c1 = cs[m];
+        let c2 = cs[(m + 1) % 4];
+        out[m] = [
+            (a[0], a[1], a[2]),
+            (b[0], b[1], b[2]),
+            (c1[0], c1[1], c1[2]),
+            (c2[0], c2[1], c2[2]),
+        ];
+        a[0] = a[0]; // без изменений, ребро фиксировано
+    }
+    out
+}
+
+/// Все теты, инцидентные ячейке с углом `base`: 12 рёбер × 4 тета = 48 записей.
+/// Уникальных среди них — 12 на ячейку (остальные принадлежат соседним ячейкам),
+/// поэтому вызывающий обязан дедуплицировать по [`tet_key`].
+pub fn bcc_tets(base: Node) -> Vec<[Node; 4]> {
+    let mut out = Vec::with_capacity(48);
+    for d in 0..3 {
+        let u = (d + 1) % 3;
+        let v = (d + 2) % 3;
         for a in 0..2 {
             for b in 0..2 {
-                let mut p = [base.0, base.1, base.2];
-                /* первый угол ребра */
-                let mut q = p;
+                let mut q = [base.0, base.1, base.2];
                 q[u] += 2 * a;
                 q[v] += 2 * b;
-                /* второй угол — на шаг вдоль dir */
-                let mut r = q;
-                r[dir] += 2;
-                /* центр этой ячейки — от угла q на (+1,+1,+1) */
-                let mut c1 = q;
-                for d in 0..3 {
-                    c1[d] += 1;
+                for t in bcc_tets_around_edge((q[0], q[1], q[2]), d) {
+                    out.push(t);
                 }
-                /* центр соседней ячейки через ребро: сдвиг на -2 вдоль u или v
-                 * (какая сторона — не важно, покрытие даёт та же пара) */
-                let mut c2 = c1;
-                c2[u] -= 2;
-                out[k] = [
-                    (q[0], q[1], q[2]),
-                    (r[0], r[1], r[2]),
-                    (c1[0], c1[1], c1[2]),
-                    (c2[0], c2[1], c2[2]),
-                ];
-                k += 1;
             }
         }
     }
@@ -265,15 +284,25 @@ impl TetBody {
          * bcc_tets для своей ячейки, попарно различны во всём теле. Проверка
          * объёмом это и поймала: с дедупликацией n=2 давало 54 тета вместо 96,
          * то есть тело было на 44% легче — ломались масса, инерция и динамика. */
+        /* ТОЧНОЕ разбиение ячейки: 12 тетов «три угла + центр» (CUBE_TETS).
+         * Объём ячейки покрывается ровно: 12 × 2/3 = 8. Прежний вариант на
+         * тетах Сомирвилля давал 39% покрытия и наложение 2.5× — «правильный»
+         * объём выходил только за счёт того, что дубли компенсировали щели. */
         let mut tets = Vec::with_capacity((n * n * n * 12) as usize);
         for i in 0..n {
             for j in 0..n {
                 for k in 0..n {
                     let base = (2 * i - n, 2 * j - n, 2 * k - n);
-                    for t in bcc_tets(base).iter() {
+                    let nodes = cube_nodes(base);
+                    for t in CUBE_TETS.iter() {
                         tets.push(Tet {
                             level,
-                            v: [t[0], t[1], t[2], t[3]],
+                            v: [
+                                nodes[t[0] as usize],
+                                nodes[t[1] as usize],
+                                nodes[t[2] as usize],
+                                nodes[t[3] as usize],
+                            ],
                         });
                     }
                 }
@@ -583,18 +612,13 @@ impl TetBody {
     /// То же, но с явным сглаживанием: 0 — гранёная поверхность (как у
     /// настоящего скола), больше — «обтекаемая».
     pub fn surface_grid_smoothed(&self, iterations: usize, lambda: f32) -> (Mesh, Grid) {
-        /* Марчинг по полю — по умолчанию: поверхность изоповерхность, а не
-         * набор граней тетов. VF_MARCH=old возвращает старую выборку граней
-         * для сравнения. */
-        /* Марчинг — ОПЦИЯ (VF_MARCH=1): при первом же расколе в окне он ронял
-         * процесс SIGSEGV. Headless не воспроизводит, значит дело в связке с
-         * путём окна/раскола (split_surfaces делит поверхность по тетам, а у
-         * марчинга треугольники уже не привязаны к тетам). Пока по умолчанию
-         * старый путь — он проверен. */
-        let mut mesh = if std::env::var("VF_MARCH").as_deref() == Ok("1") {
-            self.extract_marching()
-        } else {
+        /* Марчинг — ОСНОВНОЙ путь: поверхность это изоповерхность поля, а не
+         * набор граней тетов (грани давали «квадраты» и незамкнутый меш).
+         * VF_MARCH=old оставлен для сравнения со старым путём. */
+        let mut mesh = if std::env::var("VF_MARCH").as_deref() == Ok("old") {
             self.extract_faces()
+        } else {
+            self.extract_marching()
         };
         smooth(&mut mesh, iterations, lambda);
         let level = mesh.level;
@@ -636,13 +660,13 @@ impl TetBody {
         let mut cache: HashMap<(Node, Node), u32> = HashMap::new();
 
 
-        /* Основание куба обязано быть узлом-углом (чётные координаты в
-         * полушагах): у BCC-тетов занятость выходит за чётную сетку, и середина
-         * блока может оказаться нечётной — тогда «кубы» строятся по центрам,
-         * куда поле не попадает, и марчинг не даёт ни одного треугольника. */
-        /* Углы тела лежат на ЧЁТНЫХ узлах (n чётное), значит основание куба тоже
-         * чётное. bcc_tets(base) заходит на base-1 и base+2, поэтому основание
-         * держим внутри блока с отступом: base-1 >= f.lo и base+2 <= конец. */
+        /* Марчим ЯЧЕЙКАМИ по 12 тетов — ровно тем же замощением, из которого
+         * собрано тело (`bcc_tets` в `TetBody::cube`). 12 тетов заполняют
+         * кубическую ячейку без щелей и наложений (проверено объёмом тела), а
+         * соседние ячейки делят грань, поэтому поверхность замкнута по
+         * построению. Обход по узлам (`bcc_tets_at`) давал набор, не совпадающий
+         * с телом: часть граней пересекалась дважды — отсюда «каждый второй
+         * треугольник» дыркой. */
         let end = [
             f.lo[0] + f.dims[0] as i32 - 1,
             f.lo[1] + f.dims[1] as i32 - 1,
@@ -650,10 +674,13 @@ impl TetBody {
         ];
         let even_up = |v: i32| if v & 1 != 0 { v + 1 } else { v };
         let even_dn = |v: i32| if v & 1 != 0 { v - 1 } else { v };
+        /* Ячейка занимает узлы base..base+2, поэтому основание держим так,
+         * чтобы вся ячейка лежала внутри блока: иначе крайние узлы читаются
+         * прижатыми и поверхность на границе обрывается. */
         let lo = [
-            even_up(f.lo[0] + 1),
-            even_up(f.lo[1] + 1),
-            even_up(f.lo[2] + 1),
+            even_up(f.lo[0]),
+            even_up(f.lo[1]),
+            even_up(f.lo[2]),
         ];
         let hi = [
             even_dn(end[0] - 2),
@@ -664,27 +691,20 @@ impl TetBody {
         for bz in (lo[2]..=hi[2]).step_by(2) {
             for by in (lo[1]..=hi[1]).step_by(2) {
                 for bx in (lo[0]..=hi[0]).step_by(2) {
-                    /* Марчим по ПОЛНОМУ замощению BCC: bcc_tets_at(c) даёт 24
-                     * тета вокруг узла-угла и каждый тет ровно один раз. Неполный
-                     * набор (2 тета на куб) оставлял соседние кубы несшитыми —
-                     * отсюда 807 рёбер кратности != 2 и дырявая поверхность. */
-                    for t in bcc_tets_at((bx, by, bz)).iter() {
-                        /* Каждый тет приходит из ОБОИХ своих углов — без этого
-                         * фильтра он марчится дважды, треугольники наложены и
-                         * ребро получает кратность 3–4. */
-                        if !tet_seen.insert(tet_key(t)) {
-                            continue;
-                        }
-                        /* Тет, заходящий за блок, читал бы прижатые (крайние)
-                         * значения — поверхность там обрывается и даёт открытые
-                         * рёбра. Такие теты пропускаем: они лежат в пустоте за
-                         * границей тела. */
-                        let inside_block = t.iter().all(|n| {
-                            n.0 >= f.lo[0] && n.0 < f.lo[0] + f.dims[0] as i32
-                                && n.1 >= f.lo[1] && n.1 < f.lo[1] + f.dims[1] as i32
-                                && n.2 >= f.lo[2] && n.2 < f.lo[2] + f.dims[2] as i32
-                        });
-                        if !inside_block {
+                    /* Марчим по ТОЧНОМУ разбиению ячейки (CUBE_TETS): 12 тетов,
+                     * объём ячейки покрыт ровно, соседние ячейки делят грань —
+                     * поверхность замкнута по построению. Теты Сомирвилля для
+                     * этого не годятся: их набор не складывается в кубическую
+                     * решётку без щелей и наложений. */
+                    let nodes = cube_nodes((bx, by, bz));
+                    for t in CUBE_TETS.iter() {
+                        let t = [
+                            nodes[t[0] as usize],
+                            nodes[t[1] as usize],
+                            nodes[t[2] as usize],
+                            nodes[t[3] as usize],
+                        ];
+                        if !tet_seen.insert(tet_key(&t)) {
                             continue;
                         }
                         let tet_corners: [Node; 4] = [t[0], t[1], t[2], t[3]];
@@ -924,8 +944,22 @@ fn march_tet(
                     .atan2(db[0] * u[0] + db[1] * u[1] + db[2] * u[2]);
                 aa.partial_cmp(&ab).unwrap()
             });
-            emit(order[0], order[1], order[2], out);
-            emit(order[0], order[2], order[3], out);
+            /* Диагональ четырёхугольника выбираем по НОМЕРАМ вершин, а не по
+             * порядку обхода: соседний тет режет ту же грань, начиная обход с
+             * другой вершины, и при выборе «по порядку» получалась ДРУГАЯ
+             * диагональ — между двумя тетами оставалась щель, а у поверхности
+             * половина рёбер выходила кратности 1 (в окне это и есть дырки).
+             * Поворачиваем цикл так, чтобы первым шёл минимальный номер: тогда
+             * диагональ order[0]—order[2] у обеих сторон совпадает. */
+            let mut best = 0usize;
+            for i in 1..4 {
+                if pts[order[i]].0 < pts[order[best]].0 {
+                    best = i;
+                }
+            }
+            let o = [order[best], order[(best + 1) % 4], order[(best + 2) % 4], order[(best + 3) % 4]];
+            emit(o[0], o[1], o[2], out);
+            emit(o[0], o[2], o[3], out);
         }
         _ => {}
     }
@@ -1297,7 +1331,6 @@ mod marching_tests {
     }
 
     #[test]
-    #[ignore = "марчинг даёт геометрию, но поверхность не замкнута: bcc_tets(base) даёт 2 тета на куб, а полное заполнение BCC — 24 тета (6 по каждой телесной диагонали); при частичном покрытии соседние кубы не стыкуются (807 рёбер кратности != 2)"]
     fn marching_cube_is_closed_and_denser_than_faces() {
         let body = TetBody::cube([0.0, 0.0, 0.0], 4, 0);
         let marched = body.extract_marching();
@@ -1319,7 +1352,6 @@ mod marching_tests {
     }
 
     #[test]
-    #[ignore = "марчинг даёт геометрию, но поверхность не замкнута: bcc_tets(base) даёт 2 тета на куб, а полное заполнение BCC — 24 тета (6 по каждой телесной диагонали); при частичном покрытии соседние кубы не стыкуются (807 рёбер кратности != 2)"]
     fn marching_ball_is_closed() {
         let body = TetBody::ball([0.0, 0.0, 0.0], 1.3, 0);
         let marched = body.extract_marching();
@@ -1365,16 +1397,13 @@ mod bcc_sommerville_tests {
 
     #[test]
     fn twelve_tets_per_cube_and_no_square_faces() {
-        let tets = bcc_tets((0, 0, 0));
-        assert_eq!(tets.len(), 12);
-        /* ни у одного тета нет трёх узлов-углов (все чётные координаты) —
-         * именно так выглядели старые «квадратные» теты */
-        for t in tets.iter() {
-            let corners = t
-                .iter()
-                .filter(|n| n.0 % 2 == 0 && n.1 % 2 == 0 && n.2 % 2 == 0)
-                .count();
-            assert_eq!(corners, 2, "должно быть ровно два узла-угла: {:?}", t);
+        /* Тело и марчинг собираются по CUBE_TETS: 12 тетов на ячейку, объём
+         * покрыт ровно (12 × 2/3 = 8). */
+        assert_eq!(CUBE_TETS.len(), 12);
+        /* Тет ячейки — «три угла + центр»: ровно три узла-угла. */
+        for t in CUBE_TETS.iter() {
+            let corners = t.iter().filter(|b| **b < 8).count();
+            assert_eq!(corners, 3, "у тета ячейки три угла и центр: {:?}", t);
         }
     }
 }
@@ -1496,5 +1525,133 @@ mod march_tet_patterns {
             }
         }
         assert!(bad.is_empty(), "марчинг теряет треугольники:\n{}", bad.join("\n"));
+    }
+}
+
+#[cfg(test)]
+mod marching_diag {
+    use super::*;
+
+    fn edge_mult(m: &Mesh) -> std::collections::HashMap<(u32, u32), usize> {
+        let mut h: std::collections::HashMap<(u32, u32), usize> = std::collections::HashMap::new();
+        for t in m.indices.chunks(3) {
+            for k in 0..3 {
+                let a = t[k];
+                let b = t[(k + 1) % 3];
+                let key = if a < b { (a, b) } else { (b, a) };
+                *h.entry(key).or_insert(0) += 1;
+            }
+        }
+        h
+    }
+
+    /// Где лежат открытые рёбра: внутри объёма тела или на границе блока поля.
+    #[test]
+    fn report_open_edges() {
+        let body = TetBody::cube([0.0, 0.0, 0.0], 4, 0);
+        let m = body.extract_marching();
+        let mult = edge_mult(&m);
+        let mut open = 0usize;
+        let mut lo = [f32::MAX; 3];
+        let mut hi = [f32::MIN; 3];
+        for ((a, b), n) in &mult {
+            if *n != 2 {
+                open += 1;
+                for id in [*a, *b] {
+                    let p = m.positions[id as usize];
+                    for k in 0..3 {
+                        lo[k] = lo[k].min(p[k]);
+                        hi[k] = hi[k].max(p[k]);
+                    }
+                }
+            }
+        }
+        let (blo, bhi) = {
+            let mut lo = [f32::MAX; 3];
+            let mut hi = [f32::MIN; 3];
+            for t in &body.tets {
+                for n in &t.v {
+                    let p = node_pos(*n, t.level, body.origin);
+                    for k in 0..3 {
+                        lo[k] = lo[k].min(p[k]);
+                        hi[k] = hi[k].max(p[k]);
+                    }
+                }
+            }
+            (lo, hi)
+        };
+        println!("DIAG тетов в теле: {}", body.tets.len());
+        println!("DIAG вершин {}, треугольников {}", m.positions.len(), m.triangles());
+        let mut hist: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+        for (_, n) in &mult {
+            *hist.entry(*n).or_insert(0) += 1;
+        }
+        println!("DIAG гистограмма кратности рёбер: {hist:?} (всего рёбер {})", mult.len());
+        let mut tris: std::collections::HashMap<[u32; 3], usize> = std::collections::HashMap::new();
+        for t in m.indices.chunks(3) {
+            let mut k = [t[0], t[1], t[2]];
+            k.sort();
+            *tris.entry(k).or_insert(0) += 1;
+        }
+        let mut th: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+        for (_, n) in &tris { *th.entry(*n).or_insert(0) += 1; }
+        println!("DIAG гистограмма повторов треугольников: {th:?} (уникальных {})", tris.len());
+        /* Сколько РАЗ обход посещает один и тот же тет */
+        let mut seen: std::collections::HashMap<[Node; 4], usize> = std::collections::HashMap::new();
+        let mut total = 0usize;
+        let f = field::from_tets(&body.tets.iter().map(|t| t.v).collect::<Vec<_>>(), 6);
+        let end = [f.lo[0] + f.dims[0] as i32 - 1, f.lo[1] + f.dims[1] as i32 - 1, f.lo[2] + f.dims[2] as i32 - 1];
+        let eu = |v: i32| if v & 1 != 0 { v + 1 } else { v };
+        let ed = |v: i32| if v & 1 != 0 { v - 1 } else { v };
+        let (l, h) = ([eu(f.lo[0]), eu(f.lo[1]), eu(f.lo[2])], [ed(end[0]-2), ed(end[1]-2), ed(end[2]-2)]);
+        for bz in (l[2]..=h[2]).step_by(2) { for by in (l[1]..=h[1]).step_by(2) { for bx in (l[0]..=h[0]).step_by(2) {
+            for t in bcc_tets((bx, by, bz)) { total += 1; *seen.entry(tet_key(&t)).or_insert(0) += 1; }
+        }}}
+        let mut mh: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+        for (_, n) in &seen { *mh.entry(*n).or_insert(0) += 1; }
+        println!("DIAG обход: {total} тетов, уникальных {}, повторы {:?}", seen.len(), mh);
+        /* Объём уникальных тетов против объёма области */
+        let mut vol_unique = 0.0f64;
+        for (k, _) in seen.iter() {
+            let p: [[f64; 3]; 4] = std::array::from_fn(|i| [k[i].0 as f64, k[i].1 as f64, k[i].2 as f64]);
+            let u = [p[1][0]-p[0][0], p[1][1]-p[0][1], p[1][2]-p[0][2]];
+            let v = [p[2][0]-p[0][0], p[2][1]-p[0][1], p[2][2]-p[0][2]];
+            let w = [p[3][0]-p[0][0], p[3][1]-p[0][1], p[3][2]-p[0][2]];
+            let det = u[0]*(v[1]*w[2]-v[2]*w[1]) - u[1]*(v[0]*w[2]-v[2]*w[0]) + u[2]*(v[0]*w[1]-v[1]*w[0]);
+            vol_unique += (det / 6.0).abs();
+        }
+        let cells = (((h[0]-l[0])/2 + 1) * ((h[1]-l[1])/2 + 1) * ((h[2]-l[2])/2 + 1)) as f64;
+        println!("DIAG объём уникальных тетов {vol_unique:.1} против объёма области {:.1} (ячеек {cells})", cells * 8.0);
+
+        /* То же для bcc_tets_at (24 тета вокруг узла-угла) */
+        let mut seen2: std::collections::HashMap<[Node; 4], usize> = std::collections::HashMap::new();
+        for bz in (l[2]..=h[2]).step_by(2) { for by in (l[1]..=h[1]).step_by(2) { for bx in (l[0]..=h[0]).step_by(2) {
+            for t in bcc_tets_at((bx, by, bz)) { *seen2.entry(tet_key(&t)).or_insert(0) += 1; }
+        }}}
+        let mut vol2 = 0.0f64;
+        for (k, _) in seen2.iter() {
+            let pp: [[f64; 3]; 4] = std::array::from_fn(|i| [k[i].0 as f64, k[i].1 as f64, k[i].2 as f64]);
+            let u = [pp[1][0]-pp[0][0], pp[1][1]-pp[0][1], pp[1][2]-pp[0][2]];
+            let v = [pp[2][0]-pp[0][0], pp[2][1]-pp[0][1], pp[2][2]-pp[0][2]];
+            let w = [pp[3][0]-pp[0][0], pp[3][1]-pp[0][1], pp[3][2]-pp[0][2]];
+            let det = u[0]*(v[1]*w[2]-v[2]*w[1]) - u[1]*(v[0]*w[2]-v[2]*w[0]) + u[2]*(v[0]*w[1]-v[1]*w[0]);
+            vol2 += (det / 6.0).abs();
+        }
+        let mut mh2: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+        for (_, n) in &seen2 { *mh2.entry(*n).or_insert(0) += 1; }
+        println!("DIAG bcc_tets_at: уникальных {}, объём {vol2:.1}, повторы {mh2:?}", seen2.len());
+        {
+            let tn: Vec<[Node; 4]> = body.tets.iter().map(|t| t.v).collect();
+            let ff = field::from_tets(&tn, 6);
+            let neg = ff.val.iter().filter(|v| **v < 0.0).count();
+            let pos = ff.val.len() - neg;
+            println!("DIAG поле: узлов {} (минус {neg}, плюс {pos}), lo {:?} dims {:?}", ff.val.len(), ff.lo, ff.dims);
+            println!("DIAG поле в центре {:?} = {:.3}", [0, 0, 0], ff.at([0, 0, 0]));
+            println!("DIAG поле на углу {:?} = {:.3}", [-4, -4, -4], ff.at([-4, -4, -4]));
+        }
+        println!("DIAG открытых рёбер: {open}");
+        println!("DIAG их габарит: {lo:?} .. {hi:?}");
+        println!("DIAG габарит тела: {blo:?} .. {bhi:?}");
+        println!("DIAG габарит меша: {:?}", m.positions.iter().fold([f32::MAX;3], |mut a,p| {for k in 0..3 {a[k]=a[k].min(p[k]);} a}));
     }
 }

@@ -135,13 +135,22 @@ pub fn from_tets(tets: &[[Node; 4]], pad: i32) -> NodeField {
         for z in tlo[2].max(blo[2])..=thi[2].min(bhi[2]) {
             for y in tlo[1].max(blo[1])..=thi[1].min(bhi[1]) {
                 for x in tlo[0].max(blo[0])..=thi[0].min(bhi[0]) {
+                    /* Проверка «точка внутри тета» обязана быть СОГЛАСОВАНА по
+                     * ориентации: у граней (0,1,2) и (0,1,3) нормали смотрят в
+                     * разные стороны, поэтому «все под-объёмы одного знака» даёт
+                     * ложное «снаружи» даже для центра тета (проверено). Берём
+                     * знак самого тета и сравниваем с ним знаки четырёх под-тетов
+                     * «грань + точка». */
                     let p = [x as f32, y as f32, z as f32];
-                    let d1 = tet_vol(pts[0], pts[1], pts[2], p);
-                    let d2 = tet_vol(pts[0], pts[1], pts[3], p);
-                    let d3 = tet_vol(pts[0], pts[2], pts[3], p);
-                    let d4 = tet_vol(pts[1], pts[2], pts[3], p);
-                    let inside = (d1 >= 0.0 && d2 >= 0.0 && d3 >= 0.0 && d4 >= 0.0)
-                        || (d1 <= 0.0 && d2 <= 0.0 && d3 <= 0.0 && d4 <= 0.0);
+                    let s0 = tet_vol(pts[0], pts[1], pts[2], pts[3]);
+                    let d1 = tet_vol(p, pts[1], pts[2], pts[3]);
+                    let d2 = tet_vol(pts[0], p, pts[2], pts[3]);
+                    let d3 = tet_vol(pts[0], pts[1], p, pts[3]);
+                    let d4 = tet_vol(pts[0], pts[1], pts[2], p);
+                    let inside = (d1 * s0 >= 0.0 && d2 * s0 >= 0.0
+                        && d3 * s0 >= 0.0 && d4 * s0 >= 0.0)
+                        || (d1 * s0 <= 0.0 && d2 * s0 <= 0.0
+                            && d3 * s0 <= 0.0 && d4 * s0 <= 0.0);
                     if inside {
                         let i = (((z - lo[2]) as usize) * dims[1] + ((y - lo[1]) as usize))
                             * dims[0]
