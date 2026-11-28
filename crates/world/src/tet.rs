@@ -1949,3 +1949,21 @@ mod sdf_quality_tests {
     }
 
 }
+
+#[cfg(test)]
+mod rot_check {
+    use super::*;
+    #[test]
+    fn plate_is_rotated() {
+        let body = TetBody::cube([0.0, 0.0, 0.0], 4, 0);
+        let m = body.extract_marching();
+        let mut ymax = f32::MIN;
+        for p in &m.positions { ymax = ymax.max(p[1]); }
+        let on_top = m.positions.iter().filter(|p| (p[1] - ymax).abs() < 1e-3).count();
+        let mut zmax = f32::MIN;
+        for p in &m.positions { zmax = zmax.max(p[2]); }
+        let on_front = m.positions.iter().filter(|p| (p[2] - zmax).abs() < 1e-3).count();
+        println!("вершин {} · на верхней плоскости {} · на передней {} · ymax {ymax:.3}",
+                 m.positions.len(), on_top, on_front);
+    }
+}
