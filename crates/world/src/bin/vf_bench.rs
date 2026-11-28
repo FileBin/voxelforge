@@ -14,27 +14,10 @@
 //! из шейдера (без него проход пар работает без единой лишней атомарной
 //! операции сверх записи самой пары, и время честное).
 use std::collections::HashMap;
-use std::ffi::c_void;
 use std::time::Instant;
 
 use voxelforge_world::live::Live;
 use voxelforge_world::sim::find_shaders;
-
-#[repr(C)]
-struct VfStatus {
-    code: i32,
-    msg: *const i8,
-}
-
-unsafe extern "C" {
-    fn vf_buffer_read(
-        ctx: *mut c_void,
-        buf: *mut c_void,
-        off: usize,
-        out: *mut c_void,
-        bytes: usize,
-    ) -> VfStatus;
-}
 
 fn main() {
     let ticks: u32 = std::env::var("VF_BENCH_TICKS")
