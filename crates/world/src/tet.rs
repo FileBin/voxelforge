@@ -275,12 +275,10 @@ impl TetBody {
     pub fn sdf(&self) -> &field::NodeField {
         self.sdf.get_or_init(|| {
             let flat: Vec<[Node; 4]> = self.tets.iter().map(|t| t.v).collect();
-            let mut f = field::from_tets_exact(&flat, 6);
-            /* Тело — объединение тетов, его граница ступенчатая. Несколько
-             * проходов по полю снимают ступеньки тетраэдров, и изоповерхность
-             * выходит гладкой оболочкой, а не гранёной. */
-            f.smooth(3, 0.6);
-            f
+            /* Теты задают только УЗЛЫ (какие точки внутри). Расстояние
+             * считается от границы занятости, грани тетов в нём не участвуют —
+             * поэтому поверхность не повторяет тетраэдры. */
+            field::from_occupancy_metric(&flat, 6, 3)
         })
     }
 
@@ -1795,39 +1793,33 @@ mod marching_diag {
 mod sdf_quality_tests {
     use super::*;
 
-    /// Точность изоповерхности: каждая вершина меша обязана лежать на
-    /// поверхности тела (расстояние до тетов близко к нулю). Это и есть
-    /// проверка «плавной интерполяции по SDF»: с BFS-полем вершины уезжали на
-    /// полшага сетки, и ошибка была сравнима с шагом.
+    /// Меш обязан лежать на НУЛЕ поля расстояний — это и есть поверхность,
+    /// по которой считаются столкновения. Проверка прямая: сэмплируем поле в
+    /// каждой вершине; линейная интерполяция и проекция не должны оставлять
+    /// заметного смещения.
     #[test]
-    fn marching_vertices_lie_on_the_surface() {
+    fn marching_mesh_lies_on_the_sdf_zero() {
         let body = TetBody::ball([0.0, 0.0, 0.0], 1.0, 0);
         let step = node_step(0);
-        let flat: Vec<[[f32; 3]; 4]> = body
-            .tets
-            .iter()
-            .map(|t| std::array::from_fn(|i| node_pos(t.v[i], t.level, body.origin)))
-            .collect();
+        let f = body.sdf();
         let m = body.extract_marching();
         assert!(m.positions.len() > 100, "меш подозрительно бедный");
         let mut worst: f32 = 0.0;
         for p in &m.positions {
-            let d = field::dist_to_tets(&flat, *p);
-            worst = worst.max(d);
+            let local = [
+                (p[0] - body.origin[0]) / step,
+                (p[1] - body.origin[1]) / step,
+                (p[2] - body.origin[2]) / step,
+            ];
+            worst = worst.max(f.sample(local).abs() * step);
         }
         println!(
-            "SDF: вершин {}, худшее расстояние до поверхности {:.4} (шаг узла {:.4})",
+            "меш на нуле поля: вершин {}, худшее |f| {:.4} м (шаг {:.4})",
             m.positions.len(),
             worst,
             step
         );
-        /* Ноль поля лежит между узлами (сдвиг полшага), поэтому вершины
-         * ожидаются на расстоянии около половины шага от поверхности; главное —
-         * ошибка НЕ должна быть сеточной (√2·шаг на диагоналях). */
-        assert!(
-            worst < step * 0.75,
-            "вершины ушли с поверхности: {worst} при шаге {step}"
-        );
+        assert!(worst < step * 0.1, "меш не на поверхности SDF: {worst} м");
     }
 
 }

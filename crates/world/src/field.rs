@@ -578,3 +578,115 @@ pub fn from_tets_exact(tets: &[[Node; 4]], pad: i32) -> NodeField {
     }
     NodeField { lo, dims, val }
 }
+
+/// Поле расстояний, построенное ТОЛЬКО по занятости узлов.
+///
+/// Тетраэдры здесь — лишь способ расставить узлы (какие узлы внутри тела).
+/// Грани тетов в расстоянии НЕ участвуют: иначе поверхность повторяет
+/// ступеньки тетраэдров. Расстояние считается по 26 соседям с метрическими
+/// шагами (1, √2, √3) от границы занятости, затем поле сглаживается.
+pub fn from_occupancy_metric(tets: &[[Node; 4]], pad: i32, smooth_iters: usize) -> NodeField {
+    assert!(!tets.is_empty(), "поле без тетов");
+    let (lo, dims) = bounds_of(tets.iter().flat_map(|t| t.iter()), pad);
+    let n = dims[0] * dims[1] * dims[2];
+    let idx = |x: i32, y: i32, z: i32| -> usize {
+        (((z - lo[2]) as usize) * dims[1] + ((y - lo[1]) as usize)) * dims[0]
+            + ((x - lo[0]) as usize)
+    };
+    /* 1. Занятость по объёму тетов. */
+    let mut solid = vec![false; n];
+    for t in tets {
+        let pts: [[f32; 3]; 4] =
+            std::array::from_fn(|i| [t[i].0 as f32, t[i].1 as f32, t[i].2 as f32]);
+        let s0 = tet_vol(pts[0], pts[1], pts[2], pts[3]);
+        let (mut tlo, mut thi) = ([i32::MAX; 3], [i32::MIN; 3]);
+        for q in &pts {
+            for k in 0..3 {
+                tlo[k] = tlo[k].min(q[k].floor() as i32);
+                thi[k] = thi[k].max(q[k].ceil() as i32);
+            }
+        }
+        for z in tlo[2]..=thi[2] {
+            for y in tlo[1]..=thi[1] {
+                for x in tlo[0]..=thi[0] {
+                    let p = [x as f32, y as f32, z as f32];
+                    let d1 = tet_vol(p, pts[1], pts[2], pts[3]) * s0;
+                    let d2 = tet_vol(pts[0], p, pts[2], pts[3]) * s0;
+                    let d3 = tet_vol(pts[0], pts[1], p, pts[3]) * s0;
+                    let d4 = tet_vol(pts[0], pts[1], pts[2], p) * s0;
+                    if (d1 >= 0.0 && d2 >= 0.0 && d3 >= 0.0 && d4 >= 0.0)
+                        || (d1 <= 0.0 && d2 <= 0.0 && d3 <= 0.0 && d4 <= 0.0)
+                    {
+                        solid[idx(x, y, z)] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /* 2. Расстояние до ГРАНИЦЫ ЗАНЯТОСТИ: от узлов, у которых есть сосед
+     * с другим знаком. Обход по 26 направлениям с метрической длиной шага. */
+    let mut dirs: Vec<(i32, i32, i32, f32)> = Vec::with_capacity(26);
+    for dx in -1i32..=1 {
+        for dy in -1i32..=1 {
+            for dz in -1i32..=1 {
+                if dx == 0 && dy == 0 && dz == 0 {
+                    continue;
+                }
+                dirs.push((dx, dy, dz, ((dx * dx + dy * dy + dz * dz) as f32).sqrt()));
+            }
+        }
+    }
+    let dirs = dirs;
+    let (nx, ny, nz) = (dims[0], dims[1], dims[2]);
+    let mut dist = vec![f32::MAX; n];
+    let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    for z in 0..nz {
+        for y in 0..ny {
+            for x in 0..nx {
+                let i = (z * ny + y) * nx + x;
+                let mut border = false;
+                for (dx, dy, dz, _) in dirs.iter() {
+                    let (xx, yy, zz) = (x as i32 + dx, y as i32 + dy, z as i32 + dz);
+                    if xx < 0 || yy < 0 || zz < 0 || xx >= nx as i32 || yy >= ny as i32 || zz >= nz as i32 {
+                        continue;
+                    }
+                    let j = ((zz as usize) * ny + yy as usize) * nx + xx as usize;
+                    if solid[j] != solid[i] {
+                        border = true;
+                        break;
+                    }
+                }
+                if border {
+                    dist[i] = 0.0;
+                    queue.push_back(i);
+                }
+            }
+        }
+    }
+    /* волна: Dijkstra по малой сетке (шаги 1, √2, √3) */
+    while let Some(i) = queue.pop_front() {
+        let (x, y, z) = (i % nx, (i / nx) % ny, i / (nx * ny));
+        let d0 = dist[i];
+        for (dx, dy, dz, w) in dirs.iter() {
+            let (xx, yy, zz) = (x as i32 + dx, y as i32 + dy, z as i32 + dz);
+            if xx < 0 || yy < 0 || zz < 0 || xx >= nx as i32 || yy >= ny as i32 || zz >= nz as i32 {
+                continue;
+            }
+            let j = ((zz as usize) * ny + yy as usize) * nx + xx as usize;
+            let nd = d0 + w;
+            if nd < dist[j] - 1e-6 {
+                dist[j] = nd;
+                queue.push_back(j);
+            }
+        }
+    }
+
+    let mut f = NodeField { lo, dims, val: vec![0.0; n] };
+    for i in 0..n {
+        let d = if dist[i] == f32::MAX { 0.0 } else { dist[i] };
+        f.val[i] = if solid[i] { -(d + 0.5) } else { d + 0.5 };
+    }
+    f.smooth(smooth_iters, 0.6);
+    f
+}
