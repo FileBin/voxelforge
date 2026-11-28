@@ -702,6 +702,13 @@ fn main() {
     // интерполирует между двумя последними состояниями симуляции.
     let mut acc = 0.0f32;
 
+    /* VF_STEPS=1 — мерим то, что видит глаз: позицию тела так, как её считает
+     * шейдер (mix(prev, cur, alpha)), и шаг между кадрами. Скачки назад после
+     * шага вперёд = «перепутанные кадры»; их доля и есть число, которое ищем. */
+    let dbg_steps = std::env::var("VF_STEPS").is_ok();
+    let mut last_drawn: Option<[f32; 3]> = None;
+    let mut last_step: [f32; 3] = [0.0; 3];
+    let (mut moves, mut flips, mut max_step) = (0u32, 0u32, 0.0f32);
     let mut frame_t0 = std::time::Instant::now();
     /* Прогрев (по умолчанию ВЫКЛЮЧЕН: включается VF_WARMUP=мс). Если
      * стартовые лаги лечатся тем, что игрок успевает пострелять, дело в
@@ -820,6 +827,42 @@ fn main() {
         // Кадр: физика к этому моменту уже посчитана в своём потоке
         // (или шагнула здесь, если режим скриптовый).
         let out = sim.frame(tick, max_frames > 0, substeps_arg, iterations_arg);
+
+        if dbg_steps && matches!(sim, Sim::Thread { .. }) {
+            /* Позиция, которую видит шейдер = mix(prev, cur, alpha) по
+             * опубликованной паре. Считаем её на CPU из снимка — так видно
+             * именно то, что попадает в кадр, без чтения буферов с устройства. */
+            if let Some(b) = out.bodies.get(1) {
+                let (cur, prev) = (b.pos, b.prev);
+                let a = out.alpha as f64;
+                let p = [
+                    (prev[0] + (cur[0] - prev[0]) * a) as f32,
+                    (prev[1] + (cur[1] - prev[1]) * a) as f32,
+                    (prev[2] + (cur[2] - prev[2]) * a) as f32,
+                ];
+                if let Some(l) = last_drawn {
+                    let d = [p[0] - l[0], p[1] - l[1], p[2] - l[2]];
+                    let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                    max_step = max_step.max(len);
+                    if len > 1e-4 {
+                        let pl = (last_step[0] * last_step[0]
+                            + last_step[1] * last_step[1]
+                            + last_step[2] * last_step[2])
+                            .sqrt();
+                        if pl > 1e-4 {
+                            moves += 1;
+                            if d[0] * last_step[0] + d[1] * last_step[1] + d[2] * last_step[2]
+                                < 0.0
+                            {
+                                flips += 1;
+                            }
+                        }
+                        last_step = d;
+                    }
+                }
+                last_drawn = Some(p);
+            }
+        }
 
         if out.body_buf != 0 && out.body_buf != seen_body_buf {
             seen_body_buf = out.body_buf;
@@ -960,6 +1003,13 @@ fn main() {
             t0 = std::time::Instant::now();
             frames = 0;
         }
+    }
+
+    if dbg_steps {
+        println!(
+            "шаг кадра: движений {moves} · разворотов {flips} ({:.0}%) · макс шаг {max_step:.4}",
+            if moves > 0 { 100.0 * flips as f32 / moves as f32 } else { 0.0 }
+        );
     }
 
     unsafe { vf_view_free(view) };
