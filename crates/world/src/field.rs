@@ -116,6 +116,31 @@ pub fn from_occupied<I: Iterator<Item = Node>>(occupied: I, pad: i32) -> NodeFie
         let v = if solid[i] { -(d_out[i] - 0.5) } else { d_in[i] - 0.5 };
         f.set(i, v);
     }
+    /* Сглаживание поля. BFS даёт расстояние по сетке, и изоповерхность
+     * повторяет её квантование: на поверхности куба это видны «подушки» по
+     * клеткам. Несколько проходов усреднения по шести соседям убирают эти
+     * ступеньки, не сдвигая границу (ноль остаётся между теми же узлами). */
+    for _ in 0..3 {
+        let src = f.val.clone();
+        for z in 1..dims[2].saturating_sub(1) {
+            for y in 1..dims[1].saturating_sub(1) {
+                for x in 1..dims[0].saturating_sub(1) {
+                    let i = (z * dims[1] + y) * dims[0] + x;
+                    let sx = dims[0];
+                    let sy = dims[0] * dims[1];
+                    let avg = (src[i]
+                        + src[i - 1]
+                        + src[i + 1]
+                        + src[i - sx]
+                        + src[i + sx]
+                        + src[i - sy]
+                        + src[i + sy])
+                        / 7.0;
+                    f.set(i, avg);
+                }
+            }
+        }
+    }
     f
 }
 
