@@ -51,6 +51,18 @@ pub fn node_pos(n: Node, level: u8, origin: [f32; 3]) -> [f32; 3] {
     ]
 }
 
+/// Сколько узлов поля влезает в слот SDF на устройстве (`sim::SDF_STRIDE` =
+/// 65536). Поле тела обязано в него влезть, иначе SDF-контакты для тела
+/// выключаются (см. `GpuSim::upload_sdf`). Берём с запасом.
+const FIELD_NODE_BUDGET: usize = 60000;
+
+/// Полуразмер сетки поля на `reach` метров с запасом `pad` узлов: `(n, dim)`,
+/// где сетка — `2n+1` узлов по каждой оси (узел 0 всегда в центре).
+fn field_dims(reach: f32, step: f32, pad: i32) -> (i32, usize) {
+    let n = (reach / step).ceil() as i32 + pad;
+    (n, (2 * n + 1) as usize)
+}
+
 /// 12 тетраэдров кубической ячейки (углы — биты `x + 2y + 4z`, центр — 8).
 const CUBE_TETS: [[u8; 4]; 12] = [
     [0, 2, 6, 8], [0, 6, 4, 8],
@@ -233,12 +245,12 @@ impl Tet {
 
     /// Red-разбиение: 8 детей вдвое мельче, объём сохраняется точно.
     ///
-    /// Для НАСТОЯЩЕЙ T1-ячейки (а все теты тела приходят из
+    /// Для НАСТОЯЩЕЙ T1-ячейки (а все теты тела теперь приходят из
     /// `bcc_tets_around_edge` и канонизированы) берётся таблица `t1::red_refine`:
     /// все восемь детей конгруэнтны T1 и подобны родителю с коэффициентом 1/2 —
     /// это самоподобие и есть смысл решётки Сомирвилля. Старое разбиение
-    /// «октаэдр через ребро ab-cd» давало правильные угловые теты и
-    /// ПРОИЗВОЛЬНЫЕ четыре из середины, то есть форму детей не гарантировало.
+    /// «октаэдр через ребро ab-cd» давало четыре правильных угловых тета и
+    /// четыре ПРОИЗВОЛЬНЫХ из середины, то есть форму детей не гарантировало.
     /// Тет, не являющийся T1 (приходит только из неиспользуемого ныне
     /// `from_sdf_grid`), дробится старым общим способом — чтобы не терять объём.
     pub fn refine(&self) -> [Tet; 8] {
@@ -428,56 +440,54 @@ impl TetBody {
             origin: center,
             sdf: Default::default(),
         };
-        /* SDF коробки — АНАЛИТИЧЕСКИЙ, на том же шаге, что теты (плотность не
-         * меняем). BFS-расстояние по занятости давало гребни на рёбрах: там
-         * сходятся три плоскости, и волна обходит их ступеньками — отсюда
-         * «шип» на угле. Аналитика рёбер не боится. */
+        /* ПОЛЕ КОРОБКИ — АНАЛИТИЧЕСКОЕ, регулярная сетка по всему bounding box.
+         * Сетка поля не связана с разметкой тетов; шаг — на уровень мельче
+         * тетов, если сетка влезает в пул SDF на устройстве (65536 узлов).
+         *
+         * Коробка ОСЕВАЯ: грани параллельны осям и совпадают с габаритом
+         * коллайдера (тетов). Раньше здесь был поворот на 45° вокруг (1,1,1) —
+         * на картинке выходил скошенный октаэдр, который не совпадал с
+         * коллайдером и «срезал» углы плиты. Никакого сдвига на полшага тоже
+         * нет: он смещал коробку относительно тетов (перекос). */
         let step = node_step(level);
-        /* half - полшага: тогда ноль поля НЕ попадает в узлы решётки (иначе
-         * значения в них ровно 0, срез вырождается и поверхность рвётся). */
-        /* Куб сдвинут на полшага относительно узлов: тогда ни одна грань и ни
-         * один угол не совпадают с узлом, и марчинг строит плоскость по
-         * четырём соседним узлам, а не «задевает краем вокселя» угол. */
         let half = n as f32 * step;
-        let nf = (half / step).ceil() as i32 + 6;
+        /* Изоповерхность НЕ ДОЛЖНА лечь ровно в узлы сетки: у осевой коробки
+         * грани проходят по плоскостям узлов, значение там ровно 0, и марчинг
+         * вырождается — вершины садятся в узлы, а грани выпадают. Поэтому
+         * полуразмер увеличен на 0.1 мм: коробка остаётся ОСЕВОЙ и
+         * СИММЕТРИЧНОЙ (никакого перекоса, центр тот же), а ноль поля уходит
+         * строго между слоями узлов. */
+        let half_eval = half + 1e-4;
+        let (nf, fstep) = {
+            let mut fl = level + 1;
+            loop {
+                let fs = node_step(fl);
+                let (n, dim) = field_dims(half, fs, 3);
+                if dim * dim * dim <= FIELD_NODE_BUDGET || fl <= level {
+                    break (n, fs);
+                }
+                fl -= 1;
+            }
+        };
         let dim = (2 * nf + 1) as usize;
         let mut val = vec![0.0f32; dim * dim * dim];
         for z in -nf..=nf {
             for y in -nf..=nf {
                 for x in -nf..=nf {
-                    /* Коробка повёрнута на 45° вокруг (1,1,1): рёбра идут
-                     * наискось к решётке, и ступеньки марчинга не складываются
-                     * в заметный глазу узор по осям. */
-                    let (px, py, pz) = (x as f32 - 0.5, y as f32 - 0.5, z as f32 - 0.5);
-                    let inv3 = 1.0f32 / 3f32.sqrt();
-                    let a = std::f32::consts::FRAC_PI_4.cos();
-                    let b = std::f32::consts::FRAC_PI_4.sin();
-                    let (ux, uy, uz) = (inv3, inv3, inv3);
-                    /* поворот на -45° вокруг (1,1,1) (обратный к повороту тела) */
-                    let dot = ux * px + uy * py + uz * pz;
-                    let cr_x = uy * pz - uz * py;
-                    let cr_y = uz * px - ux * pz;
-                    let cr_z = ux * py - uy * px;
-                    let rx = px * a - cr_x * b + ux * dot * (1.0 - a);
-                    let ry = py * a - cr_y * b + uy * dot * (1.0 - a);
-                    let rz = pz * a - cr_z * b + uz * dot * (1.0 - a);
-                    let q = [
-                        rx.abs() - half / step,
-                        ry.abs() - half / step,
-                        rz.abs() - half / step,
-                    ];
+                    let px = x as f32 * fstep;
+                    let py = y as f32 * fstep;
+                    let pz = z as f32 * fstep;
+                    let q = [px.abs() - half_eval, py.abs() - half_eval, pz.abs() - half_eval];
                     let outside = (q[0].max(0.0).powi(2) + q[1].max(0.0).powi(2)
                         + q[2].max(0.0).powi(2))
                     .sqrt();
                     let inside = q[0].max(q[1]).max(q[2]).min(0.0);
                     let i = (((z + nf) as usize) * dim + ((y + nf) as usize)) * dim
                         + ((x + nf) as usize);
-                    /* В ЕДИНИЦАХ УЗЛА, как у шара и у поля по занятости:
-                     * молчаливое умножение на step давало метры, а физика
-                     * (sample_m, intersect_plane, sdf_contact) считает поле
-                     * узловым и умножает на step сама — глубина контакта
-                     * выходила в 14 раз меньше настоящей (шаг плиты 0.07 м). */
-                    val[i] = outside + inside;
+                    /* В ШАГАХ ПОЛЯ — физика (sample_m, intersect_plane,
+                     * sdf_contact) считает поле узловым и умножает на шаг
+                     * сама; молчаливые метры давали глубину в 14 раз меньше. */
+                    val[i] = (outside + inside) / fstep;
                 }
             }
         }
@@ -485,7 +495,7 @@ impl TetBody {
             lo: [-nf, -nf, -nf],
             dims: [dim, dim, dim],
             val,
-            step,
+            step: fstep,
         });
         body
     }
@@ -515,25 +525,20 @@ impl TetBody {
             lv -= 1;
         }
         let step = node_step(lv);
-        let rn = radius / step;
-        /* +5 слоёв: марчинг идёт ячейками и внешний слой тетов ему нужен с
-         * каждой стороны — иначе с дальней стороны строить не из чего. */
-        let n = (rn.ceil() as i32) + 5;
+        /* +5 слоёв: марчинг идёт ячейками и внешний слой ему нужен с каждой
+         * стороны — иначе с дальней стороны строить не из чего. */
+        let n = ((radius / step).ceil() as i32) + 5;
         let dim = (2 * n + 1) as usize;
         let idx = |x: i32, y: i32, z: i32| -> usize {
             (((z + n) as usize) * dim + ((y + n) as usize)) * dim + ((x + n) as usize)
         };
-        let mut val = vec![0.0f32; dim * dim * dim];
+        /* ЗАНЯТОСТЬ (только для разметки тетов) — по узлам уровня тетов. */
         let mut solid = vec![false; dim * dim * dim];
         for z in -n..=n {
             for y in -n..=n {
                 for x in -n..=n {
-                    let d = ((x * x + y * y + z * z) as f32).sqrt() - rn;
-                    let i = idx(x, y, z);
-                    solid[i] = d < 0.0;
-                    /* без сдвига: у запечённого SDF ноль и есть поверхность,
-                     * а |значение| — настоящее расстояние до неё */
-                    val[i] = d;
+                    let d = ((x * x + y * y + z * z) as f32).sqrt();
+                    solid[idx(x, y, z)] = d < radius / step;
                 }
             }
         }
@@ -568,6 +573,44 @@ impl TetBody {
             }
             bz += 2;
         }
+        /* ПОЛЕ — РЕГУЛЯРНАЯ СЕТКА ПО ВСЕМУ BOUNDING BOX, ОДИН ШАГ НА ВСЁ ТЕЛО.
+         * Меш строится по ней (см. `extract_marching`), теты — разметка для
+         * физики. Шаг поля берём САМЫЙ МЕЛКИЙ, который влезает в слот SDF на
+         * устройстве (SDF_STRIDE = 65536 узлов): гладкость шара определяется
+         * именно шагом сетки поля, а не размером тета. Нижняя граница — вдвое
+         * мельче шага тетов, иначе поле не добавляет ничего к их точности. */
+        let (fn_, fstep) = {
+            let mut best: Option<(i32, f32)> = None;
+            for extra in 0..4 {
+                let fs = node_step(lv + 1 + extra);
+                let (n, dim) = field_dims(radius, fs, 1);
+                if dim * dim * dim <= FIELD_NODE_BUDGET {
+                    best = Some((n, fs));
+                } else {
+                    break;
+                }
+            }
+            best.unwrap_or_else(|| {
+                let fs = node_step(lv);
+                (field_dims(radius, fs, 2).0, fs)
+            })
+        };
+        let fdim = (2 * fn_ + 1) as usize;
+        let mut val = vec![0.0f32; fdim * fdim * fdim];
+        for z in -fn_..=fn_ {
+            for y in -fn_..=fn_ {
+                for x in -fn_..=fn_ {
+                    let i = (((z + fn_) as usize) * fdim + ((y + fn_) as usize)) * fdim
+                        + ((x + fn_) as usize);
+                    /* без сдвига: у запечённого SDF ноль и есть поверхность,
+                     * а |значение| — настоящее расстояние в шагах поля. 0.1 мм
+                     * запаса — чтобы ноль не попал РОВНО в узел (иначе марчинг
+                     * вырождается); шар при этом остаётся симметричным. */
+                    val[i] = ((x * x + y * y + z * z) as f32).sqrt()
+                        - (radius + 1e-4) / fstep;
+                }
+            }
+        }
         let body = Self {
             tets,
             level_cap: lv,
@@ -575,10 +618,10 @@ impl TetBody {
             sdf: Default::default(),
         };
         let _ = body.sdf.set(field::NodeField {
-            lo: [-n, -n, -n],
-            dims: [dim, dim, dim],
+            lo: [-fn_, -fn_, -fn_],
+            dims: [fdim, fdim, fdim],
             val,
-            step,
+            step: fstep,
         });
         body
     }
@@ -933,9 +976,11 @@ impl TetBody {
         }
         /* Нормали — из ГРАДИЕНТА поля, а не из граней треугольников: поле
          * гладкое (расстояние), поэтому затенение перестаёт показывать
-         * тетраэдры и поверхность читается как одна оболочка. */
+         * тетраэдры и поверхность читается как одна оболочка. Кадр — кадр
+         * ПОЛЯ: шаг берём из `f.step`, а не из уровня тетов (поле может быть
+         * запечено мельче — см. `TetBody::ball`). */
         if let Some(f) = self.sdf.get() {
-            let step = node_step(mesh.level);
+            let step = f.step;
             for (i, p) in mesh.positions.iter().enumerate() {
                 let local = [
                     (p[0] - self.origin[0]) / step,
@@ -947,15 +992,15 @@ impl TetBody {
             }
         }
         let level = mesh.level;
-        let _step = node_step(level);
         let origin = self.centroid();
         let (lo, hi) = self.bounds();
+        let fstep = self.sdf.get().map(|f| f.step).unwrap_or(BASE / (1u32 << level) as f32 * 0.5);
         (
             mesh,
             Grid {
                 lo: [lo[0] - origin[0], lo[1] - origin[1], lo[2] - origin[2]],
                 hi: [hi[0] - origin[0], hi[1] - origin[1], hi[2] - origin[2]],
-                step: BASE / (1u32 << level) as f32,
+                step: fstep,
             },
         )
     }
@@ -968,6 +1013,25 @@ impl TetBody {
     /// Вершины кэшируются по паре узлов, поэтому соседние теты делят одну
     /// вершину и швов нет.
     fn extract_marching(&self) -> Mesh {
+        self.extract_marching_diag(None)
+    }
+
+    /// Замер распределения `t` по всем пересечённым рёбрам — диагностика
+    /// интерполяции (см. тест `t_histogram`). Пустой список — все рёбра
+    /// пересекаются ровно в узле, что для непрерывного поля невозможно.
+    pub fn march_edge_t(&self) -> Vec<f32> {
+        self.march_diag().t
+    }
+
+    /// Полный замер марчинга: `t` по рёбрам и точки, которые дала линейная
+    /// интерполяция (до проекции на изоповерхность).
+    pub fn march_diag(&self) -> MarchDiag {
+        let mut d = MarchDiag::default();
+        let _ = self.extract_marching_diag(Some(&mut d));
+        d
+    }
+
+    fn extract_marching_diag(&self, mut diag: Option<&mut MarchDiag>) -> Mesh {
         /* Поле по ОБЪЁМУ тетов: заполнение одними вершинами даёт дырявую
          * занятость, ноль поля не встречается и марчинг выдаёт ноль
          * треугольников. Запас 3 узла: тет заходит за своё основание. */
@@ -986,13 +1050,15 @@ impl TetBody {
         let mut cache: HashMap<(Node, Node), u32> = HashMap::new();
 
 
-        /* Марчим ЯЧЕЙКАМИ по 12 тетов — ровно тем же замощением, из которого
-         * собрано тело (`bcc_tets` в `TetBody::cube`). 12 тетов заполняют
-         * кубическую ячейку без щелей и наложений (проверено объёмом тела), а
-         * соседние ячейки делят грань, поэтому поверхность замкнута по
-         * построению. Обход по узлам (`bcc_tets_at`) давал набор, не совпадающий
-         * с телом: часть граней пересекалась дважды — отсюда «каждый второй
-         * треугольник» дыркой. */
+        /* Марчим ЯЧЕЙКАМИ сетки ПОЛЯ: ячейка — 2×2×2 узла, 12 тетов. Теты
+         * здесь только ТОПОЛОГИЯ марчинга (какие четвёрки узлов соединять), а не
+         * разметка тела: значение в узле — настоящее расстояние до поверхности,
+         * и вершина ставится по нему. Соседние ячейки делят грань, вершины
+         * кэшируются по паре узлов — швов нет.
+         *
+         * Ячейки, у всех 9 узлов которых один знак, не могут дать треугольника
+         * (каждый тет — четвёрка этих же узлов) и пропускаются: их большинство,
+         * а поле с запасом по краям. */
         let end = [
             f.lo[0] + f.dims[0] as i32 - 1,
             f.lo[1] + f.dims[1] as i32 - 1,
@@ -1003,52 +1069,80 @@ impl TetBody {
         /* Ячейка занимает узлы base..base+2, поэтому основание держим так,
          * чтобы вся ячейка лежала внутри блока: иначе крайние узлы читаются
          * прижатыми и поверхность на границе обрывается. */
-        let lo = [
-            even_up(f.lo[0]),
-            even_up(f.lo[1]),
-            even_up(f.lo[2]),
-        ];
-        /* Ещё ОДИН СЛОЙ ячеек за границей блока поля: с дальней стороны
-         * поверхности иначе не из чего строить, и марчинг выдаёт шипы. Это
-         * только сетка марчинга — набор тетов тела (масса) не меняется. */
-        let hi = [
-            even_dn(end[0]),
-            even_dn(end[1]),
-            even_dn(end[2]),
-        ];
-        let mut tet_seen: std::collections::HashSet<[Node; 4]> = std::collections::HashSet::new();
+        let lo = [even_up(f.lo[0]), even_up(f.lo[1]), even_up(f.lo[2])];
+        let hi = [even_dn(end[0]), even_dn(end[1]), even_dn(end[2])];
         for bz in (lo[2]..=hi[2]).step_by(2) {
             for by in (lo[1]..=hi[1]).step_by(2) {
                 for bx in (lo[0]..=hi[0]).step_by(2) {
-                    /* Марчим по ТОЧНОМУ разбиению ячейки (CUBE_TETS): 12 тетов,
-                     * объём ячейки покрыт ровно, соседние ячейки делят грань —
-                     * поверхность замкнута по построению. Теты Сомирвилля для
-                     * этого не годятся: их набор не складывается в кубическую
-                     * решётку без щелей и наложений. */
                     let nodes = cube_nodes((bx, by, bz));
+                    let vals: [f32; 9] =
+                        std::array::from_fn(|i| f.at([nodes[i].0, nodes[i].1, nodes[i].2]));
+                    let any_neg = vals.iter().any(|v| *v < 0.0);
+                    let any_pos = vals.iter().any(|v| *v >= 0.0);
+                    if !(any_neg && any_pos) {
+                        continue;
+                    }
                     for t in CUBE_TETS.iter() {
-                        let t = [
+                        let tet_corners: [Node; 4] = [
                             nodes[t[0] as usize],
                             nodes[t[1] as usize],
                             nodes[t[2] as usize],
                             nodes[t[3] as usize],
                         ];
-                        if !tet_seen.insert(tet_key(&t)) {
-                            continue;
-                        }
-                        let tet_corners: [Node; 4] = [t[0], t[1], t[2], t[3]];
                         let mut pos = [[0.0f32; 3]; 4];
                         let val: [f32; 4] = std::array::from_fn(|i| {
                             let q = tet_corners[i];
-                            pos[i] = [origin[0] + q.0 as f32 * fstep, origin[1] + q.1 as f32 * fstep, origin[2] + q.2 as f32 * fstep];
-                            f.at([q.0, q.1, q.2])
+                            pos[i] = [
+                                origin[0] + q.0 as f32 * fstep,
+                                origin[1] + q.1 as f32 * fstep,
+                                origin[2] + q.2 as f32 * fstep,
+                            ];
+                            vals[t[i] as usize]
                         });
                         let mut vertex = |a: Node, b: Node, tp: f32| -> u32 {
-                            let (a, b, tp) = if pack(a) <= pack(b) {
-                                (a, b, tp)
+                            if let Some(d) = diag.as_deref_mut() {
+                                d.t.push(tp);
+                            }
+                            let mut a = a;
+                            let mut b = b;
+                            let mut tp = tp;
+                            if pack(a) > pack(b) {
+                                std::mem::swap(&mut a, &mut b);
+                                tp = 1.0 - tp;
+                            }
+                            /* Ноль поля РОВНО в узле (симметричная аналитика
+                             * даёт такие значения): пересечение формально легло
+                             * в вершину сетки, и если кэшировать его по паре
+                             * узлов, из одной точки получатся РАЗНЫЕ вершины для
+                             * разных рёбер — меш разваливается на «открытые
+                             * рёбра». Привязываем такую точку к самому узлу:
+                             * тогда все рёбра, сходящиеся в нём, делят одну
+                             * вершину. */
+                            let node_hit = if tp <= 1e-6 {
+                                Some(a)
+                            } else if tp >= 1.0 - 1e-6 {
+                                Some(b)
                             } else {
-                                (b, a, 1.0 - tp)
+                                None
                             };
+                            if let Some(n) = node_hit {
+                                let key = (n, n);
+                                if let Some(&id) = cache.get(&key) {
+                                    return id;
+                                }
+                                let p = [
+                                    origin[0] + n.0 as f32 * fstep,
+                                    origin[1] + n.1 as f32 * fstep,
+                                    origin[2] + n.2 as f32 * fstep,
+                                ];
+                                let id = positions.len() as u32;
+                                if let Some(d) = diag.as_deref_mut() {
+                                    d.interp.push(p);
+                                }
+                                positions.push(p);
+                                cache.insert(key, id);
+                                return id;
+                            }
                             let key = (a, b);
                             if let Some(&id) = cache.get(&key) {
                                 return id;
@@ -1061,6 +1155,9 @@ impl TetBody {
                                 pa[2] + (pb[2] - pa[2]) * tp,
                             ];
                             let id = positions.len() as u32;
+                            if let Some(d) = diag.as_deref_mut() {
+                                d.interp.push(p);
+                            }
                             positions.push(p);
                             cache.insert(key, id);
                             id
@@ -1077,29 +1174,11 @@ impl TetBody {
             indices,
             level,
         };
-        /* Проекция вершин на изоповерхность поля: линейная интерполяция вдоль
-         * ребра тета смещает точку на кривой изоповерхности. Два шага Ньютона по
-         * градиенту ставят вершину туда, где поле РАВНО нулю, поэтому между
-         * треугольниками не остаётся «ступенек» интерполяции. */
-        {
-            let step = node_step(level);
-            let origin = self.origin;
-            for p in mesh.positions.iter_mut() {
-                for _ in 0..2 {
-                    let local = [
-                        (p[0] - origin[0]) / step,
-                        (p[1] - origin[1]) / step,
-                        (p[2] - origin[2]) / step,
-                    ];
-                    let v = f.sample(local);
-                    let g = f.gradient(local);
-                    let d = v * step;
-                    p[0] -= g[0] * d;
-                    p[1] -= g[1] * d;
-                    p[2] -= g[2] * d;
-                }
-            }
-        }
+        /* ПРОЕКЦИЙ НЕТ: вершина — это ровно точка линейной интерполяции на
+         * ребре, ничего больше. Точность даёт шаг сетки поля (ошибка O(h²)), а
+         * не доталкивание вершины на аналитику: проекция сдвигала вершину с
+         * изоповерхности и, при шаге не того уровня, давала «вершины в
+         * постоянном отступе от узла». */
         recompute_normals(&mut mesh);
         mesh
     }
@@ -1172,6 +1251,16 @@ impl TetBody {
         recompute_normals(&mut mesh);
         mesh
     }
+}
+
+/// Сырые замеры марчинга (гистограмма `t` — диагностика интерполяции).
+#[derive(Default, Debug)]
+pub struct MarchDiag {
+    /// `t` по каждому пересечённому ребру: 0 — ноль в узле `a`, 1 — в узле `b`.
+    pub t: Vec<f32>,
+    /// Точка, которую дала ЛИНЕЙНАЯ интерполяция вдоль ребра (до проекции),
+    /// в том же порядке, что и вершины меша.
+    pub interp: Vec<[f32; 3]>,
 }
 
 /// Параметры решётки тела для отрисовки сетки вокселей.
@@ -2012,6 +2101,100 @@ mod marching_diag {
 mod sdf_quality_tests {
     use super::*;
 
+    /// ДИАГНОСТИКА интерполяции: гистограмма `t` по всем пересечённым рёбрам.
+    ///
+    /// `t` — доля от узла `a` до нуля поля. У правильной интерполяции по
+    /// непрерывному полю `t` распределён широко и унимодально: крайние корзины
+    /// (0..0.1 и 0.9..1.0) не должны забирать заметную долю рёбер, а середина
+    /// 0.4..0.6 — не должна быть единственной. Два вырожденных случая:
+    ///   * биполярно (t≈0 или t≈1) — развёрнута пара узлов в кэше вершин;
+    ///   * всё около 0.5 — значения поля в одних единицах, а позиции в других.
+    fn histogram(ts: &[f32]) -> [usize; 10] {
+        let mut bins = [0usize; 10];
+        for t in ts {
+            let b = ((t * 10.0).floor() as isize).clamp(0, 9) as usize;
+            bins[b] += 1;
+        }
+        bins
+    }
+
+    #[test]
+    fn t_histogram_of_crossed_edges() {
+        /* Третий случай — ТАК, как меш строит живое окно: TetBody создаётся
+         * заново с пустым полем (`sdf: Default::default()`), и `sdf()` считает
+         * BFS по занятости. Если значения там ступенчатые (±0.5 узла), t
+         * вырождается в 0.5 — это и есть «вершины в полушаге от узла». */
+        let raw = TetBody::ball([0.0, 0.0, 0.0], 1.0, 0);
+        let rebuilt = TetBody {
+            tets: raw.tets.clone(),
+            level_cap: raw.level_cap,
+            origin: raw.origin,
+            sdf: Default::default(),
+        };
+        for (name, body) in [
+            ("шар r=1 (поле запечено)", raw),
+            ("куб n=4", TetBody::cube([0.0, 0.0, 0.0], 4, 0)),
+            ("шар r=1 (поле BFS, как в shape_for)", rebuilt),
+        ] {
+            let ts = body.march_edge_t();
+            assert!(!ts.is_empty(), "{name}: ни одного пересечённого ребра");
+            let bins = histogram(&ts);
+            let n = ts.len() as f32;
+            let edge = (bins[0] + bins[9]) as f32 / n;
+            let mid = (bins[4] + bins[5]) as f32 / n;
+            println!(
+                "DIAG t {name}: рёбер {n:.0}, корзины {bins:?}, край {:.1}%, середина {:.1}%",
+                edge * 100.0,
+                mid * 100.0
+            );
+        }
+        for (name, body) in [
+            ("шар r=1", TetBody::ball([0.0, 0.0, 0.0], 1.0, 0)),
+        ] {
+            let ts = body.march_edge_t();
+            let bins = histogram(&ts);
+            let n = ts.len() as f32;
+            let edge = (bins[0] + bins[9]) as f32 / n;
+            let mid = (bins[4] + bins[5]) as f32 / n;
+            /* Поле непрерывное и аналитическое — вершины не должны садиться в
+             * узлы: иначе это разворот пары узлов, а не интерполяция.
+             *
+             * КУБ СЮДА НЕ ВХОДИТ намеренно: у осевой коробки грани лежат в
+             * плоскостях узлов, и t ≈ 1 — это ПРАВИЛЬНЫЙ ответ (ноль поля ровно
+             * на узловой плоскости), а не симптом. Дискриминирующая форма —
+             * шар: его ноль не совпадает ни с одним узлом. */
+            assert!(edge < 0.5, "{name}: t липнет к узлам (край {:.0}%)", edge * 100.0);
+            assert!(mid < 0.95, "{name}: t вырожден в 0.5 (середина {:.0}%)", mid * 100.0);
+        }
+    }
+
+    /// Числовая проверка интерполяции: для шара r=1 при шаге h отклонение
+    /// вершин от |p|-r должно быть O(h²), а не «константа у узла».
+    /// Замеряется ДО проекции (чистая линейная интерполяция) и после неё.
+    #[test]
+    fn t_interpolation_error_is_second_order() {
+        let body = TetBody::ball([0.0, 0.0, 0.0], 1.0, 0);
+        let h = body.sdf().step;
+        let d = body.march_diag();
+        assert_eq!(d.interp.len(), body.march_diag().interp.len());
+        let mesh = body.extract_marching();
+        let (mut pre, mut post, mut disp) = (0.0f32, 0.0f32, 0.0f32);
+        for (i, p) in d.interp.iter().enumerate() {
+            let r = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+            pre = pre.max((r - 1.0).abs());
+            let q = mesh.positions[i];
+            let rq = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2]).sqrt();
+            post = post.max((rq - 1.0).abs());
+            disp = disp.max((0..3).map(|k| (q[k] - p[k]).powi(2)).sum::<f32>().sqrt());
+        }
+        println!(
+            "DIAG шар r=1 шаг h={h:.5}: |r-1| до проекции {pre:.5} (O(h²)={:.5}), после {post:.5}, сдвиг проекции {disp:.5}",
+            h * h / 2.0
+        );
+        assert!(pre < h * h, "интерполяция не второго порядка: {pre} при h={h}");
+    }
+
+
     /// Меш обязан лежать на НУЛЕ поля расстояний — это и есть поверхность,
     /// по которой считаются столкновения. Проверка прямая: сэмплируем поле в
     /// каждой вершине; линейная интерполяция и проекция не должны оставлять
@@ -2054,17 +2237,42 @@ mod sdf_quality_tests {
 #[cfg(test)]
 mod rot_check {
     use super::*;
+
+    /// Плита обязана быть ОСЕВЫМ параллелепипедом: все вершины меша лежат на
+    /// шести плоскостях x,y,z = ±half (half = n·шаг узла), грани плоские.
+    /// Раньше поле пеклось с поворотом на 45° вокруг (1,1,1) — это давало
+    /// скошенный октаэдр, не совпадающий с коллайдером.
     #[test]
-    fn plate_is_rotated() {
-        let body = TetBody::cube([0.0, 0.0, 0.0], 4, 0);
+    fn plate_is_axis_aligned() {
+        let (n, level) = (4i32, 0u8);
+        let half = n as f32 * node_step(level);
+        let body = TetBody::cube([0.0, 0.0, 0.0], n, level);
         let m = body.extract_marching();
-        let mut ymax = f32::MIN;
-        for p in &m.positions { ymax = ymax.max(p[1]); }
-        let on_top = m.positions.iter().filter(|p| (p[1] - ymax).abs() < 1e-3).count();
-        let mut zmax = f32::MIN;
-        for p in &m.positions { zmax = zmax.max(p[2]); }
-        let on_front = m.positions.iter().filter(|p| (p[2] - zmax).abs() < 1e-3).count();
-        println!("вершин {} · на верхней плоскости {} · на передней {} · ymax {ymax:.3}",
-                 m.positions.len(), on_top, on_front);
+        assert!(m.positions.len() > 100, "меш подозрительно бедный");
+        let mut lo = [f32::MAX; 3];
+        let mut hi = [f32::MIN; 3];
+        for p in &m.positions {
+            for k in 0..3 {
+                lo[k] = lo[k].min(p[k]);
+                hi[k] = hi[k].max(p[k]);
+            }
+        }
+        for k in 0..3 {
+            assert!((lo[k] + half).abs() < 1e-3, "низ по оси {k}: {} вместо {}", lo[k], -half);
+            assert!((hi[k] - half).abs() < 1e-3, "верх по оси {k}: {} вместо {}", hi[k], half);
+        }
+        /* каждая вершина обязана лежать на одной из шести плоскостей коробки
+         * (у тела-коробки вся поверхность на гранях) */
+        let on_face = m
+            .positions
+            .iter()
+            .filter(|p| (0..3).any(|k| (p[k] - lo[k]).abs() < 1e-4 || (p[k] - hi[k]).abs() < 1e-4))
+            .count();
+        let flat = on_face as f32 / m.positions.len() as f32;
+        println!(
+            "плита {}×{}×{}: вершин {}, на плоскостях {:.0}%",
+            n, n, n, m.positions.len(), flat * 100.0
+        );
+        assert!(flat > 0.98, "вершины не на плоскостях коробки: {:.0}%", flat * 100.0);
     }
 }
