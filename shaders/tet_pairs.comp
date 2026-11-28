@@ -16,7 +16,9 @@ layout(std430, set = 0, binding = 5) buffer Pairs { uvec2 pairs[]; };
 layout(std430, set = 0, binding = 6) buffer PairCount { uint pcnt[]; };
 layout(std430, set = 0, binding = 7) buffer BodyAabb { vec4 baabb[]; };
 
-const uint MAX_PAIRS = 262144u;
+/* Потолок — ровно размер буфера (sim::MAX_PAIRS): больше в него не влезает,
+ * а записи за границей били в соседние буферы. */
+const uint MAX_PAIRS = 65536u;
 
 vec3 qrot(vec4 q, vec3 v) {
     vec3 u = q.yzw;

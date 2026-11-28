@@ -23,3 +23,9 @@ required-features = ["live"]
 name = "vf-two-queues"
 path = "src/bin/vf_two_queues.rs"
 required-features = ["live"]
+
+# Замер цепочки пар тетов на живой сцене — без окна.
+[[bin]]
+name = "vf-bench"
+path = "src/bin/vf_bench.rs"
+required-features = ["live"]

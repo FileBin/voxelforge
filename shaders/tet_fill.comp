@@ -11,6 +11,9 @@ layout(std430, set = 0, binding = 2) buffer Span { uvec2 span[]; };
 layout(std430, set = 0, binding = 3) buffer Starts { uint start[]; };
 layout(std430, set = 0, binding = 4) buffer Cursors { uint cursor[]; };
 layout(std430, set = 0, binding = 5) buffer CellTets { uvec2 cell_tets[]; };
+/* Номер ячейки для каждой записи — чтобы проход пар не искал её бинарным
+ * поиском по префиксу (17 зависимых чтений на запись вместо одного). */
+layout(std430, set = 0, binding = 6) buffer CellId { uint cellid[]; };
 
 const uint MAX_ENTRIES = 262144u;
 
@@ -67,7 +70,10 @@ void main() {
                     int ci = cell_index(ivec3(xx, y, z));
                     uint slot = atomicAdd(cursor[ci], 1u);
                     uint at = start[ci] + slot;
-                    if (at < MAX_ENTRIES) cell_tets[at] = uvec2(body, base + t);
+                    if (at < MAX_ENTRIES) {
+                        cell_tets[at] = uvec2(body, base + t);
+                        cellid[at] = uint(ci);
+                    }
                 }
             }
         }

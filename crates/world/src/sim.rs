@@ -306,7 +306,7 @@ pub const PIPE_NAMES: [&str; 36] = [
 ];
 /// Число storage-буферов у каждого пайплайна — в том же порядке.
 const PIPE_BUFNS: [u32; 36] = [
-    1, 2, 2, 3, 4, 2, 5, 4, 1, 1, 4, 4, 7, 3, 2, 4, 3, 6, 8, 6, 4, 1, 2, 3, 2, 2, 4, 8, 1, 7, 5, 6,
+    1, 2, 2, 3, 4, 2, 5, 4, 1, 1, 4, 4, 7, 3, 2, 4, 3, 7, 8, 6, 4, 1, 2, 3, 2, 2, 4, 9, 1, 7, 5, 6,
     5, 6, 2, 2,
 ];
 /// Ячеек на блок в параллельном скане (совпадает с 16 * 64 в шейдере).
@@ -330,8 +330,23 @@ const WORK_TAIL: u32 = 0xFFFF_FFFF;
 /// Порог энергии раскола, Дж. Финальное слово — у шейдера (pc.lo.w), CPU
 /// страхует только на всякий случай.
 pub const FRACTURE_ENERGY: f32 = 500.0;
-/// Потолок пар тетраэдров за такт.
+/// Потолок пар тетраэдров за такт. Он же потолок в шейдерах (`MAX_PAIRS` в
+/// `tet_pairs.comp`/`tet_pairs_flat.comp`): потолок БОЛЬШЕ буфера — это записи
+/// за его границей, то есть GPUVM fault на RADV и мусор в паре у SAT. Поэтому
+/// число обязано совпадать с размером `pairs`, а не быть «с запасом».
 pub const MAX_PAIRS: usize = 65536;
+/// Стадии цепочки пар в такте. Когда пары встроены в такт (`inline_pairs`),
+/// время цепочки = сумма этих строк таблицы: отдельного submit'а с fence нет,
+/// и `vf_perf_read` цепочку отдельно не показывает. `tet_pairs` и
+/// `tet_pairs_flat` — взаимоисключающие крылья, неработавшее даёт ноль.
+const PAIR_STAGE_IDS: [u32; 6] = [
+    P_BODYAABB as u32,
+    P_TETKEY as u32,
+    P_TETSCAN as u32,
+    P_TETFILL as u32,
+    P_TETPAIRS as u32,
+    P_TETPAIRSFLAT as u32,
+];
 /// Слов поля SDF на слот тела в общем пуле. Поле плиты (куб 8 ячеек уровня 1)
 /// занимает ~29³ ≈ 24 К узлов, шар-снаряд — 19³ ≈ 7 К; потолок с двойным
 /// запасом. Память: 64 слота × 65536 × 4 Б = 16 МБ (совпадает с SDF_STRIDE
@@ -469,6 +484,9 @@ pub struct GpuSim {
     tetcursor: *mut c_void,
     /// Раскладка: (тело, индекс тета в пуле) по ячейкам.
     cell_tets: *mut c_void,
+    /// Номер ячейки для каждой записи раскладки (cell_tets): O(1) вместо
+    /// бинарного поиска по `tetstart` в проходе пар.
+    cellid: *mut c_void,
     /// Счётчик пар от tet_pairs.
     pair_count: *mut c_void,
     /// Энергия самого сильного удара на тело (2 vec4 на тело).
@@ -490,6 +508,10 @@ pub struct GpuSim {
     flat_pairs: bool,
     /// Параллельный скан (по умолчанию). VF_SCAN=serial — старый однопоточный.
     par_scan: bool,
+    /// Счётчики прохода пар (VF_PAIR_STATS=1): сколько итераций, какая ячейка
+    /// самая большая, сколько пар не влезло в буфер. Выключено — шейдер не
+    /// делает ни одной атомарной операции сверх записи самой пары.
+    pub pair_stats: bool,
     /// AABB тел для префильтра пар (2 vec4 на тело).
     baabb: *mut c_void,
     /// Пары и их число известны только устройству (SAT берёт число из буфера).
@@ -497,6 +519,11 @@ pub struct GpuSim {
     /// Пары тетов строятся ВНУТРИ такта (одним submit'ом с ним), а не
     /// отдельным submit'ом с ожиданием fence. Ставится один раз из `Live`.
     inline_pairs: bool,
+    /// Время всей цепочки пар (сетка + испускание) в прошлом такте, мс.
+    /// В отдельном submit'е (`run_tet_pairs`) это честное время с ожиданием
+    /// fence; при встроенных в такт парах — сумма стадий цепочки из
+    /// диагностики (если VF_PERF=1), иначе 0.
+    pub last_pairs_ms: f32,
     /// Пары тетраэдров, посчитанные CPU один раз на такт.
     pairs: *mut c_void,
     pub n_pairs: usize,
@@ -630,7 +657,11 @@ impl GpuSim {
         let tetstart = mk((ncells as usize + 1) * 4, true);
         let tetcursor = mk(ncells as usize * 4, false);
         let cell_tets = mk(MAX_CELL_TETS * 8, true);
-        let pair_count = mk(4, true);
+        /* Номер ячейки каждой записи: пишет tet_fill, читает tet_pairs_flat —
+         * вместо бинарного поиска по префиксу на каждую запись. */
+        let cellid = mk(MAX_CELL_TETS * 4, false);
+        /* 8 слов: [0] пары, [1..] — диагностика прохода пар (см. bench). */
+        let pair_count = mk(256, true);
         let impact = mk(MAX_BODIES * 32, true);
         let impact_ring = mk(MAX_EVENTS * 3 * 16, true);
         let impact_cnt = mk(4, true);
@@ -769,6 +800,7 @@ impl GpuSim {
             tetstart,
             tetcursor,
             cell_tets,
+            cellid,
             pair_count,
             impact,
             impact_ring,
@@ -783,11 +815,16 @@ impl GpuSim {
             /* Параллельный скан — по умолчанию. Сверка probe_scan на одних
              * данных: расхождений 0 и по start, и по ячейкам. VF_SCAN=serial
              * возвращает старый однопоточный проход (для сверки). */
-            flat_pairs: !matches!(std::env::var("VF_PAIRGEN").as_deref(), Ok("cell")),
+            /* Старое крыло — VF_PAIRGEN=cell (наше имя) или VF_PAIRS_OLD=1
+             * (как звали в задаче): оба включают проход по ячейкам. */
+            flat_pairs: !matches!(std::env::var("VF_PAIRGEN").as_deref(), Ok("cell"))
+                && std::env::var("VF_PAIRS_OLD").is_err(),
             par_scan: !matches!(std::env::var("VF_SCAN").as_deref(), Ok("serial")),
+            pair_stats: matches!(std::env::var("VF_PAIR_STATS").as_deref(), Ok(v) if v != "0"),
             baabb,
             pairs_on_gpu: false,
             inline_pairs: false,
+            last_pairs_ms: 0.0,
             pairs,
             n_pairs: 0,
             sdf_desc,
@@ -927,6 +964,15 @@ impl GpuSim {
         let n = n as usize;
         self.perf
             .record(&self.perf_ids[..n], &self.perf_ms[..n], tick_ms);
+        /* Пары, встроенные в такт, отдельного submit'а не имеют: их время —
+         * сумма стадий цепочки в этом такте. Без VF_PERF меток нет, и число
+         * остаётся тем, что поставил `run_tet_pairs` (отдельный submit). */
+        if self.inline_pairs && self.perf.enabled {
+            let pair_ms = self.perf.last_stage_sum_ms(&PAIR_STAGE_IDS);
+            if pair_ms > 0.0 {
+                self.last_pairs_ms = pair_ms;
+            }
+        }
         self.perf.maybe_print(std::time::Instant::now());
     }
 
@@ -979,7 +1025,9 @@ impl GpuSim {
             /* lo.w — порог энергии раскола: отдельного vec4 в push-константах
              * нет (128 Б — гарантированный минимум), а это поле пустовало. */
             lo: [p.lo[0], p.lo[1], p.lo[2], FRACTURE_ENERGY],
-            hi: [p.hi[0], p.hi[1], p.hi[2], 0.0],
+            /* hi.w — флаг диагностики прохода пар: в такте это поле больше
+             * никто не читает (число тел для body_init ставит write_slots). */
+            hi: [p.hi[0], p.hi[1], p.hi[2], if self.pair_stats { 1.0 } else { 0.0 }],
         }
     }
 
@@ -1965,6 +2013,7 @@ impl GpuSim {
                     self.tetstart,
                     self.tetcursor,
                     self.cell_tets,
+                    self.cellid,
                 ],
                 push,
                 groups: [g_body, 1, 1],
@@ -2089,16 +2138,20 @@ impl GpuSim {
     /// fence не нужно вовсе.
     pub fn tet_pair_steps(&mut self, push: Push) -> Vec<Step> {
         /* Счётчики — в ноль с хоста: предыдущий такт уже закрыт (wait_idle),
-         * иначе это была бы запись по считающемуся буферу. */
+         * иначе это была бы запись по считающемуся буферу. В `pair_count`
+         * лежит не только число пар, но и блок диагностики прохода пар
+         * (рассмотрено/самая большая ячейка/не влезло — 8 слов), поэтому
+         * чистим его целиком: иначе счётчики копились бы между тактами. */
+        let zero = vec![0u8; 256];
         unsafe {
-            vf_buffer_write(self.ctx, self.pair_count, 0, [0u8; 4].as_ptr() as *const c_void, 4);
+            check_status(
+                vf_buffer_write(self.ctx, self.pair_count, 0, zero.as_ptr() as *const c_void, zero.len()),
+                "zero_pairs",
+            );
             let zero_cells = vec![0u8; self.ncells as usize * 4];
-            vf_buffer_write(
-                self.ctx,
-                self.tetcnt,
-                0,
-                zero_cells.as_ptr() as *const c_void,
-                zero_cells.len(),
+            check_status(
+                vf_buffer_write(self.ctx, self.tetcnt, 0, zero_cells.as_ptr() as *const c_void, zero_cells.len()),
+                "zero_cells",
             );
         }
         let g_body = ((self.n as u32) + WG - 1) / WG;
@@ -2120,6 +2173,9 @@ impl GpuSim {
         steps.extend(self.scan_steps(push));
         steps.push(Step {
             pipe: P_TETFILL,
+            /* Номер ячейки каждой записи (cellid) пишется здесь же — проход
+             * пар читает его одним обращением вместо бинарного поиска по
+             * префиксу `tetstart` (17 зависимых чтений на запись). */
             bufs: vec![
                 self.bodies[0],
                 self.tets,
@@ -2127,22 +2183,33 @@ impl GpuSim {
                 self.tetstart,
                 self.tetcursor,
                 self.cell_tets,
+                self.cellid,
             ],
             push,
             groups: [g_body, 1, 1],
         });
         steps.push(Step {
             pipe: if self.flat_pairs { P_TETPAIRSFLAT } else { P_TETPAIRS },
-            bufs: vec![
-                self.bodies[0],
-                self.tets,
-                self.span,
-                self.tetstart,
-                self.cell_tets,
-                self.pairs,
-                self.pair_count,
-                self.baabb,
-            ],
+            /* flat читает ещё и номер ячейки записи (9 буферов), старое
+             * крыло VF_PAIRGEN=cell / VF_PAIRS_OLD=1 — без него (8). Раскладку
+             * числа буферов держим рядом с выбором пайплайна: layout у них
+             * разный, и лишний буфер — это ошибка диспатча. */
+            bufs: {
+                let mut b = vec![
+                    self.bodies[0],
+                    self.tets,
+                    self.span,
+                    self.tetstart,
+                    self.cell_tets,
+                    self.pairs,
+                    self.pair_count,
+                    self.baabb,
+                ];
+                if self.flat_pairs {
+                    b.push(self.cellid);
+                }
+                b
+            },
             push,
             /* По записям: групп на весь потолок (записей не больше
              * MAX_CELL_TETS), лишние invocation выходят первой проверкой.
@@ -2188,9 +2255,15 @@ impl GpuSim {
                 },
             })
             .collect();
+        let t0 = std::time::Instant::now();
         unsafe {
             check_status(vf_run(self.ctx, ds.as_mut_ptr(), ds.len() as u32), "run_tet_pairs");
         }
+        /* `vf_run` ждёт fence, поэтому это ЧЕСТНОЕ время всей цепочки пар
+         * (сетка + испускание), а не «отправлено и забыто». В таблице стадий
+         * F3 эта цепочка НЕ видна, когда пары встроены в такт (`inline_pairs`):
+         * тогда её время — сумма стадий такта (см. `note_pairs_stage_ms`). */
+        self.last_pairs_ms = t0.elapsed().as_secs_f32() * 1000.0;
         self.n_pairs
     }
 
@@ -2204,6 +2277,30 @@ impl GpuSim {
             );
         }
         out
+    }
+
+    /// Сколько пар тетов насчитал проход пар за последний такт (4 Б).
+    /// Нужен замерам: `n_pairs` на CPU — это потолок буфера, а не число пар.
+    pub fn read_pair_debug(&self) -> [u32; 8] {
+        let mut c = [0u32; 8];
+        unsafe {
+            check_status(
+                vf_buffer_read(self.ctx, self.pair_count, 0, c.as_mut_ptr() as *mut c_void, 32),
+                "read_pair_debug",
+            );
+        }
+        c
+    }
+
+    pub fn read_pair_count(&self) -> u32 {
+        let mut c = [0u32; 1];
+        unsafe {
+            check_status(
+                vf_buffer_read(self.ctx, self.pair_count, 0, c.as_mut_ptr() as *mut c_void, 4),
+                "read_pair_count",
+            );
+        }
+        c[0]
     }
 
     /// События раскола из кольца: читаем счётчик 4 Б и, только если он

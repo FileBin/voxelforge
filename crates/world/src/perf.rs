@@ -529,6 +529,11 @@ pub struct Perf {
     pub cpu_rows: Vec<CpuRow>,
 
     acc: [StageAcc; MAX_STAGES],
+    /// Длительности стадий ПОСЛЕДНЕГО такта, мс (сумма по всем диспатчам
+    /// стадии). Окно и печать сюда не смотрят: число нужно тем, кому стадия
+    /// такта нужна отдельно каждый такт — например цепочке пар, встроенной в
+    /// такт, у которой нет своего submit'а и своего места в таблице.
+    last_stage: [f32; MAX_STAGES],
     /// Сколько тактов попало в окно.
     ticks: u32,
     tick_sum_ms: f64,
@@ -560,6 +565,7 @@ impl Perf {
             last_tick_ms: 0.0,
             scene: VfSceneCounts::default(),
             acc: [StageAcc::default(); MAX_STAGES],
+            last_stage: [0.0; MAX_STAGES],
             cpu: Vec::new(),
             cpu_rows: Vec::new(),
             ticks: 0,
@@ -611,6 +617,7 @@ impl Perf {
             }
             cnt[s] += 1;
         }
+        self.last_stage = sum;
         for (s, a) in self.acc.iter_mut().enumerate() {
             if cnt[s] == 0 {
                 continue;
@@ -704,6 +711,21 @@ impl Perf {
     /// Длительность последнего завершённого такта, мс («ИТОГО такт»).
     pub fn last_tick_ms(&self) -> f32 {
         self.last_tick_ms
+    }
+
+    /// Сумма времени указанных стадий в ПОСЛЕДНЕМ такте, мс. Нужна стадиям,
+    /// у которых нет своей строки в таблице: например цепочке пар, когда она
+    /// встроена в список такта (`tet_key`+`tet_scan`+`tet_fill`+`tet_pairs*`).
+    pub fn last_stage_sum_ms(&self, ids: &[u32]) -> f32 {
+        ids.iter()
+            .filter_map(|&s| {
+                let s = s as usize;
+                if s >= MAX_STAGES {
+                    return None;
+                }
+                Some(self.last_stage[s])
+            })
+            .sum()
     }
 
     /// Закрыть окно без печати (тесты и оверлей).
