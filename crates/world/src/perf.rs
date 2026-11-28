@@ -11,10 +11,12 @@
 //! (стадия изредка берёт втрое больше), и «пустой» такт. Три числа рядом —
 //! разброс стадии за окно.
 //!
-//! Рядом со стадиями — частоты: сколько кадров в секунду и сколько тактов
-//! физики реально завершилось (`Rates`), с мин/макс за то же окно и историей
-//! на графики. Номинал тут бесполезен: такт «20 Гц» при перегрузе выходит
-//! 12 Гц, и именно эта разница и есть ответ на «почему лагает».
+//! Рядом со стадиями — времена: работа кадра (запись команд + submit, мс) и
+//! работа такта (ИТОГО такт, мс), оба со мин/сред/макс за окно и историей на
+//! графики. Частоты (fps/tps) остаются числом в той же строке — но графики
+//! рисуются по работе, а не по периоду: период кадра на 60 Гц всегда 16.7 мс,
+//! период такта на 20 Гц — 50 мс, и график по ним показывал бы развёртку
+//! вместо нагрузки.
 //!
 //! Печать — одна таблица раз в секунду, самой дорогой стадией сверху: вопрос
 //! «что оптимизировать» должен решаться чтением первой строки.
@@ -103,8 +105,16 @@ pub struct VfSceneCounts {
     pub contacts: u32,
 }
 
-/// Итог окна частот: сколько кадров и тактов пришлось на секунду окна.
-/// Печатается строкой над таблицей стадий и рисуется в оверлее.
+/// Итог окна: сколько кадров и тактов пришлось на секунду окна, плюс сколько
+/// времени заняла РАБОТА кадра и такта (мс). Печатается строкой над таблицей
+/// стадий и рисуется в оверлее.
+///
+/// Времена здесь — работа, а не период. Период кадра при 60 fps всегда 16.7 мс
+/// (его задаёт развёртка), период такта при 20 Гц — 50 мс; на графике они
+/// показывали бы бюджет, а не то, сколько машина правда считала. `frame_*` —
+/// запись команд + submit (CPU-работа кадра: без ожидания fence, acquire,
+/// present и развёртки),
+/// `tick_*` — ИТОГО такт, то же число, что в нижней строке таблицы стадий.
 /// Раскладка 1:1 с `vf_rates` в `c/voxelforge_view.h`.
 #[repr(C)]
 #[derive(Clone, Copy, Default, PartialEq)]
@@ -117,8 +127,15 @@ pub struct RatesOut {
     /// Крайние значения TPS в окне (по кадрам окна).
     pub tps_min: f32,
     pub tps_max: f32,
-    /// Среднее время кадра, мс: по нему видно, упираемся ли в развёртку.
+    /// Работа кадра, мс: среднее и края за окно.
     pub frame_mean_ms: f32,
+    pub frame_min_ms: f32,
+    pub frame_max_ms: f32,
+    /// Работа такта (ИТОГО такт), мс: среднее и края за окно. Ноль — такта в
+    /// окне не было.
+    pub tick_mean_ms: f32,
+    pub tick_min_ms: f32,
+    pub tick_max_ms: f32,
     /// Кадров и тактов в окне. `frames == 0` — окно ещё ни разу не закрылось.
     pub frames: u32,
     pub ticks: u32,
@@ -136,37 +153,60 @@ pub struct VfRatesView {
     pub tps_min: f32,
     pub tps_max: f32,
     pub frame_mean_ms: f32,
+    pub frame_min_ms: f32,
+    pub frame_max_ms: f32,
+    pub tick_mean_ms: f32,
+    pub tick_min_ms: f32,
+    pub tick_max_ms: f32,
     pub frames: u32,
     pub ticks: u32,
-    /// Покадровая история, старые отсчёты первыми.
-    pub fps_hist: *const f32,
-    pub fps_hist_n: u32,
-    pub tps_hist: *const f32,
-    pub tps_hist_n: u32,
+    /// Покадровая история работы кадра и такта, мс, старые отсчёты первыми.
+    pub frame_hist: *const f32,
+    pub frame_hist_n: u32,
+    pub tick_hist: *const f32,
+    pub tick_hist_n: u32,
 }
 
-/// Счётчик частот окна: кадры считает главный поток, такты приходят числом
+/// Счётчик окна: кадры считает главный поток, такты приходят числом
 /// завершённых тактов физики (`Perf::ticks_total`). Окно — то же 1 с.
 ///
-/// TPS здесь — не номинал: это число тактов, которые правда доехали до конца
-/// за последнюю секунду, и минимум с максимумом по кадрам окна. Голодный такт
-/// (физика не успевает) виден как просадка графика, а не как «20 Гц» на бумаге.
+/// Два разных времени, и их легко перепутать:
+/// - период кадра (`interval_ms`) — это всегда ~1/частота развёртки (16.7 мс
+///   на 60 Гц), из него считаются только крайние значения FPS;
+/// - работа кадра (`work_ms`) — сколько реально заняли запись команд и submit.
+///   На 60 fps это единицы миллисекунд, и на графике должно быть именно это
+///   (period present-а сюда не входит: на FIFO он ждёт развёртку);
+/// - работа такта (`tick_work_ms`) — длительность последнего ЗАВЕРШЁННОГО
+///   такта («ИТОГО такт»), а не интервал между тактами: 5-10 мс, не 50.
 pub struct Rates {
     /// Сколько секунд копить до закрытия окна (1.0 в бою).
     pub window_s: f32,
     start: Instant,
     frames: u32,
     ticks: u32,
-    frame_sum_ms: f64,
-    frame_min_ms: f32,
-    frame_max_ms: f32,
+    /// Крайние ПЕРИОДЫ кадров окна, мс — только для min/max FPS.
+    iv_min_ms: f32,
+    iv_max_ms: f32,
+    /// Работа кадра: сумма, минимум и максимум за окно, мс.
+    work_sum_ms: f64,
+    work_min_ms: f32,
+    work_max_ms: f32,
+    /// Работа такта: сумма, края и сколько тактов реально видели.
+    tick_sum_ms: f64,
+    tick_min_ms: f32,
+    tick_max_ms: f32,
+    tick_n: u32,
+    /// Работа последнего завершённого такта. Её же повторяем в истории на
+    /// кадрах без нового такта: такт идёт 50 мс, кадр 16.7 — иначе график
+    /// такта мигал бы нулями между тактами.
+    last_tick_ms: f32,
     tps_min: f32,
     tps_max: f32,
     tps_any: bool,
     /// Моменты завершённых тактов за последнюю секунду — мгновенный TPS.
     pubs: VecDeque<Instant>,
-    hist_fps: [f32; HIST_MAX],
-    hist_tps: [f32; HIST_MAX],
+    hist_frame: [f32; HIST_MAX],
+    hist_tick: [f32; HIST_MAX],
     hist_n: u32,
     out: RatesOut,
     /// Первые кадры — создание окна и компиляция пайплайнов, а не рендер.
@@ -181,31 +221,48 @@ impl Rates {
             start: Instant::now(),
             frames: 0,
             ticks: 0,
-            frame_sum_ms: 0.0,
-            frame_min_ms: f32::INFINITY,
-            frame_max_ms: 0.0,
+            iv_min_ms: f32::INFINITY,
+            iv_max_ms: 0.0,
+            work_sum_ms: 0.0,
+            work_min_ms: f32::INFINITY,
+            work_max_ms: 0.0,
+            tick_sum_ms: 0.0,
+            tick_min_ms: f32::INFINITY,
+            tick_max_ms: 0.0,
+            tick_n: 0,
+            last_tick_ms: 0.0,
             tps_min: 0.0,
             tps_max: 0.0,
             tps_any: false,
             pubs: VecDeque::new(),
-            hist_fps: [0.0; HIST_MAX],
-            hist_tps: [0.0; HIST_MAX],
+            hist_frame: [0.0; HIST_MAX],
+            hist_tick: [0.0; HIST_MAX],
             hist_n: 0,
             out: RatesOut::default(),
             skip: 3,
         }
     }
 
-    /// Один кадр: `frame_ms` — настоящее (не урезанное клампом) время кадра,
+    /// Один кадр. `interval_ms` — период кадра (для крайних значений FPS),
+    /// `work_ms` — реальная работа кадра (record + submit + present),
+    /// `tick_ms` — работа последнего завершённого такта (0 — нового не было),
     /// `ticks` — сколько тактов физики завершилось с прошлого кадра.
     /// Возвращает `true`, если этим кадром закрылось окно.
-    pub fn sample(&mut self, now: Instant, frame_ms: f32, ticks: u32) -> bool {
+    pub fn sample(
+        &mut self,
+        now: Instant,
+        interval_ms: f32,
+        work_ms: f32,
+        tick_ms: f32,
+        ticks: u32,
+    ) -> bool {
         if self.skip > 0 {
             self.skip -= 1;
             self.start = now;
             return false;
         }
-        let frame_ms = frame_ms.max(0.001);
+        let interval_ms = interval_ms.max(0.001);
+        let work_ms = work_ms.max(0.0);
         /* Мгновенный TPS — число тактов за последнюю секунду. Считаем по
          * моментам публикаций: на 20 Гц это 20 вёдер в скользящем окне, и
          * график выходит ровным, а голодный такт сразу топит значение. */
@@ -230,10 +287,21 @@ impl Rates {
         }
         self.frames += 1;
         self.ticks += ticks;
-        self.frame_sum_ms += frame_ms as f64;
-        self.frame_min_ms = self.frame_min_ms.min(frame_ms);
-        self.frame_max_ms = self.frame_max_ms.max(frame_ms);
-        self.push_hist(1000.0 / frame_ms, tps_now);
+        self.iv_min_ms = self.iv_min_ms.min(interval_ms);
+        self.iv_max_ms = self.iv_max_ms.max(interval_ms);
+        self.work_sum_ms += work_ms as f64;
+        self.work_min_ms = self.work_min_ms.min(work_ms);
+        self.work_max_ms = self.work_max_ms.max(work_ms);
+        /* Такт засчитываем только когда он правда пришёл: повтор прошлого
+         * значения на промежуточных кадрах — для графика, а не для средних. */
+        if tick_ms > 0.0 {
+            self.last_tick_ms = tick_ms;
+            self.tick_sum_ms += tick_ms as f64;
+            self.tick_n += 1;
+            self.tick_min_ms = self.tick_min_ms.min(tick_ms);
+            self.tick_max_ms = self.tick_max_ms.max(tick_ms);
+        }
+        self.push_hist(work_ms, self.last_tick_ms);
         if now.duration_since(self.start).as_secs_f32() < self.window_s {
             return false;
         }
@@ -251,15 +319,38 @@ impl Rates {
          * суммы кадров. Тогда честнее показать среднее вместо «min > mean».
          * От двух кадров крайние уже имеют смысл. */
         let few = self.frames < 2;
-        let fps_min = if few || !(self.frame_max_ms > 0.0) {
+        let fps_min = if few || !(self.iv_max_ms > 0.0) {
             fps_mean
         } else {
-            1000.0 / self.frame_max_ms
+            1000.0 / self.iv_max_ms
         };
-        let fps_max = if few || !(self.frame_min_ms.is_finite() && self.frame_min_ms > 0.0) {
+        let fps_max = if few || !(self.iv_min_ms.is_finite() && self.iv_min_ms > 0.0) {
             fps_mean
         } else {
-            1000.0 / self.frame_min_ms
+            1000.0 / self.iv_min_ms
+        };
+        let work_mean = (self.work_sum_ms / frames as f64) as f32;
+        let work_min = if self.work_min_ms.is_finite() {
+            self.work_min_ms.min(work_mean)
+        } else {
+            work_mean
+        };
+        let work_max = self.work_max_ms.max(work_mean);
+        let tick_n = self.tick_n.max(1) as f64;
+        let tick_mean = (self.tick_sum_ms / tick_n) as f32;
+        /* Новых тактов в окне могло не быть вовсе (мир спит, или такт идёт
+         * дольше секунды на софтверном рендере). Тогда держим последние
+         * известные числа, а не обнуляем панель: «tick ms 65.3» из прошлого
+         * окна полезнее прочерка. Прочерк остаётся для случая, когда такта не
+         * было вообще ни разу. */
+        let (tick_mean, tick_min, tick_max) = if self.tick_n > 0 {
+            (tick_mean, self.tick_min_ms, self.tick_max_ms)
+        } else {
+            (
+                self.out.tick_mean_ms,
+                self.out.tick_min_ms,
+                self.out.tick_max_ms,
+            )
         };
         self.out = RatesOut {
             fps_mean,
@@ -270,32 +361,43 @@ impl Rates {
             tps_mean,
             tps_min: if self.tps_any && !few { self.tps_min } else { tps_mean },
             tps_max: if self.tps_any && !few { self.tps_max } else { tps_mean },
-            frame_mean_ms: (self.frame_sum_ms / frames as f64) as f32,
+            frame_mean_ms: work_mean,
+            frame_min_ms: work_min,
+            frame_max_ms: work_max,
+            tick_mean_ms: tick_mean,
+            tick_min_ms: tick_min,
+            tick_max_ms: tick_max,
             frames: self.frames,
             ticks: self.ticks,
         };
         self.frames = 0;
         self.ticks = 0;
-        self.frame_sum_ms = 0.0;
-        self.frame_min_ms = f32::INFINITY;
-        self.frame_max_ms = 0.0;
+        self.iv_min_ms = f32::INFINITY;
+        self.iv_max_ms = 0.0;
+        self.work_sum_ms = 0.0;
+        self.work_min_ms = f32::INFINITY;
+        self.work_max_ms = 0.0;
+        self.tick_sum_ms = 0.0;
+        self.tick_min_ms = f32::INFINITY;
+        self.tick_max_ms = 0.0;
+        self.tick_n = 0;
         self.tps_min = 0.0;
         self.tps_max = 0.0;
         self.tps_any = false;
         self.start = now;
     }
 
-    fn push_hist(&mut self, fps: f32, tps: f32) {
+    fn push_hist(&mut self, frame_ms: f32, tick_ms: f32) {
         let n = self.hist_n as usize;
         if n < HIST_MAX {
-            self.hist_fps[n] = fps;
-            self.hist_tps[n] = tps;
+            self.hist_frame[n] = frame_ms;
+            self.hist_tick[n] = tick_ms;
             self.hist_n += 1;
         } else {
-            self.hist_fps[..].copy_within(1.., 0);
-            self.hist_tps[..].copy_within(1.., 0);
-            self.hist_fps[HIST_MAX - 1] = fps;
-            self.hist_tps[HIST_MAX - 1] = tps;
+            self.hist_frame[..].copy_within(1.., 0);
+            self.hist_tick[..].copy_within(1.., 0);
+            self.hist_frame[HIST_MAX - 1] = frame_ms;
+            self.hist_tick[HIST_MAX - 1] = tick_ms;
         }
     }
 
@@ -314,12 +416,17 @@ impl Rates {
             tps_min: self.out.tps_min,
             tps_max: self.out.tps_max,
             frame_mean_ms: self.out.frame_mean_ms,
+            frame_min_ms: self.out.frame_min_ms,
+            frame_max_ms: self.out.frame_max_ms,
+            tick_mean_ms: self.out.tick_mean_ms,
+            tick_min_ms: self.out.tick_min_ms,
+            tick_max_ms: self.out.tick_max_ms,
             frames: self.out.frames,
             ticks: self.out.ticks,
-            fps_hist: self.hist_fps.as_ptr(),
-            fps_hist_n: self.hist_n,
-            tps_hist: self.hist_tps.as_ptr(),
-            tps_hist_n: self.hist_n,
+            frame_hist: self.hist_frame.as_ptr(),
+            frame_hist_n: self.hist_n,
+            tick_hist: self.hist_tick.as_ptr(),
+            tick_hist_n: self.hist_n,
         }
     }
 
@@ -328,9 +435,16 @@ impl Rates {
         self.start = Instant::now();
         self.frames = 0;
         self.ticks = 0;
-        self.frame_sum_ms = 0.0;
-        self.frame_min_ms = f32::INFINITY;
-        self.frame_max_ms = 0.0;
+        self.iv_min_ms = f32::INFINITY;
+        self.iv_max_ms = 0.0;
+        self.work_sum_ms = 0.0;
+        self.work_min_ms = f32::INFINITY;
+        self.work_max_ms = 0.0;
+        self.tick_sum_ms = 0.0;
+        self.tick_min_ms = f32::INFINITY;
+        self.tick_max_ms = 0.0;
+        self.tick_n = 0;
+        self.last_tick_ms = 0.0;
         self.tps_min = 0.0;
         self.tps_max = 0.0;
         self.tps_any = false;
@@ -358,6 +472,10 @@ pub struct Perf {
     rates: RatesOut,
     /// Сколько тактов завершилось с включения сбора — главному потоку для TPS.
     ticks_total: u64,
+    /// Длительность последнего принятого такта, мс — «ИТОГО такт». Главный
+    /// поток берёт её для графика работы такта: интервал между тактами (50 мс
+    /// при 20 Гц) для этого не годится, он ничего не говорит о нагрузке.
+    last_tick_ms: f32,
     /// Счётчики сцены (тела, контакты) — берутся из готовых буферов ядра.
     scene: VfSceneCounts,
     acc: [StageAcc; MAX_STAGES],
@@ -389,6 +507,7 @@ impl Perf {
             enabled,
             rates: RatesOut::default(),
             ticks_total: 0,
+            last_tick_ms: 0.0,
             scene: VfSceneCounts::default(),
             acc: [StageAcc::default(); MAX_STAGES],
             ticks: 0,
@@ -422,6 +541,9 @@ impl Perf {
             self.skip -= 1;
             return;
         }
+        /* «ИТОГО такт» — то же число, что в нижней строке таблицы: главному
+         * потоку оно нужно на график работы такта, а не на печать. */
+        self.last_tick_ms = tick_ms.max(0.0);
         let mut sum = [0.0f32; MAX_STAGES];
         let mut mx = [0.0f32; MAX_STAGES];
         let mut cnt = [0u32; MAX_STAGES];
@@ -513,6 +635,11 @@ impl Perf {
         self.ticks_total
     }
 
+    /// Длительность последнего завершённого такта, мс («ИТОГО такт»).
+    pub fn last_tick_ms(&self) -> f32 {
+        self.last_tick_ms
+    }
+
     /// Закрыть окно без печати (тесты и оверлей).
     pub fn finish_window(&mut self) {
         let ticks = self.ticks.max(1) as f32;
@@ -560,15 +687,20 @@ impl Perf {
             /* Ниже 10 — с десятой: в headless/на просадках целые «2 fps» и
              * «0 fps» скрывают разницу между 0.3 и 9. */
             let f = |v: f32| if v >= 10.0 { format!("{v:.0}") } else { format!("{v:.1}") };
+            /* «frame» здесь — работа кадра, а не период: период задаёт
+             * развёртка (16.7 мс), и печатать его рядом с fps бессмысленно. */
             println!(
-                "[perf] fps {} (min {} max {}) · tps {} (min {} max {}) · frame {:.1} мс",
+                "[perf] fps {} (min {} max {}) · tps {} (min {} max {}) · frame ms {:.2} (min {:.2} max {:.2}) · tick ms {:.2}",
                 f(r.fps_mean),
                 f(r.fps_min),
                 f(r.fps_max),
                 f(r.tps_mean),
                 f(r.tps_min),
                 f(r.tps_max),
-                r.frame_mean_ms
+                r.frame_mean_ms,
+                r.frame_min_ms,
+                r.frame_max_ms,
+                r.tick_mean_ms
             );
         } else {
             println!("[perf] fps — (окно кадров ещё не закрыто) · tps —");
@@ -611,6 +743,7 @@ impl Perf {
         self.tick_sum_ms = 0.0;
         self.tick_min_ms = f32::INFINITY;
         self.tick_max_ms = 0.0;
+        self.last_tick_ms = 0.0;
         self.tick_min_window_ms = 0.0;
         self.tick_mean_ms = 0.0;
         self.tick_max_window_ms = 0.0;
@@ -782,20 +915,40 @@ mod tests {
         let mut closed = false;
         for i in 0..5 {
             let ticks = u32::from(i == 0 || i == 4);
-            closed |= r.sample(t0 + Duration::from_millis(20 * (i + 1)), 10.0 + i as f32, ticks);
+            let tick_ms = match i {
+                0 => 6.0,
+                4 => 9.0,
+                _ => 0.0,
+            };
+            closed |= r.sample(
+                t0 + Duration::from_millis(20 * (i + 1)),
+                20.0,
+                10.0 + i as f32,
+                tick_ms,
+                ticks,
+            );
         }
         assert!(closed, "окно должно было закрыться");
         let o = r.out();
         assert_eq!(o.frames, 5);
         assert_eq!(o.ticks, 2);
         assert!((o.fps_mean - 50.0).abs() < 1e-3, "fps_mean {}", o.fps_mean);
-        assert!((o.fps_min - 1000.0 / 14.0).abs() < 1e-2, "fps_min {}", o.fps_min);
-        assert!((o.fps_max - 100.0).abs() < 1e-2, "fps_max {}", o.fps_max);
+        /* Период у всех кадров ровно 20 мс — крайние fps равны среднему. Если
+         * бы в крайние попадало время РАБОТЫ кадра (10-14 мс), максимум вышел
+         * бы 100 fps: это и было старой ошибкой. */
+        assert!((o.fps_min - 50.0).abs() < 1e-3, "fps_min {}", o.fps_min);
+        assert!((o.fps_max - 50.0).abs() < 1e-3, "fps_max {}", o.fps_max);
         assert!((o.tps_mean - 20.0).abs() < 1e-2, "tps_mean {}", o.tps_mean);
         // TPS по кадрам: пока такт один — 1, после второго — 2.
         assert!((o.tps_min - 1.0).abs() < 1e-4, "tps_min {}", o.tps_min);
         assert!((o.tps_max - 2.0).abs() < 1e-4, "tps_max {}", o.tps_max);
         assert!((o.frame_mean_ms - 12.0).abs() < 1e-3, "frame {}", o.frame_mean_ms);
+        assert!((o.frame_min_ms - 10.0).abs() < 1e-3, "frame_min {}", o.frame_min_ms);
+        assert!((o.frame_max_ms - 14.0).abs() < 1e-3, "frame_max {}", o.frame_max_ms);
+        // Работа такта — принятые значения, а не период кадра.
+        assert!((o.tick_mean_ms - 7.5).abs() < 1e-3, "tick {}", o.tick_mean_ms);
+        assert!((o.tick_min_ms - 6.0).abs() < 1e-3, "tick_min {}", o.tick_min_ms);
+        assert!((o.tick_max_ms - 9.0).abs() < 1e-3, "tick_max {}", o.tick_max_ms);
     }
 
     /// Мёртвая физика (ни одного такта) — tps 0, а не пустая строка.
@@ -807,16 +960,43 @@ mod tests {
         r.start = t0;
         r.window_s = 0.05;
         for i in 0..4 {
-            r.sample(t0 + Duration::from_millis(20 * (i + 1)), 20.0, 0);
+            r.sample(t0 + Duration::from_millis(20 * (i + 1)), 20.0, 3.0, 0.0, 0);
         }
         let o = r.out();
         assert_eq!(o.ticks, 0);
         assert_eq!(o.tps_mean, 0.0);
         assert!((o.fps_mean - 50.0).abs() < 1e-3);
+        // Без тактов работа такта — ноль, а не «нет такта = 50 мс».
+        assert_eq!(o.tick_mean_ms, 0.0);
+        assert_eq!(o.tick_max_ms, 0.0);
+    }
+
+    /// Окно без новых тактов не обнуляет числа такта: панель держит последние
+    /// известные, а не мигает прочерком на медленном такте.
+    #[test]
+    fn window_without_ticks_keeps_last_tick_numbers() {
+        let t0 = Instant::now();
+        let mut r = Rates::new();
+        r.skip = 0;
+        r.start = t0;
+        r.window_s = 0.1;
+        // Первое окно: такт 8.5 мс на первом кадре.
+        r.sample(t0 + Duration::from_millis(50), 20.0, 3.0, 8.5, 0);
+        assert!(r.sample(t0 + Duration::from_millis(120), 20.0, 3.0, 0.0, 0));
+        let o = r.out();
+        assert!((o.tick_mean_ms - 8.5).abs() < 1e-4, "tick {}", o.tick_mean_ms);
+        assert!((o.tick_min_ms - 8.5).abs() < 1e-4);
+        // Второе окно — без тактов вовсе: числа остались прошлые, не ноль.
+        r.sample(t0 + Duration::from_millis(200), 20.0, 3.0, 0.0, 0);
+        assert!(r.sample(t0 + Duration::from_millis(280), 20.0, 3.0, 0.0, 0));
+        let o2 = r.out();
+        assert!((o2.tick_mean_ms - 8.5).abs() < 1e-4, "tick {}", o2.tick_mean_ms);
+        assert!((o2.tick_max_ms - 8.5).abs() < 1e-4, "tick_max {}", o2.tick_max_ms);
     }
 
     /// История для графиков: старые отсчёты первыми, длиннее HIST_MAX не растёт,
-    /// в конце — самые свежие кадры.
+    /// в конце — самые свежие кадры. Пишется РАБОТА кадра (мс), а такт
+    /// повторяется на промежуточных кадрах, чтобы график не мигал нулями.
     #[test]
     fn history_keeps_last_hundred_twenty_frames() {
         let t0 = Instant::now();
@@ -825,18 +1005,28 @@ mod tests {
         r.start = t0;
         r.window_s = 10.0; // окно в тесте не закрываем
         for i in 0..(HIST_MAX + 10) {
-            r.sample(t0 + Duration::from_millis(i as u64 + 1), 10.0 + i as f32, 0);
+            let tick_ms = if i % 4 == 0 { 7.0 } else { 0.0 };
+            r.sample(
+                t0 + Duration::from_millis(i as u64 + 1),
+                16.7,
+                10.0 + i as f32,
+                tick_ms,
+                0,
+            );
         }
         let v = r.c_view();
-        assert_eq!(v.fps_hist_n as usize, HIST_MAX);
-        let hist = unsafe { std::slice::from_raw_parts(v.fps_hist, v.fps_hist_n as usize) };
-        /* Кадры в тесте становятся медленнее (10, 11, … мс), поэтому fps
-         * падает: первый отсчёт в окне — самый быстрый, последний — самый
-         * медленный, и последний из них — последний поданный кадр. */
-        assert!((hist[0] - 1000.0 / 20.0).abs() < 1e-3, "начало {}", hist[0]);
-        let want = 1000.0 / (10.0 + (HIST_MAX + 9) as f32);
+        assert_eq!(v.frame_hist_n as usize, HIST_MAX);
+        assert_eq!(v.tick_hist_n as usize, HIST_MAX);
+        let hist = unsafe { std::slice::from_raw_parts(v.frame_hist, v.frame_hist_n as usize) };
+        /* Первым ушёл отсчёт i = 10 (ровно на HIST_MAX вытеснено), последним —
+         * i = HIST_MAX + 9. Время работы кадра растёт: 20 … 139 мс. */
+        assert!((hist[0] - 20.0).abs() < 1e-3, "начало {}", hist[0]);
+        let want = 10.0 + (HIST_MAX + 9) as f32;
         assert!((hist[HIST_MAX - 1] - want).abs() < 1e-3, "хвост {}", hist[HIST_MAX - 1]);
-        assert!(hist[0] > hist[HIST_MAX - 1]);
+        let th = unsafe { std::slice::from_raw_parts(v.tick_hist, v.tick_hist_n as usize) };
+        // Такт был на i % 4 == 0 — после последнего значения нулей нет.
+        assert!((th[HIST_MAX - 1] - 7.0).abs() < 1e-3, "такт {}", th[HIST_MAX - 1]);
+        assert!(th[0] > 0.0);
     }
 
     /// Первые кадры (окно, компиляция пайплайнов) в статистику не идут.
@@ -848,12 +1038,13 @@ mod tests {
         r.window_s = 1.0;
         // skip по умолчанию 3: три кадра по 300 мс — это компиляция, не рендер.
         for i in 0..3 {
-            assert!(!r.sample(t0 + Duration::from_millis(300 * (i + 1)), 300.0, 1));
+            assert!(!r.sample(t0 + Duration::from_millis(300 * (i + 1)), 300.0, 250.0, 0.0, 1));
         }
         assert_eq!(r.out().frames, 0);
-        r.sample(t0 + Duration::from_millis(1300), 16.0, 1);
+        r.sample(t0 + Duration::from_millis(1300), 16.0, 25.0, 0.0, 1);
         assert_eq!(r.frames, 1);
-        assert!((r.frame_max_ms - 16.0).abs() < 1e-4);
+        assert!((r.iv_max_ms - 16.0).abs() < 1e-4);
+        assert!((r.work_max_ms - 25.0).abs() < 1e-4);
     }
 
     /// Один кадр в окне: окно длиннее кадра, поэтому крайние значения взяты
@@ -865,13 +1056,17 @@ mod tests {
         r.skip = 0;
         r.start = t0;
         r.window_s = 0.1;
-        // Один кадр 400 мс, окно закрывается сразу после него.
-        assert!(r.sample(t0 + Duration::from_millis(400), 400.0, 1));
+        /* Один кадр: период 400 мс (2.5 fps), работа кадра 12 мс, такт 20 мс.
+         * Работа и период — разные числа, и в строке должны стоять работа и
+         * период: 12 мс кадра и 20 мс такта, а не 400 и не 50. */
+        assert!(r.sample(t0 + Duration::from_millis(400), 400.0, 12.0, 20.0, 1));
         let o = r.out();
         assert_eq!(o.frames, 1);
         assert!((o.fps_mean - 2.5).abs() < 1e-3, "fps_mean {}", o.fps_mean);
         assert!((o.fps_min - o.fps_mean).abs() < 1e-4);
         assert!((o.fps_max - o.fps_mean).abs() < 1e-4);
+        assert!((o.frame_mean_ms - 12.0).abs() < 1e-4, "frame {}", o.frame_mean_ms);
+        assert!((o.tick_mean_ms - 20.0).abs() < 1e-4, "tick {}", o.tick_mean_ms);
         assert!((o.tps_min - o.tps_mean).abs() < 1e-4);
         assert!((o.tps_max - o.tps_mean).abs() < 1e-4);
     }

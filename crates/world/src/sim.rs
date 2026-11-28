@@ -757,6 +757,13 @@ impl GpuSim {
         self.perf.tick_range_ms()
     }
 
+    /// Длительность последнего завершённого такта, мс — то же число, что в
+    /// строке «ИТОГО такт». График в оверлее строится по нему, а не по
+    /// интервалу между тактами (50 мс при 20 Гц ничего не говорит о нагрузке).
+    pub fn perf_last_tick_ms(&self) -> f32 {
+        self.perf.last_tick_ms()
+    }
+
     /// Счётчики сцены для строки тел в оверлее (всего/бодр/контактов).
     pub fn perf_scene(&self) -> crate::perf::VfSceneCounts {
         self.perf.scene_counts()

@@ -44,22 +44,28 @@ typedef struct {
     float share;
 } vf_perf_row;
 
-/* Частоты кадра и физики за последнее окно (1 с) — строка над таблицей
- * стадий и два графика под ней. Считает главный поток: кадры он видит сам,
- * такты — по числу завершённых тактов физики. Номинальные «20 Гц» тут были бы
- * бесполезны: интересно, сколько тактов правда доехало и насколько ровно.
+/* Времена кадра и такта за последнее окно (1 с) — строка над таблицей стадий
+ * и два графика под ней. Считает главный поток: кадры он видит сам, работу
+ * такта присылает физика.
+ *
+ * frame_ms — РАБОТА кадра (запись команд + submit), а не период: период при
+ * 60 fps всегда 16.7 мс, его задаёт развёртка, и на графике он показывал бы
+ * бюджет, а не нагрузку. tick_ms — «ИТОГО такт» (работа стадий), а не интервал
+ * между тактами (50 мс при 20 Гц). fps/tps остались числом над графиками:
+ * частота полезна, но её график — это график развёртки.
  * История — покадрово, старые отсчёты первыми; указатели живут только на время
  * вызова vf_view_perf (окно копирует данные внутрь себя). */
 typedef struct {
     float fps_mean, fps_min, fps_max;
     float tps_mean, tps_min, tps_max;
-    float frame_mean_ms;   /* среднее время кадра окна, мс */
+    float frame_mean_ms, frame_min_ms, frame_max_ms; /* работа кадра, мс */
+    float tick_mean_ms, tick_min_ms, tick_max_ms;    /* работа такта, мс */
     uint32_t frames;       /* кадров и тактов в окне; frames == 0 — окна ещё нет */
     uint32_t ticks;
-    const float *fps_hist; /* мгновенный fps по кадрам, старые первыми */
-    uint32_t fps_hist_n;
-    const float *tps_hist; /* тактов в секунду по кадрам */
-    uint32_t tps_hist_n;
+    const float *frame_hist; /* работа кадра по кадрам окна, старые первыми */
+    uint32_t frame_hist_n;
+    const float *tick_hist;  /* работа последнего такта на каждый кадр */
+    uint32_t tick_hist_n;
 } vf_rates;
 
 vf_status vf_view_new(vf_view **out, vf_ctx *core, int w, int h, const char *title,
@@ -98,3 +104,8 @@ void vf_view_draw(vf_view *v, int32_t mesh, uint32_t body, float alpha, const fl
 int vf_view_present_mode(vf_view *v);
 void vf_view_draw_lines(vf_view *v, int32_t lines, const float *model, const float *tint);
 void vf_view_end(vf_view *v);
+/* Реальная работа последнего кадра, мс: запись команд и submit (CPU-часть
+ * кадра). Ожидание fence/acquire, пауза развёртки и сам present не входят —
+ * на 60 Гц они всегда равны периоду 16.7 мс и о нагрузке не говорят ничего.
+ * 0 — кадр ещё не измерен. */
+float vf_view_frame_work_ms(const vf_view *v);

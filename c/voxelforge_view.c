@@ -11,13 +11,22 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Монотонные секунды — только для замера работы кадра. SDL_GetPerformanceCounter
+ * уже подключён (SDL3 в зависимостях окна) и даёт наносекунды; SDL_GetTicks
+ * идёт миллисекундами, а кадр на живой карте занимает меньше 1 мс. */
+static double now_s(void) {
+    static double freq = 0.0;
+    if (freq == 0.0) freq = (double)SDL_GetPerformanceFrequency();
+    return (double)SDL_GetPerformanceCounter() / freq;
+}
+
 #define MAX_SHAPES 512
 #define MAX_SWAP 8
 /* Оверлей стадий: не больше стольких строк и столько байт под его вершины.
  * Потолок держим с запасом: строка текста в 18 знаков при scale 2 — это
  * ~600 вершин, 16 строк — ~10 тыс. вершин, 240 КБ. Буфер 2 МБ заведомо выше. */
 #define VF_PERF_MAX_ROWS 24
-/* История частот для графиков: 120 кадров ≈ 2 с при 60 fps. */
+/* История работы кадра и такта для графиков: 120 кадров ≈ 2 с при 60 fps. */
 #define VF_HIST_MAX 120
 #define VF_UI_VBUF_BYTES (2u * 1024u * 1024u)
 
@@ -76,16 +85,22 @@ struct vf_view {
     /* Оверлей запрошен этим кадром (F3 / VF_PERF), даже если данных ещё нет:
      * тогда панель показывает «ждём такт», а не исчезает молча. */
     int perf_show;
-    /* Частоты кадра и физики: среднее и крайние за окно + история на графики.
+    /* Времена кадра и такта: среднее и крайние за окно + история на графики.
      * Копия vf_rates внутри окна — указатели Rust-истории живут один вызов. */
     float fps_mean, fps_min, fps_max;
     float tps_mean, tps_min, tps_max;
-    float frame_mean_ms;
+    float frame_mean_ms, frame_min_ms, frame_max_ms; /* работа кадра */
+    float tick_mean_ms, tick_min_ms, tick_max_ms;    /* работа такта */
     uint32_t rates_frames;
-    float hist_fps[VF_HIST_MAX];
-    float hist_tps[VF_HIST_MAX];
+    float hist_frame[VF_HIST_MAX];
+    float hist_tick[VF_HIST_MAX];
     uint32_t hist_n;
     int rates_ok;
+    /* Реальная работа кадра, мс: запись команд + submit. Отсекаем ожидание
+     * fence/acquire и present (там сидит развёртка) — иначе «время кадра»
+     * всегда равнялось бы периоду 16.7 мс и ничего не говорило о нагрузке. */
+    double t_work0;
+    float frame_work_ms;
     VkDescriptorSetLayout dsl;
     VkDescriptorPool dpool;
     VkDescriptorSet dset;
@@ -946,6 +961,8 @@ int32_t vf_view_add_lines(vf_view *v, const float *pts, uint32_t n_lines) {
 // ---------------------------------------------------------------- кадр
 
 void vf_view_begin(vf_view *v, float r, float g, float b) {
+    /* Ожидание fence и acquire — это пауза развёртки и очередь, а не работа:
+     * замер начинается ПОСЛЕ них (ниже, перед записью команд). */
     vkWaitForFences(v->dev, 1, &v->fence, VK_TRUE, UINT64_MAX);
     uint32_t img = 0;
     VkResult ar = vkAcquireNextImageKHR(v->dev, v->sc, UINT64_MAX, v->sem_ready, VK_NULL_HANDLE, &img);
@@ -958,6 +975,7 @@ void vf_view_begin(vf_view *v, float r, float g, float b) {
         ar = vkAcquireNextImageKHR(v->dev, v->sc, UINT64_MAX, v->sem_ready, VK_NULL_HANDLE, &img);
     }
     if (ar != VK_SUCCESS) return;
+    v->t_work0 = now_s();
     v->cur_img = img;
     vkResetFences(v->dev, 1, &v->fence);
     vkResetCommandBuffer(v->cmd, 0);
@@ -1111,20 +1129,20 @@ static void fmt_triplet(char *buf, size_t n, float mn, float me, float mx) {
 
 /* График истории: n отсчётов на w пикселей, верх — vmax. Столбики 1-2 px без
  * заливки: график — фон под цифрами, а не цветное пятно; новых конвейеров не
- * нужно, всё те же квады из ui_quad. g1/g2 — линии-ориентиры (60/30 fps,
- * номинал/половина tps), чтобы просадку можно было читать без линейки. */
+ * нужно, всё те же квады из ui_quad. guide_ms — линия бюджета (16.7 мс кадра
+ * при 60 Гц, 50 мс такта при 20 Гц): по ней видно, сколько бюджета съедено. */
 static void ui_graph(vf_view *v, float x, float y, float w, float h,
                      const float *s, uint32_t n, float vmax,
-                     const float *bar, const float *guide, float g1, float g2) {
+                     const float *bar, const float *line_col, float guide_ms) {
     if (n == 0 || vmax <= 0.0f) return;
-    float fr[4] = {guide[0], guide[1], guide[2], 0.22f};
+    float fr[4] = {line_col[0], line_col[1], line_col[2], 0.22f};
     ui_quad(v, x, y, w, 1.0f, fr);
     ui_quad(v, x, y + h - 1.0f, w, 1.0f, fr);
     ui_quad(v, x, y, 1.0f, h, fr);
     ui_quad(v, x + w - 1.0f, y, 1.0f, h, fr);
-    float gl[4] = {guide[0], guide[1], guide[2], 0.38f};
-    if (g1 > 0.0f && g1 < vmax) ui_quad(v, x, y + h - h * g1 / vmax, w, 1.0f, gl);
-    if (g2 > 0.0f && g2 < vmax) ui_quad(v, x, y + h - h * g2 / vmax, w, 1.0f, gl);
+    float gl[4] = {line_col[0], line_col[1], line_col[2], 0.55f};
+    if (guide_ms > 0.0f && guide_ms < vmax)
+        ui_quad(v, x, y + h - h * guide_ms / vmax, w, 1.0f, gl);
     float bw = w / (float)n;
     float bw_draw = bw > 1.6f ? bw - 0.6f : 1.0f;
     for (uint32_t i = 0; i < n; i++) {
@@ -1135,6 +1153,18 @@ static void ui_graph(vf_view *v, float x, float y, float w, float h,
         if (bh < 1.0f) bh = 1.0f;
         ui_quad(v, x + bw * (float)i, y + h - bh, bw_draw, bh, bar);
     }
+}
+
+/* Бюджет кадра и такта: 60 Гц и 20 Гц. Линии на графиках — про них. */
+#define VF_FRAME_BUDGET_MS 16.7f
+#define VF_TICK_BUDGET_MS 50.0f
+
+/* Верх шкалы по максимуму истории, округлённый до шага step (5 мс для кадра,
+ * 10 мс для такта), чтобы подпись была круглой, а не «0-13». */
+static float scale_top(float v, float step) {
+    float s = step;
+    while (s < v && s < 4000.0f) s += step;
+    return s;
 }
 
 /* Частота одной строкой: целые от 10 и выше, десятые ниже. На просадках
@@ -1166,8 +1196,8 @@ static void draw_perf_overlay(vf_view *v) {
     /* Панель шире прежней: «мин / сред / макс» идут одной группой — три числа
      * рядом читаются как разброс стадии, а не как три несвязанных колонки. */
     const float x0 = 10.0f, y0 = 10.0f, w = 620.0f;
-    /* Верх панели: заголовок, две строки частот, подписи и два графика
-     * (250x40 каждый). Таблица стадий идёт под ними. */
+    /* Верх панели: заголовок, строка работы кадра, строка работы такта,
+     * подписи и два графика (250x40 каждый). Таблица стадий идёт под ними. */
     const float yrate1 = y0 + 30.0f;
     const float yrate2 = y0 + 48.0f;
     const float ycap = y0 + 72.0f;
@@ -1201,70 +1231,58 @@ static void draw_perf_overlay(vf_view *v) {
     }
     ui_text(v, x0 + 10, y0 + 8, sc, title, line);
 
-    /* Частоты — первой строкой: чаще всего хочется знать именно это. Среднее
-     * плюс крайние за то же окно: одно среднее прячет просадку на глаз. */
+    /* Времена — первой строкой: чаще всего хочется знать именно это. Здесь
+     * РАБОТА кадра и такта (миллисекунды нагрузки), а не период развёртки:
+     * период при 60 fps всегда 16.7 мс и о нагрузке не говорит ничего.
+     * Сами частоты остаются числом в конце строки — они полезны. */
     if (v->rates_ok && v->rates_frames > 0) {
-        char fe[16], fn[16], fx[16], te[16], tn[16], tx[16];
+        char fe[16], te[16];
         fmt_rate(fe, sizeof fe, v->fps_mean);
-        fmt_rate(fn, sizeof fn, v->fps_min);
-        fmt_rate(fx, sizeof fx, v->fps_max);
         fmt_rate(te, sizeof te, v->tps_mean);
-        fmt_rate(tn, sizeof tn, v->tps_min);
-        fmt_rate(tx, sizeof tx, v->tps_max);
-        snprintf(line, sizeof line, "fps %s (min %s max %s)  frame %.1f ms",
-                 fe, fn, fx, (double)v->frame_mean_ms);
+        snprintf(line, sizeof line, "frame ms %.1f (min %.1f max %.1f)   fps %s",
+                 (double)v->frame_mean_ms, (double)v->frame_min_ms,
+                 (double)v->frame_max_ms, fe);
         ui_text(v, x0 + 10, yrate1, sc, title, line);
-        /* Вторая строка — tps и опорное 60 Гц: на 620 px панели всё одной
-         * строкой не встаёт, а переносить числа по разным строкам нельзя —
-         * fps/tps должны читаться рядом. */
-        snprintf(line, sizeof line, "tps %s (min %s max %s)  60 Hz = 16.7 ms",
-                 te, tn, tx);
+        if (v->tick_max_ms > 0.0f) {
+            snprintf(line, sizeof line, "tick ms %.1f (min %.1f max %.1f)   tps %s",
+                     (double)v->tick_mean_ms, (double)v->tick_min_ms,
+                     (double)v->tick_max_ms, te);
+        } else {
+            /* Такт ещё не завершался — честнее прочерк, чем ноль мс. */
+            snprintf(line, sizeof line, "tick ms -- (no tick yet)   tps %s", te);
+        }
         ui_text(v, x0 + 10, yrate2, sc, head, line);
     } else {
-        ui_text(v, x0 + 10, yrate1, sc, head, "fps -- (min -- max --)  frame -- ms");
-        ui_text(v, x0 + 10, yrate2, sc, head, "tps -- (min -- max --)");
+        ui_text(v, x0 + 10, yrate1, sc, head, "frame ms -- (min -- max --)   fps --");
+        ui_text(v, x0 + 10, yrate2, sc, head, "tick ms -- (min -- max --)   tps --");
     }
 
-    /* Графики: ориентиры — 60/30 fps (обычный бюджет кадра) и номинал/половина
-     * tps. Но если машина сильно ниже (софтверный рендер, тяжёлая сцена),
-     * фиксированная шкала прижала бы все столбики к нулю и график перестал бы
-     * что-либо показывать — тогда автомасштаб по максимуму истории. */
+    /* Два графика — работа кадра и работа такта, мс. Шкала — по максимуму
+     * истории (с запасом), но не ниже бюджета: линия 16.7 мс (60 Гц) и 50 мс
+     * (20 Гц) должна быть видна, иначе график показывает нагрузку без ответа
+     * «сколько бюджета осталось». */
     {
         float fmax = 0.0f, tmax = 0.0f;
         for (uint32_t i = 0; i < v->hist_n; i++) {
-            if (v->hist_fps[i] > fmax) fmax = v->hist_fps[i];
-            if (v->hist_tps[i] > tmax) tmax = v->hist_tps[i];
+            if (v->hist_frame[i] > fmax) fmax = v->hist_frame[i];
+            if (v->hist_tick[i] > tmax) tmax = v->hist_tick[i];
         }
-        float fs, fg1, fg2;
-        if (fmax >= 30.0f) {
-            fs = 60.0f;
-            while (fs < fmax * 1.05f && fs < 1000.0f) fs += 30.0f;
-            fg1 = 60.0f;
-            fg2 = 30.0f;
-        } else {
-            fs = 5.0f;
-            while (fs < fmax * 1.15f && fs < 1000.0f) fs += 5.0f;
-            fg1 = fs;
-            fg2 = fs * 0.5f;
-        }
-        float ts;
-        if (tmax >= 10.0f) {
-            ts = 20.0f;
-            while (ts < tmax * 1.05f && ts < 500.0f) ts += 10.0f;
-        } else {
-            ts = 3.0f;
-            while (ts < tmax * 1.15f && ts < 500.0f) ts += 3.0f;
-        }
-        float bar1[4] = {text[0], text[1], text[2], 0.55f};
-        float bar2[4] = {text[0], text[1], text[2], 0.55f};
+        float fs = scale_top(fmax * 1.15f, 5.0f);
+        if (fs <= VF_FRAME_BUDGET_MS) fs = scale_top(VF_FRAME_BUDGET_MS * 1.1f, 5.0f);
+        float ts = scale_top(tmax * 1.15f, 10.0f);
+        if (ts <= VF_TICK_BUDGET_MS) ts = scale_top(VF_TICK_BUDGET_MS * 1.1f, 10.0f);
+        float bar[4] = {text[0], text[1], text[2], 0.55f};
+        /* Опорные линии — янтарные: их видно и поверх столбиков, и в пустом
+         * графике, и они не путаются с самими отсчётами. */
+        float guide[4] = {0.98f, 0.68f, 0.30f, 1.0f};
         float gx2 = x0 + 12.0f + gw + 16.0f;
-        ui_graph(v, x0 + 12.0f, ygraph, gw, gh, v->hist_fps, v->hist_n, fs,
-                 bar1, head, fg1, fg2);
-        ui_graph(v, gx2, ygraph, gw, gh, v->hist_tps, v->hist_n, ts,
-                 bar2, head, ts, ts * 0.5f);
-        snprintf(line, sizeof line, "fps 0-%.0f", (double)fs);
+        ui_graph(v, x0 + 12.0f, ygraph, gw, gh, v->hist_frame, v->hist_n, fs,
+                 bar, guide, VF_FRAME_BUDGET_MS);
+        ui_graph(v, gx2, ygraph, gw, gh, v->hist_tick, v->hist_n, ts,
+                 bar, guide, VF_TICK_BUDGET_MS);
+        snprintf(line, sizeof line, "frame 0-%.0f ms /16.7", (double)fs);
         ui_text(v, x0 + 12.0f, ycap, sc, head, line);
-        snprintf(line, sizeof line, "tps 0-%.0f", (double)ts);
+        snprintf(line, sizeof line, "tick 0-%.0f ms /50", (double)ts);
         ui_text(v, gx2, ycap, sc, head, line);
     }
 
@@ -1350,7 +1368,7 @@ void vf_view_perf(vf_view *v, const vf_perf_row *rows, uint32_t n,
     v->perf_tick_max_ms = tick_max_ms;
     v->perf_scene_ok = scene != NULL;
     if (scene) v->perf_scene = *scene;
-    /* Частоты и история копируются внутрь окна: указатели истории живут только
+    /* Времена и история копируются внутрь окна: указатели истории живут только
      * на время вызова, а рисуем мы их в vf_view_end. */
     v->rates_ok = rates != NULL;
     v->hist_n = 0;
@@ -1362,16 +1380,21 @@ void vf_view_perf(vf_view *v, const vf_perf_row *rows, uint32_t n,
         v->tps_min = rates->tps_min;
         v->tps_max = rates->tps_max;
         v->frame_mean_ms = rates->frame_mean_ms;
+        v->frame_min_ms = rates->frame_min_ms;
+        v->frame_max_ms = rates->frame_max_ms;
+        v->tick_mean_ms = rates->tick_mean_ms;
+        v->tick_min_ms = rates->tick_min_ms;
+        v->tick_max_ms = rates->tick_max_ms;
         v->rates_frames = rates->frames;
-        uint32_t nf = rates->fps_hist_n;
+        uint32_t nf = rates->frame_hist_n;
         if (nf > VF_HIST_MAX) nf = VF_HIST_MAX;
-        if (rates->fps_hist && nf) {
-            memcpy(v->hist_fps, rates->fps_hist, (size_t)nf * sizeof(float));
+        if (rates->frame_hist && nf) {
+            memcpy(v->hist_frame, rates->frame_hist, (size_t)nf * sizeof(float));
         }
-        uint32_t nt = rates->tps_hist_n;
+        uint32_t nt = rates->tick_hist_n;
         if (nt > VF_HIST_MAX) nt = VF_HIST_MAX;
-        if (rates->tps_hist && nt) {
-            memcpy(v->hist_tps, rates->tps_hist, (size_t)nt * sizeof(float));
+        if (rates->tick_hist && nt) {
+            memcpy(v->hist_tick, rates->tick_hist, (size_t)nt * sizeof(float));
         }
         v->hist_n = nf < nt ? nf : nt;
     }
@@ -1400,6 +1423,13 @@ void vf_view_end(vf_view *v) {
     vf_ctx_lock(v->core);
     VkResult sres = vkQueueSubmit(v->queue, 1, &si, v->fence);
     vf_ctx_unlock(v->core);
+    /* Работа кадра: запись команд + submit. Замер кончается ЗДЕСЬ, до present,
+     * по той же причине, по которой не считаются ожидание fence и acquire:
+     * present — это отдача кадра показу, и на FIFO он блокируется развёрткой
+     * или кадровым callback'ом композитора (в headless-прогоне на lavapipe
+     * видели и 17 мс, и секунды). Это ожидание, а не работа: на 60 Гц оно
+     * всегда равно периоду, и именно оно раньше попадало в график. */
+    v->frame_work_ms = (float)((now_s() - v->t_work0) * 1000.0);
     if (sres != VK_SUCCESS) return;
     VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.waitSemaphoreCount = 1;
@@ -1420,4 +1450,8 @@ void vf_view_end(vf_view *v) {
         make_framebuffers(v);
     }
     v->recording = 0;
+}
+
+float vf_view_frame_work_ms(const vf_view *v) {
+    return v ? v->frame_work_ms : 0.0f;
 }
