@@ -86,6 +86,13 @@ struct vf_view {
     VkCommandPool cmd_pool;
     VkCommandBuffer cmd;
     VkSemaphore sem_ready, sem_done;
+    /* Две очереди (VF_SPLIT=1): кадр ждёт тактовый таймлайн («банк
+     * опубликован») и сигналит свой — по нему такт понимает, что банк, в
+     * который он собирается писать, уже прочитан. Оба NULL — прежний путь. */
+    VkSemaphore tl_tick, tl_frame;
+    uint64_t tl_wait;   /* значение такта, на котором стоит банк */
+    uint64_t tl_value;  /* сколько кадров отмечено (значение своего таймлайна) */
+    uint32_t bank;      /* какой банк читает этот кадр */
     VkFence fence;
     int recording;
     uint32_t cur_img;
@@ -988,6 +995,22 @@ void vf_view_begin(vf_view *v, float r, float g, float b) {
     v->recording = 1;
 }
 
+/* Две очереди: семафоры ядра. tick — ждать перед кадром, frame — сигналить
+ * после (ядро по нему пускает такт писать в этот банк). NULL — выключено. */
+void vf_view_timelines(vf_view *v, void *tick_sem, void *frame_sem) {
+    if (!v) return;
+    v->tl_tick = (VkSemaphore)tick_sem;
+    v->tl_frame = (VkSemaphore)frame_sem;
+}
+
+/* Кадр читает банк, опубликованный тактом `value`: ждать его на GPU (обычно
+ * уже выполнено — такт публикует на такт раньше). */
+void vf_view_tick_ready(vf_view *v, uint64_t value, uint32_t bank) {
+    if (!v) return;
+    v->tl_wait = v->tl_tick ? value : 0;
+    v->bank = bank;
+}
+
 void vf_view_set_bodies(vf_view *v, void *buffer, uint32_t count) {
     if (!v || !buffer) return;
     v->body_buf = (VkBuffer)buffer;
@@ -1241,12 +1264,47 @@ void vf_view_end(vf_view *v) {
     si.pCommandBuffers = &v->cmd;
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores = &v->sem_done;
+
+    /* Две очереди: (1) ждём тактовый таймлайн на значение опубликованного
+     * банка, (2) сигналим свой кадровый таймлайн, чтобы такт не начал писать
+     * в этот банк, пока кадр его читает.
+     *
+     * Ждать надо ДО первого чтения буфера тел, то есть на стадии vertex
+     * shader; ALL_COMMANDS — верхняя граница, лишнего не ломает. */
+    VkSemaphore tl_ws[2] = {v->sem_ready, v->tl_tick};
+    VkPipelineStageFlags tl_wss[2] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT};
+    VkSemaphore tl_ss[2] = {v->sem_done, v->tl_frame};
+    uint64_t tl_wv[2] = {0, v->tl_wait}; /* у бинарного значение игнорируется */
+    uint64_t tl_sv[2] = {0, v->tl_value + 1};
+    VkTimelineSemaphoreSubmitInfo tsi = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+    int tl_on = v->tl_tick != NULL && v->tl_frame != NULL;
+    if (tl_on) {
+        v->tl_value++;
+        tsi.waitSemaphoreValueCount = 2;
+        tsi.pWaitSemaphoreValues = tl_wv;
+        tsi.signalSemaphoreValueCount = 2;
+        tsi.pSignalSemaphoreValues = tl_sv;
+        si.pNext = &tsi;
+        if (v->tl_wait) {
+            si.waitSemaphoreCount = 2;
+            si.pWaitSemaphores = tl_ws;
+            si.pWaitDstStageMask = tl_wss;
+        }
+        si.signalSemaphoreCount = 2;
+        si.pSignalSemaphores = tl_ss;
+    }
     /* Очередь общая с физикой: submit и present — под замком ядра.
      * Fence ждём вне замка (см. vf_view_begin). */
     vf_ctx_lock(v->core);
     VkResult sres = vkQueueSubmit(v->queue, 1, &si, v->fence);
     vf_ctx_unlock(v->core);
     if (sres != VK_SUCCESS) return;
+    if (tl_on) {
+        /* Кадр читает этот банк на значении tl_value: такт ждёт его, прежде
+         * чем писать в этот банк снова. */
+        vf_note_bank_read(v->core, v->bank, v->tl_value);
+    }
     VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.waitSemaphoreCount = 1;
     pi.pWaitSemaphores = &v->sem_done;

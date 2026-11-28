@@ -522,8 +522,11 @@ pub struct GpuSim {
     bank: [*mut c_void; 2],
     /// Приёмник кадрового прохода (поза и кватернион на тело).
     draw: *mut c_void,
-    /// Что опубликовано: номер такта и банк. Кадр ждёт это значение.
+    /// Что опубликовано и доступно кадру: номер такта и банк (на такт позади).
     pub published: (u64, usize),
+    /// Банк, который записал ПОСЛЕДНИЙ такт: (номер такта, банк). Для сверки
+    /// «банк равен физике» сразу после такта.
+    pub tick_bank: (u64, usize),
     /// Время кадрового submit'а: от отправки до закрытия fence, мс.
     pub frame_ms: f32,
     pub frame_submits: u64,
@@ -794,6 +797,7 @@ impl GpuSim {
             bank,
             draw,
             published: (0, 0),
+            tick_bank: (0, 0),
             frame_ms: 0.0,
             frame_submits: 0,
             frame_t0: std::time::Instant::now(),
@@ -1040,6 +1044,11 @@ impl GpuSim {
     /// Одна очередь: кадр идёт в ту же очередь, что такт, и читает буфер
     /// физики напрямую (прежний путь). Две: кадр на graphics, читает банк.
     pub fn frame_submit(&mut self, alpha: f32, wait: bool) -> u64 {
+        if self.split && self.published.0 == 0 {
+            /* Публикации ещё нет: рисовать нечего. */
+            self.frame_ms = 0.0;
+            return 0;
+        }
         let (src, stream, tick_no) = if self.split {
             let (tick_no, bank) = self.published;
             (self.bank[bank], VF_STREAM_FRAME, tick_no)
@@ -1349,6 +1358,7 @@ impl GpuSim {
                 push,
                 groups: [g_body, 1, 1],
             });
+            self.tick_bank = (tick_no, bank);
             let read_by = unsafe { vf_bank_read_value(self.ctx, bank as u32) };
             if read_by > 0 {
                 waits.push(VfSemWait {
@@ -1356,7 +1366,16 @@ impl GpuSim {
                     value: read_by,
                 });
             }
-            self.published = (tick_no, bank);
+            /* Кадру доступен банк ПРОШЛОГО такта (N-1): он опубликован, и на
+             * него есть таймлайн-значение N-1. Текущий такт кадр НЕ ждёт — в
+             * этом весь смысл раздельных очередей. Стоит задержки в один такт
+             * (50 мс при 20 Гц), зато кадр неуязвим к длительности такта.
+             * Первому такту публиковать нечего: published остаётся нулём, и
+             * кадр пропускает submits, пока такт не посчитался. */
+            if tick_no >= 2 {
+                let prev = tick_no - 1;
+                self.published = (prev, (prev % 2) as usize);
+            }
         }
 
         let mut keep: Vec<Vec<*mut c_void>> = steps.iter().map(|s| s.bufs.clone()).collect();
