@@ -44,6 +44,24 @@ typedef struct {
     float share;
 } vf_perf_row;
 
+/* Частоты кадра и физики за последнее окно (1 с) — строка над таблицей
+ * стадий и два графика под ней. Считает главный поток: кадры он видит сам,
+ * такты — по числу завершённых тактов физики. Номинальные «20 Гц» тут были бы
+ * бесполезны: интересно, сколько тактов правда доехало и насколько ровно.
+ * История — покадрово, старые отсчёты первыми; указатели живут только на время
+ * вызова vf_view_perf (окно копирует данные внутрь себя). */
+typedef struct {
+    float fps_mean, fps_min, fps_max;
+    float tps_mean, tps_min, tps_max;
+    float frame_mean_ms;   /* среднее время кадра окна, мс */
+    uint32_t frames;       /* кадров и тактов в окне; frames == 0 — окна ещё нет */
+    uint32_t ticks;
+    const float *fps_hist; /* мгновенный fps по кадрам, старые первыми */
+    uint32_t fps_hist_n;
+    const float *tps_hist; /* тактов в секунду по кадрам */
+    uint32_t tps_hist_n;
+} vf_rates;
+
 vf_status vf_view_new(vf_view **out, vf_ctx *core, int w, int h, const char *title,
                       const char *shader_dir);
 void vf_view_free(vf_view *v);
@@ -52,10 +70,11 @@ void vf_view_free(vf_view *v);
  * кадр между vf_view_begin и vf_view_end; числа дублируются в консоль, здесь
  * они для глаза. tick_* — строка ИТОГО такта: мин/сред/макс за то же окно.
  * scene — счётчики тел и контактов, отдельной строкой под таблицей (NULL —
- * строку не рисовать). */
+ * строку не рисовать). rates — частоты кадра и физики: строка над стадиями и
+ * два графика под ней (NULL — строку и графики не рисовать). */
 void vf_view_perf(vf_view *v, const vf_perf_row *rows, uint32_t n,
                   float tick_min_ms, float tick_mean_ms, float tick_max_ms,
-                  const vf_scene_counts *scene);
+                  const vf_scene_counts *scene, const vf_rates *rates);
 
 // Опросить события. Возвращает 0, если окно закрыто.
 int vf_view_poll(vf_view *v, vf_input *in);
