@@ -459,10 +459,15 @@ impl TetBody {
         /* Марчинг по полю — по умолчанию: поверхность изоповерхность, а не
          * набор граней тетов. VF_MARCH=old возвращает старую выборку граней
          * для сравнения. */
-        let mut mesh = if std::env::var("VF_MARCH").as_deref() == Ok("old") {
-            self.extract_faces()
-        } else {
+        /* Марчинг — ОПЦИЯ (VF_MARCH=1): при первом же расколе в окне он ронял
+         * процесс SIGSEGV. Headless не воспроизводит, значит дело в связке с
+         * путём окна/раскола (split_surfaces делит поверхность по тетам, а у
+         * марчинга треугольники уже не привязаны к тетам). Пока по умолчанию
+         * старый путь — он проверен. */
+        let mut mesh = if std::env::var("VF_MARCH").as_deref() == Ok("1") {
             self.extract_marching()
+        } else {
+            self.extract_faces()
         };
         smooth(&mut mesh, iterations, lambda);
         let level = mesh.level;
