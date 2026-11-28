@@ -539,6 +539,8 @@ impl Sim {
                  * Позы на GPU при этом могут быть новее опубликованных, но мы
                  * их не смешиваем — смешивать нечего при alpha = 1. */
                 let tick_in_flight = shared.lock().unwrap().in_tick;
+                let mut g = shared.lock().unwrap();
+                let step = if g.interval > 0.0 { g.interval } else { g.tick };
                 let overdue = tick_in_flight
                     || std::env::var("VF_NO_INTERP").is_ok()
                     || step > g.tick * 1.25;
