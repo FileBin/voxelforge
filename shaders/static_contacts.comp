@@ -1,115 +1,41 @@
 #version 450
 #include "common.glsl"
 
-/* Контакты со статикой: пол и четыре стенки ящика (партнёр — GROUND).
+/* Контакты со статикой — ПРОХОД 0 из 4: сброс свёрток по каналам.
  *
- * Раньше здесь брались полуразмеры AABB и одна точка в центре грани: поворот
- * тела игнорировался, и куб чувствовал пол как сфера — катился и не вставал
- * на грань. Теперь контакты строятся по РЕАЛЬНЫМ вершинам тетраэдров, как на
- * CPU: пол даёт до четырёх точек опоры (иначе коробка балансирует на одной
- * точке), стенки — по одной.
+ * ПОЧЕМУ ИМЯ СТАРОЕ. Раньше этот файл был единственным проходом и делал всю
+ * работу: ОДНА invocation на тело, внутри — цикл по всем тетам тела (у плиты
+ * тысячи) и по 4 вершины на тет. Один поток обходил десятки тысяч вершин, при
+ * 64 потоках в группе и десятках тел занята была ОДНА рабочая группа — 80 %
+ * такта уходило в эту стадию при простое GPU.
+ *
+ * Теперь работа нарезана по ТЕТАМ (см. static_work.comp), и стадия состоит из
+ * четырёх проходов:
+ *   static_contacts (этот файл) — сброс свёрток, 8 каналов на тело;
+ *   static_work   — тет считает локальные максимумы по 8 каналам;
+ *   static_tie    — выбор победителя (минимальный индекс тета среди равных);
+ *   static_emit   — на тело: точка победившего тета и push в прежнем порядке.
+ *
+ * Имя и номер стадии оставлены прежними намеренно: в таблице F3/VF_PERF=1
+ * строка `static_contacts` показывает СУММУ всех четырёх проходов, поэтому
+ * замеры «до/после» сравнимы напрямую.
+ *
+ * score = 0 — «кандидата нет» (кодирование static_work не даёт 0 для конечных
+ * чисел), win = 0xFFFFFFFF — «победителя нет». Сброс — отдельным диспатчем, а
+ * не записью с CPU: такт целиком уходит одним командным буфером, и хост-запись
+ * между кусками такта недопустима.
+ *
+ * Буферы — 8 слотов на тело, размер по ЧИСЛУ ТЕЛ сцены (не по MAX_BODIES:
+ * куча в тестах — 1000 и 5000 тел). CPU округляет размер до кратности 64,
+ * поэтому диспатч покрывает буфер ровно и границы в шейдере не нужны.
  */
 
 layout(local_size_x = 64) in;
-layout(std430, set = 0, binding = 0) buffer Bodies { Body b[]; };
-layout(std430, set = 0, binding = 1) buffer Pool { vec4 tets[]; };
-layout(std430, set = 0, binding = 2) buffer Span { uvec2 span[]; };
-layout(std430, set = 0, binding = 3) buffer Lists { C list[]; };
-layout(std430, set = 0, binding = 4) buffer ListCount { uint lc[]; };
-
-vec3 qrot(vec4 q, vec3 v) {
-    /* кватернион в common.glsl лежит как (w, x, y, z) */
-    vec3 u = q.yzw;
-    float w = q.x;
-    vec3 t = 2.0 * cross(u, v);
-    return v + w * t + cross(u, t);
-}
-
-void push(uint self, vec3 n, float pen, vec3 at) {
-    uint slot = atomicAdd(lc[self], 1u);
-    if (int(slot) >= CAP) return;
-    C c;
-    c.meta = ivec4(GROUND, 0, 0, 0);
-    c.n_pen = vec4(n, pen);
-    c.point = vec4(at, 1.0);
-    list[self * CAP + slot] = c;
-}
+layout(std430, set = 0, binding = 0) buffer Score { uint score[]; };
+layout(std430, set = 0, binding = 1) buffer Win { uint win[]; };
 
 void main() {
     uint i = gl_GlobalInvocationID.x;
-    if (i >= uint(pc.grid.w)) return;
-
-    Body x = b[i];
-    if (x.misc.y > 0.5) return; /* спящее тело контакты не трогает */
-    uint cnt = span[i].y;
-    if (cnt == 0u) return;
-    uint base = span[i].x;
-
-    float m = pc.prm1.z;
-    float floor_y = 0.0;
-
-    /* Точки опоры пола — четыре УГЛА опорной площадки, а не «первые четыре
-     * глубокие вершины». У лежащего куба все нижние вершины одинаково
-     * глубокие, и «самые глубокие» оказывались в одном углу: опора крошечная,
-     * плеча против поворота вокруг вертикали нет — куб крутился юлой и ничто
-     * его не тормозило. Берём по одной вершине в каждом направлении
-     * (±x±z) — база широкая, поворот получает сопротивление. */
-    vec3 pts[4];
-    float pens[4];
-    int have = 0;
-    for (int c = 0; c < 4; c++) {
-        vec2 dir = vec2((c & 1) == 0 ? 1.0 : -1.0, (c & 2) == 0 ? 1.0 : -1.0);
-        float best_d = -1e30;
-        vec3 best_v = vec3(0.0);
-        float best_pen = 0.0;
-        bool found = false;
-        for (uint t = 0u; t < cnt; t++) {
-            for (int k = 0; k < 4; k++) {
-                vec3 v = qrot(x.quat, tets[(base + t) * 4u + uint(k)].xyz) + x.pos_r.xyz;
-                float pen = floor_y - v.y;
-                if (pen <= -m) continue;
-                float d = dot(v.xz, dir);
-                if (!found || d > best_d) {
-                    found = true;
-                    best_d = d;
-                    best_v = v;
-                    best_pen = pen;
-                }
-            }
-        }
-        if (found) {
-            pts[have] = best_v;
-            pens[have] = best_pen;
-            have++;
-        }
-    }
-    for (int j2 = 0; j2 < have; j2++) {
-        push(i, vec3(0.0, 1.0, 0.0), pens[j2], pts[j2]);
-    }
-
-    /* стенки: по одной точке — самая выступившая вершина за границей */
-    /* Инициализация «глубоко снаружи», а НЕ нулём: при нуле проверка
-     * `> -margin` истинна всегда, и все четыре стены срабатывали каждый
-     * подшаг с нулевой глубиной — летящий снаряд упирался в фантомную
-     * стену и мгновенно терял скорость. */
-    float left = -1e9, right = -1e9, back = -1e9, front = -1e9;
-    vec3 at_left = x.pos_r.xyz, at_right = x.pos_r.xyz, at_back = x.pos_r.xyz, at_front = x.pos_r.xyz;
-    for (uint t = 0u; t < cnt; t++) {
-        for (int k = 0; k < 4; k++) {
-            vec3 v = qrot(x.quat, tets[(base + t) * 4u + uint(k)].xyz) + x.pos_r.xyz;
-            float d;
-            d = pc.lo.x - v.x;
-            if (d > left) { left = d; at_left = v; }
-            d = v.x - pc.hi.x;
-            if (d > right) { right = d; at_right = v; }
-            d = pc.lo.z - v.z;
-            if (d > back) { back = d; at_back = v; }
-            d = v.z - pc.hi.z;
-            if (d > front) { front = d; at_front = v; }
-        }
-    }
-    if (left > -m) push(i, vec3(1.0, 0.0, 0.0), left, at_left);
-    if (right > -m) push(i, vec3(-1.0, 0.0, 0.0), right, at_right);
-    if (back > -m) push(i, vec3(0.0, 0.0, 1.0), back, at_back);
-    if (front > -m) push(i, vec3(0.0, 0.0, -1.0), front, at_front);
+    score[i] = 0u;
+    win[i] = 0xFFFFFFFFu;
 }
