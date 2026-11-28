@@ -278,7 +278,7 @@ impl TetBody {
             /* Теты задают только УЗЛЫ (какие точки внутри). Расстояние
              * считается от границы занятости, грани тетов в нём не участвуют —
              * поэтому поверхность не повторяет тетраэдры. */
-            field::from_occupancy_metric(&flat, 6, 3)
+            field::from_occupancy_metric(&flat, 6, 3, node_step(self.tets.iter().map(|t| t.level).max().unwrap_or(0)))
         })
     }
 
@@ -342,13 +342,14 @@ impl TetBody {
             bz += 2;
         }
         /* Поле приводим к соглашению «ноль между узлами» и к единицам узла. */
+        /* Внутри поле в единицах узла (ноль между узлами); метры даёт sample_m. */
         let mut val = Vec::with_capacity(sdf.len());
         for v in sdf {
             let d = v / step;
             val.push(if *v < 0.0 { d - 0.5 } else { d + 0.5 });
         }
         let body = Self { tets, level_cap: level, origin: center, sdf: Default::default() };
-        let _ = body.sdf.set(field::NodeField { lo, dims, val });
+        let _ = body.sdf.set(field::NodeField { lo, dims, val, step });
         body
     }
 

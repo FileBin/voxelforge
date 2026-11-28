@@ -23,7 +23,10 @@ pub struct NodeField {
     /// Размер блока в узлах.
     pub dims: [usize; 3],
     /// Значения по индексу `((z * dims[1]) + y) * dims[0] + x`.
+    /// В МЕТРАХ: это запечённые расстояния для физики (минус внутри).
     pub val: Vec<f32>,
+    /// Сколько метров в одном шаге узла (для градиента и перевода координат).
+    pub step: f32,
 }
 
 impl NodeField {
@@ -69,6 +72,12 @@ impl NodeField {
                 }
             }
         }
+    }
+
+    /// Значение поля в МЕТРАХ — то, что читает физика: |v| это глубина
+    /// проникновения, градиент — нормаль контакта.
+    pub fn sample_m(&self, p: [f32; 3]) -> f32 {
+        self.sample(p) * self.step
     }
 
     /// Трилинейная выборка поля в произвольной точке (в координатах узлов).
@@ -254,7 +263,7 @@ fn build_from_solid(solid: &[bool], lo: [i32; 3], dims: [usize; 3]) -> NodeField
     bfs(&mut d_out, &mut queue, dims);
     /* 3. Знаковое расстояние: внутри минус, снаружи плюс. Поверхность — между
      * занятым и пустым узлом, поэтому ноль приходится на середину шага. */
-    let mut f = NodeField { lo, dims, val: vec![0.0; n] };
+    let mut f = NodeField { lo, dims, val: vec![0.0; n], step: 1.0 };
     for i in 0..n {
         let v = if solid[i] { -(d_out[i] - 0.5) } else { d_in[i] - 0.5 };
         f.set(i, v);
@@ -576,7 +585,7 @@ pub fn from_tets_exact(tets: &[[Node; 4]], pad: i32) -> NodeField {
         let d = if val[i] == f32::MAX { far } else { val[i] };
         val[i] = if solid[i] { -(d + 0.5) } else { d + 0.5 };
     }
-    NodeField { lo, dims, val }
+    NodeField { lo, dims, val, step: 1.0 }
 }
 
 /// Поле расстояний, построенное ТОЛЬКО по занятости узлов.
@@ -585,7 +594,7 @@ pub fn from_tets_exact(tets: &[[Node; 4]], pad: i32) -> NodeField {
 /// Грани тетов в расстоянии НЕ участвуют: иначе поверхность повторяет
 /// ступеньки тетраэдров. Расстояние считается по 26 соседям с метрическими
 /// шагами (1, √2, √3) от границы занятости, затем поле сглаживается.
-pub fn from_occupancy_metric(tets: &[[Node; 4]], pad: i32, smooth_iters: usize) -> NodeField {
+pub fn from_occupancy_metric(tets: &[[Node; 4]], pad: i32, smooth_iters: usize, step_m: f32) -> NodeField {
     assert!(!tets.is_empty(), "поле без тетов");
     let (lo, dims) = bounds_of(tets.iter().flat_map(|t| t.iter()), pad);
     let n = dims[0] * dims[1] * dims[2];
@@ -682,7 +691,7 @@ pub fn from_occupancy_metric(tets: &[[Node; 4]], pad: i32, smooth_iters: usize) 
         }
     }
 
-    let mut f = NodeField { lo, dims, val: vec![0.0; n] };
+    let mut f = NodeField { lo, dims, val: vec![0.0; n], step: 1.0 };
     for i in 0..n {
         let d = if dist[i] == f32::MAX { 0.0 } else { dist[i] };
         f.val[i] = if solid[i] { -(d + 0.5) } else { d + 0.5 };
