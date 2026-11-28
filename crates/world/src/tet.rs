@@ -279,6 +279,76 @@ impl TetBody {
         })
     }
 
+    /// Тело из готовой сетки SDF (второй путь создания: сетку заполнил
+    /// шейдер на устройстве или CPU из сейва).
+    ///
+    /// `sdf` — значения в мировых единицах, порядок `((z*ny)+y)*nx+x`, узел
+    /// `(lo + (x,y,z))` в координатах своего уровня. Тет попадает в тело, если
+    /// все четыре его узла внутри (значение < 0).
+    pub fn from_sdf_grid(
+        center: [f32; 3],
+        level: u8,
+        lo: [i32; 3],
+        dims: [usize; 3],
+        sdf: &[f32],
+    ) -> Self {
+        assert_eq!(sdf.len(), dims[0] * dims[1] * dims[2], "размер сетки SDF");
+        let step = node_step(level);
+        let solid = |n: Node| -> bool {
+            let x = n.0 - lo[0];
+            let y = n.1 - lo[1];
+            let z = n.2 - lo[2];
+            if x < 0 || y < 0 || z < 0 {
+                return false;
+            }
+            let (x, y, z) = (x as usize, y as usize, z as usize);
+            if x >= dims[0] || y >= dims[1] || z >= dims[2] {
+                return false;
+            }
+            sdf[(z * dims[1] + y) * dims[0] + x] < 0.0
+        };
+        let mut tets = Vec::new();
+        /* ячейки: основание чётное, шаг 2; берём только полностью «внутренние» */
+        let hi = [
+            lo[0] + dims[0] as i32 - 3,
+            lo[1] + dims[1] as i32 - 3,
+            lo[2] + dims[2] as i32 - 3,
+        ];
+        let mut bz = lo[2];
+        while bz <= hi[2] {
+            let mut by = lo[1];
+            while by <= hi[1] {
+                let mut bx = lo[0];
+                while bx <= hi[0] {
+                    let nodes = cube_nodes((bx, by, bz));
+                    for t in CUBE_TETS.iter() {
+                        let v = [
+                            nodes[t[0] as usize],
+                            nodes[t[1] as usize],
+                            nodes[t[2] as usize],
+                            nodes[t[3] as usize],
+                        ];
+                        if v.iter().all(|n| solid(*n)) {
+                            tets.push(Tet { level, v });
+                        }
+                    }
+                    bx += 2;
+                }
+                by += 2;
+            }
+            bz += 2;
+        }
+        /* Поле приводим к соглашению «ноль между узлами» и к единицам узла. */
+        let mut val = Vec::with_capacity(sdf.len());
+        for v in sdf {
+            let d = v / step;
+            val.push(if *v < 0.0 { d - 0.5 } else { d + 0.5 });
+        }
+        let body = Self { tets, level_cap: level, origin: center, sdf: Default::default() };
+        let _ = body.sdf.set(field::NodeField { lo, dims, val });
+        body
+    }
+
     /// Куб из `n³` кубических ячеек, каждая — 12 тетраэдров.
     pub fn cube(center: [f32; 3], n: i32, level: u8) -> Self {
         /* BCC-тет занимает ДВЕ кубические ячейки (его центры лежат в соседних
@@ -766,7 +836,7 @@ impl TetBody {
         mesh
     }
 
-    /// Точная поверхность: грани, встречающиеся у одного тетраэдра.
+/// Точная поверхность: грани, встречающиеся у одного тетраэдра.
     fn extract_faces(&self) -> Mesh {
         let mut faces: HashMap<[u64; 3], (u32, [Node; 3], u8, [f32; 3])> = HashMap::new();
         // Узлы решётки отсчитываются от origin тела. Здесь раньше стоял
@@ -1332,7 +1402,7 @@ mod marching_tests {
 
     /// Замкнутость: каждое ребро поверхности принадлежит ровно двум
     /// треугольникам. Дыра или щель сразу дают рёбра с кратностью 1.
-    fn closedness(m: &Mesh) -> usize {
+    pub fn closedness(m: &Mesh) -> usize {
         let mut e: HashMap<(u32, u32), i32> = HashMap::new();
         for t in m.indices.chunks(3) {
             for k in 0..3 {
@@ -1728,4 +1798,24 @@ mod sdf_quality_tests {
         println!("SDF у осевого узла: {axis:.3}, ожидаем ~1.5");
         assert!((axis - 1.5).abs() < 0.1, "осевое расстояние сломано: {axis}");
     }
+}
+
+/// Сколько рёбер поверхности имеет кратность не 2 (незамкнутость).
+///
+/// Замкнутая поверхность даёт ровно 2 треугольника на ребро; любое другое
+/// значение — щель или наложение.
+pub fn open_edges(m: &Mesh) -> usize {
+    let mut h: HashMap<(u32, u32), u32> = HashMap::new();
+    for t in m.indices.chunks(3) {
+        if t.len() < 3 {
+            break;
+        }
+        for k in 0..3 {
+            let a = t[k];
+            let b = t[(k + 1) % 3];
+            let key = if a < b { (a, b) } else { (b, a) };
+            *h.entry(key).or_insert(0) += 1;
+        }
+    }
+    h.values().filter(|n| **n != 2).count()
 }

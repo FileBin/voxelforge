@@ -182,6 +182,8 @@ const P_TETBLOCKSUM: usize = 24;
 const P_TETBLOCKPREF: usize = 25;
 const P_TETSCANP: usize = 26;
 const P_TETPAIRSFLAT: usize = 27;
+/// Заполнение сетки SDF аналитическим примитивом на устройстве.
+const P_SDFFILL: usize = 28;
 /// Ячеек на блок в параллельном скане (совпадает с 16 * 64 в шейдере).
 pub const SCAN_BLOCK: usize = 1024;
 /// Потолок изменений тел за одно событие (спавн/деспавн).
@@ -436,7 +438,7 @@ impl GpuSim {
             )
         };
 
-        let names: [(&str, u32); 28] = [
+        let names: [(&str, u32); 29] = [
             ("integrate", 1),
             ("clear", 2),
             ("count", 2),
@@ -465,6 +467,7 @@ impl GpuSim {
             ("tet_blockprefix", 2),
             ("tet_scan_p", 4),
             ("tet_pairs_flat", 8),
+            ("sdf_fill", 1),
         ];
         let mut pipes = Vec::new();
         for (nm, nb) in names.iter() {
@@ -1731,5 +1734,93 @@ impl Drop for GpuSim {
             }
             vf_shutdown(self.ctx);
         }
+    }
+}
+
+/// Примитив, из которого сетку SDF заполняет устройство.
+#[derive(Clone, Copy, Debug)]
+pub struct SdfPrim {
+    /// 0 — коробка, 1 — шар, 2 — капсула, 3 — цилиндр вдоль Y.
+    pub kind: u32,
+    pub center: [f32; 3],
+    pub radius: f32,
+    pub half: [f32; 3],
+    pub b: [f32; 3],
+}
+
+impl SdfPrim {
+    pub fn sphere(c: [f32; 3], r: f32) -> Self {
+        Self { kind: 1, center: c, radius: r, half: [0.0; 3], b: [0.0; 3] }
+    }
+    pub fn box_shape(c: [f32; 3], half: [f32; 3]) -> Self {
+        Self { kind: 0, center: c, radius: 0.0, half, b: [0.0; 3] }
+    }
+    pub fn capsule(a: [f32; 3], b: [f32; 3], r: f32) -> Self {
+        Self { kind: 2, center: a, radius: r, half: [0.0; 3], b }
+    }
+    pub fn cylinder(c: [f32; 3], r: f32, half_height: f32) -> Self {
+        Self { kind: 3, center: c, radius: r, half: [half_height, 0.0, 0.0], b: [0.0; 3] }
+    }
+}
+
+/// Раскладка push-констант для `sdf_fill.comp` (80 байт).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SdfPush {
+    grid: [u32; 4],
+    origin: [f32; 4],
+    a: [f32; 4],
+    b: [f32; 4],
+    c: [f32; 4],
+}
+
+impl GpuSim {
+    /// Заполнить сетку SDF примитивом НА УСТРОЙСТВЕ и вернуть значения хосту.
+    ///
+    /// Порядок значений: `((z * ny) + y) * nx + x`, позиция узла —
+    /// `origin + (x,y,z) * step`. Знак: внутри примитива минус, снаружи плюс
+    /// (обычное соглашение SDF), значения в мировых единицах.
+    pub fn fill_sdf_grid(
+        &mut self,
+        prim: &SdfPrim,
+        dims: [u32; 3],
+        origin: [f32; 3],
+        step: f32,
+    ) -> Vec<f32> {
+        let n = (dims[0] as usize) * (dims[1] as usize) * (dims[2] as usize);
+        assert!(n > 0, "пустая сетка SDF");
+        let mut buf: *mut c_void = std::ptr::null_mut();
+        unsafe {
+            check_status(vf_buffer_new(self.ctx, n * 4, 1, &mut buf), "sdf: buffer") 
+        };
+        let push = SdfPush {
+            grid: [dims[0], dims[1], dims[2], prim.kind],
+            origin: [origin[0], origin[1], origin[2], step],
+            a: [prim.center[0], prim.center[1], prim.center[2], prim.radius],
+            b: [prim.half[0], prim.half[1], prim.half[2], 0.0],
+            c: [prim.b[0], prim.b[1], prim.b[2], 0.0],
+        };
+        let mut bufs = [buf];
+        let mut ds = [VfDispatch {
+            pipeline: self.pipes[P_SDFFILL],
+            buffers: bufs.as_mut_ptr(),
+            n_buffers: 1,
+            push: &push as *const SdfPush as *const c_void,
+            push_bytes: std::mem::size_of::<SdfPush>() as u32,
+            groups: [(n as u32).div_ceil(64), 1, 1],
+        }];
+        unsafe {
+            check_status(vf_run(self.ctx, ds.as_mut_ptr(), 1), "sdf_fill");
+        }
+        let mut out = vec![0.0f32; n];
+        unsafe {
+            check_status(
+                vf_buffer_read(self.ctx, buf, 0, out.as_mut_ptr() as *mut c_void, n * 4),
+                "sdf: read",
+            );
+            vf_buffer_free(self.ctx, buf);
+        }
+        self.bytes_down += (n * 4) as u64;
+        out
     }
 }
