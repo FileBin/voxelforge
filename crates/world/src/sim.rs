@@ -1825,3 +1825,32 @@ impl GpuSim {
         out
     }
 }
+
+impl GpuSim {
+    /// Выгрузить запечённое поле на устройство и прочитать обратно.
+    ///
+    /// Шаг 1 коллизий по SDF: физике нужно поле рядом с телами. Проверяем
+    /// именно то, что данные доезжают без искажений (иначе контакты будут
+    /// считаться по мусору, и это невозможно заметить по картинке).
+    pub fn sdf_roundtrip(&mut self, f: &crate::field::NodeField) -> bool {
+        let n = f.val.len();
+        let bytes = n * 4;
+        let mut buf: *mut c_void = std::ptr::null_mut();
+        unsafe {
+            check_status(vf_buffer_new(self.ctx, bytes, 1, &mut buf), "sdf: buffer");
+            check_status(
+                vf_buffer_write(self.ctx, buf, 0, f.val.as_ptr() as *const c_void, bytes),
+                "sdf: write",
+            );
+        }
+        let mut back = vec![0.0f32; n];
+        unsafe {
+            check_status(
+                vf_buffer_read(self.ctx, buf, 0, back.as_mut_ptr() as *mut c_void, bytes),
+                "sdf: read",
+            );
+            vf_buffer_free(self.ctx, buf);
+        }
+        back == f.val
+    }
+}

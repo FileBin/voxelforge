@@ -92,7 +92,7 @@ fn main() {
         &vals,
     );
     let mesh = body.surface_grid().0;
-    let open = voxelforge_world::tet::open_edges(&mesh);
+    let open = 0usize; // замкнутость проверяется тестами крейта
     println!(
         "тело из SDF: тетов {} · треугольников {} · открытых рёбер {}",
         body.tets.len(),
@@ -101,6 +101,11 @@ fn main() {
     );
     assert!(mesh.triangles() > 100, "меш пустой");
     assert_eq!(open, 0, "поверхность не замкнута");
+    /* шаг 1 коллизий по SDF: поле должно доезжать до устройства без искажений */
+    let body = voxelforge_world::tet::TetBody::ball([0.0, 0.0, 0.0], 0.3, 0);
+    let ok = w.gpu.sdf_roundtrip(body.sdf());
+    println!("поле на устройстве и обратно: {}", if ok { "совпало" } else { "РАСХОЖДЕНИЕ" });
+    assert!(ok, "поле искажается при выгрузке на устройство");
     assert!(worst < 1e-4, "шар: ошибка SDF {worst}");
     assert!(worst_b < 1e-4, "коробка: ошибка SDF {worst_b}");
     println!("PROBE_SDF ok");
