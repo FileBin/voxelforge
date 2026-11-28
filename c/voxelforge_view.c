@@ -1,5 +1,8 @@
 // Живое окно движка: SDL3 + Vulkan. Логики мира здесь нет — только
 // поверхность, swapchain, два конвейера (меши и линии) и ввод.
+/* clock_gettime/CLOCK_MONOTONIC под -std=c11: определять ДО системных
+ * заголовков, иначе glibc их прячет. */
+#define _POSIX_C_SOURCE 199309L
 #include "voxelforge_view.h"
 #include "vf_font5x7.h"
 
@@ -10,9 +13,26 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define MAX_SHAPES 512
 #define MAX_SWAP 8
+/* Кадров в полёте и число фаз кадра, которые меряются на CPU. */
+#define VF_FIF 2
+#define VF_PH_SAMPLES 512
+/* Фазы кадра — по порядку в таблице. IVL — интервал между кадрами: если он
+ * равен сумме фаз, поток занят целиком; если больше — стоим на развёртке. */
+enum { VF_PH_WAIT, VF_PH_ACQ, VF_PH_REC, VF_PH_LOCK, VF_PH_SUB, VF_PH_PLOCK,
+       VF_PH_PRES, VF_PH_IVL };
+#define VF_PH_N 8
+
+/* Настенное время CPU, мс — для фаз кадра. */
+static double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
 /* Оверлей стадий: не больше стольких строк и столько байт под его вершины.
  * Потолок держим с запасом: строка текста в 18 знаков при scale 2 — это
  * ~600 вершин, 16 строк — ~10 тыс. вершин, 240 КБ. Буфер 2 МБ заведомо выше. */
@@ -45,9 +65,11 @@ struct vf_view {
     int present_mode; /* выбранный VkPresentModeKHR — окну и приложению */
     VkExtent2D extent;
 
-    VkImage depth;
-    VkDeviceMemory depth_mem;
-    VkImageView depth_view;
+    /* Глубина — СВОЯ на образ swapchain: с двумя кадрами в полёте общий буфер
+     * глубины читал бы кадр N+1, пока кадр N ещё в него пишет. */
+    VkImage depth_img[MAX_SWAP];
+    VkDeviceMemory depth_mem[MAX_SWAP];
+    VkImageView depth_view[MAX_SWAP];
 
     VkRenderPass rp;
     VkFramebuffer fb[MAX_SWAP];
@@ -76,16 +98,39 @@ struct vf_view {
     int perf_show;
     VkDescriptorSetLayout dsl;
     VkDescriptorPool dpool;
-    VkDescriptorSet dset;
+    VkDescriptorSet dset;   /* текущий набор кадра (dset_fif[fif]) */
+
     VkBuffer body_buf;   /* буфер тел физики (тот же девайс) */
     uint32_t body_n;
+    /* Кадров в полёте: VF_FIF. С одним кадром CPU стоит ровно столько, сколько
+     * GPU рисует кадр (ждать его fence перед записью следующего), и любая
+     * задержка GPU целиком попадает в интервал. С двумя — пока GPU рисует кадр
+     * N, CPU пишет N+1. Всё, что GPU читает во время кадра, обязано быть
+     * СВОИМ на слот: command buffer, fence, семафор образа, UBO, набор. */
     VkBuffer ubo;
     VkDeviceMemory ubo_mem;
     void *ubo_ptr;
 
     VkCommandPool cmd_pool;
-    VkCommandBuffer cmd;
-    VkSemaphore sem_ready, sem_done;
+    VkCommandBuffer cmd;    /* текущий (cmd_fif[fif]) */
+    VkCommandBuffer cmd_fif[VF_FIF];
+    VkFence fence;          /* текущий (fence_fif[fif]) */
+    VkFence fence_fif[VF_FIF];
+    VkSemaphore sem_ready;       /* текущий (sem_ready_fif[fif]) */
+    VkSemaphore sem_ready_fif[VF_FIF];
+    /* Семафор «образ отрисован» — НА ОБРАЗ: acquire того же образа сам
+     * гарантирует, что прошлый показ с него закончился, поэтому семафор можно
+     * переиспользовать, не дожидаясь present. */
+    VkSemaphore sem_done_img[MAX_SWAP];
+    VkDescriptorSet dset_fif[VF_FIF];
+    VkBuffer ubo_slot[VF_FIF];
+    VkDeviceMemory ubo_mem_slot[VF_FIF];
+    void *ubo_ptr_slot[VF_FIF];
+    int fif;                /* какой слот сейчас в работе */
+    /* Сколько кадров в полёте: 2 по умолчанию, VF_FIF=1 — прежний путь с одним
+     * кадром (для сравнения «до/после» на одном бинаре). */
+    int n_fif;
+
     /* Две очереди (VF_SPLIT=1): кадр ждёт тактовый таймлайн («банк
      * опубликован») и сигналит свой — по нему такт понимает, что банк, в
      * который он собирается писать, уже прочитан. Оба NULL — прежний путь. */
@@ -93,9 +138,34 @@ struct vf_view {
     uint64_t tl_wait;   /* значение такта, на котором стоит банк */
     uint64_t tl_value;  /* сколько кадров отмечено (значение своего таймлайна) */
     uint32_t bank;      /* какой банк читает этот кадр */
-    VkFence fence;
     int recording;
     uint32_t cur_img;
+
+    /* --- фазы кадра на CPU (мс): где стоит главный поток --- */
+    float ph[VF_PH_SAMPLES][VF_PH_N];
+    float ph_gap[VF_PH_SAMPLES];   /* простой GPU между кадрами, мс */
+    float ph_gap_stat[4];
+    uint32_t ph_n;
+
+    double ph_w0;            /* начало окна накопления, мс */
+    /* Итог последнего окна: min/mean/max/p99 по каждой фазе + окно целиком. */
+    float ph_stat[VF_PH_N][4];
+    uint32_t ph_win_frames;
+    double ph_prev_begin;    /* начало прошлого кадра (для интервала) */
+    /* Метки GPU на кадр: [0] — начало, [1] — конец. Читаются на СЛЕДУЮЩЕМ
+     * кадре этого слота, поэтому ничего не ждут. */
+    VkQueryPool fq[VF_FIF];
+    VkBuffer fts[VF_FIF];
+    VkDeviceMemory fts_mem[VF_FIF];
+    uint64_t *fts_ptr[VF_FIF];
+    uint64_t ts_start[VF_FIF], ts_end[VF_FIF];
+    double ts_period_ms;
+    int ts_ok;               /* драйвер даёт таймстемпы на этой очереди */
+    uint64_t ts_prev_end;    /* конец прошлого кадра, тиков (для простоя GPU) */
+    int ts_prev_valid;
+    /* Фазы текущего кадра, накапливаются по ходу begin/end. */
+    float ph_cur[VF_PH_N];
+    double ph_rec_start;     /* начало записи команд (после acquire) */
 
     gpu_shape shapes[MAX_SHAPES];
     int n_shapes;
@@ -218,34 +288,37 @@ static int make_swapchain(vf_view *v);
 static int make_swapchain_shaders(vf_view *v);
 
 static int make_depth(vf_view *v) {
-    VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    ci.imageType = VK_IMAGE_TYPE_2D;
-    ci.format = VK_FORMAT_D32_SFLOAT;
-    ci.extent.width = v->extent.width;
-    ci.extent.height = v->extent.height;
-    ci.extent.depth = 1;
-    ci.mipLevels = 1;
-    ci.arrayLayers = 1;
-    ci.samples = VK_SAMPLE_COUNT_1_BIT;
-    ci.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ci.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-    ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (!ok(vkCreateImage(v->dev, &ci, NULL, &v->depth), "vkCreateImage(depth)")) return 0;
-    VkMemoryRequirements req;
-    vkGetImageMemoryRequirements(v->dev, v->depth, &req);
-    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    ai.allocationSize = req.size;
-    ai.memoryTypeIndex = mem_type(v->phys, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (!ok(vkAllocateMemory(v->dev, &ai, NULL, &v->depth_mem), "alloc depth")) return 0;
-    vkBindImageMemory(v->dev, v->depth, v->depth_mem, 0);
-    VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    vi.image = v->depth;
-    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    vi.format = VK_FORMAT_D32_SFLOAT;
-    vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-    vi.subresourceRange.levelCount = 1;
-    vi.subresourceRange.layerCount = 1;
-    return ok(vkCreateImageView(v->dev, &vi, NULL, &v->depth_view), "depth view");
+    for (uint32_t i = 0; i < v->sc_n; i++) {
+        VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ci.imageType = VK_IMAGE_TYPE_2D;
+        ci.format = VK_FORMAT_D32_SFLOAT;
+        ci.extent.width = v->extent.width;
+        ci.extent.height = v->extent.height;
+        ci.extent.depth = 1;
+        ci.mipLevels = 1;
+        ci.arrayLayers = 1;
+        ci.samples = VK_SAMPLE_COUNT_1_BIT;
+        ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ci.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (!ok(vkCreateImage(v->dev, &ci, NULL, &v->depth_img[i]), "vkCreateImage(depth)")) return 0;
+        VkMemoryRequirements req;
+        vkGetImageMemoryRequirements(v->dev, v->depth_img[i], &req);
+        VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        ai.allocationSize = req.size;
+        ai.memoryTypeIndex = mem_type(v->phys, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (!ok(vkAllocateMemory(v->dev, &ai, NULL, &v->depth_mem[i]), "alloc depth")) return 0;
+        vkBindImageMemory(v->dev, v->depth_img[i], v->depth_mem[i], 0);
+        VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = v->depth_img[i];
+        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = VK_FORMAT_D32_SFLOAT;
+        vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        vi.subresourceRange.levelCount = 1;
+        vi.subresourceRange.layerCount = 1;
+        if (!ok(vkCreateImageView(v->dev, &vi, NULL, &v->depth_view[i]), "depth view")) return 0;
+    }
+    return 1;
 }
 
 static int make_render_pass(vf_view *v) {
@@ -300,7 +373,7 @@ static int make_render_pass(vf_view *v) {
 static int make_framebuffers(vf_view *v) {
     v->fb_count = 0;
     for (uint32_t i = 0; i < v->sc_n; i++) {
-        VkImageView att[2] = {v->sc_view[i], v->depth_view};
+        VkImageView att[2] = {v->sc_view[i], v->depth_view[i]};
         VkFramebufferCreateInfo ci = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
         ci.renderPass = v->rp;
         ci.attachmentCount = 2;
@@ -591,12 +664,14 @@ static int make_swapchain(vf_view *v) {
 static void drop_swapchain(vf_view *v) {
     for (uint32_t i = 0; i < v->fb_count; i++) vkDestroyFramebuffer(v->dev, v->fb[i], NULL);
     v->fb_count = 0;
-    if (v->depth_view) vkDestroyImageView(v->dev, v->depth_view, NULL);
-    if (v->depth) vkDestroyImage(v->dev, v->depth, NULL);
-    if (v->depth_mem) vkFreeMemory(v->dev, v->depth_mem, NULL);
-    v->depth_view = VK_NULL_HANDLE;
-    v->depth = VK_NULL_HANDLE;
-    v->depth_mem = VK_NULL_HANDLE;
+    for (uint32_t i = 0; i < MAX_SWAP; i++) {
+        if (v->depth_view[i]) vkDestroyImageView(v->dev, v->depth_view[i], NULL);
+        if (v->depth_img[i]) vkDestroyImage(v->dev, v->depth_img[i], NULL);
+        if (v->depth_mem[i]) vkFreeMemory(v->dev, v->depth_mem[i], NULL);
+        v->depth_view[i] = VK_NULL_HANDLE;
+        v->depth_img[i] = VK_NULL_HANDLE;
+        v->depth_mem[i] = VK_NULL_HANDLE;
+    }
     for (uint32_t i = 0; i < v->sc_n; i++) vkDestroyImageView(v->dev, v->sc_view[i], NULL);
     v->sc_n = 0;
     if (v->sc) vkDestroySwapchainKHR(v->dev, v->sc, NULL);
@@ -672,24 +747,35 @@ vf_status vf_view_new(vf_view **out, vf_ctx *core, int w, int h, const char *tit
     dpi.pPoolSizes = ps;
     if (!ok(vkCreateDescriptorPool(v->dev, &dpi, NULL, &v->dpool), "dpool")) return st(9, "dpool");
 
-    VkDescriptorSetAllocateInfo da = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    da.descriptorPool = v->dpool;
-    da.descriptorSetCount = 1;
-    da.pSetLayouts = &v->dsl;
-    if (!ok(vkAllocateDescriptorSets(v->dev, &da, &v->dset), "dset")) return st(10, "dset");
+    /* Набор — СВОЙ на кадр в полёте: пока GPU читает UBO кадра N, CPU пишет
+     * камеру кадра N+1. */
+    for (int i = 0; i < VF_FIF; i++) {
+        VkDescriptorSetAllocateInfo da = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        da.descriptorPool = v->dpool;
+        da.descriptorSetCount = 1;
+        da.pSetLayouts = &v->dsl;
+        if (!ok(vkAllocateDescriptorSets(v->dev, &da, &v->dset_fif[i]), "dset")) return st(10, "dset");
+        if (!make_buffer(v, sizeof(float) * 24, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &v->ubo,
+                         &v->ubo_mem,
+                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+            return st(11, "ubo");
+        vkMapMemory(v->dev, v->ubo_mem, 0, VK_WHOLE_SIZE, 0, &v->ubo_ptr);
+        VkDescriptorBufferInfo dbi = {v->ubo, 0, sizeof(float) * 24};
+        VkWriteDescriptorSet wd = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        wd.dstSet = v->dset_fif[i];
+        wd.dstBinding = 0;
+        wd.descriptorCount = 1;
+        wd.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        wd.pBufferInfo = &dbi;
+        vkUpdateDescriptorSets(v->dev, 1, &wd, 0, NULL);
+        /* UBO/набор кадра i — в массивы, чтобы был доступ по слоту. Держим
+         * отдельные массивы: ubo/ubo_ptr выше — «текущий» слот. */
+        v->ubo_slot[i] = v->ubo;
+        v->ubo_mem_slot[i] = v->ubo_mem;
+        v->ubo_ptr_slot[i] = v->ubo_ptr;
+    }
+    v->dset = v->dset_fif[0];
 
-    if (!make_buffer(v, sizeof(float) * 24, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &v->ubo, &v->ubo_mem,
-                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
-        return st(11, "ubo");
-    vkMapMemory(v->dev, v->ubo_mem, 0, VK_WHOLE_SIZE, 0, &v->ubo_ptr);
-    VkDescriptorBufferInfo dbi = {v->ubo, 0, sizeof(float) * 24};
-    VkWriteDescriptorSet wd = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    wd.dstSet = v->dset;
-    wd.dstBinding = 0;
-    wd.descriptorCount = 1;
-    wd.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    wd.pBufferInfo = &dbi;
-    vkUpdateDescriptorSets(v->dev, 1, &wd, 0, NULL);
 
     /* Вершинный буфер оверлея: host-visible и постоянно замапен — вершины
      * собираются на CPU каждый кадр, а кадр начинается после fence, так что
@@ -714,15 +800,52 @@ vf_status vf_view_new(vf_view **out, vf_ctx *core, int w, int h, const char *tit
     VkCommandBufferAllocateInfo ca = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     ca.commandPool = v->cmd_pool;
     ca.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    ca.commandBufferCount = 1;
-    if (!ok(vkAllocateCommandBuffers(v->dev, &ca, &v->cmd), "cmd buffer")) return st(17, "cmd");
+    ca.commandBufferCount = VF_FIF;
+    if (!ok(vkAllocateCommandBuffers(v->dev, &ca, v->cmd_fif), "cmd buffer")) return st(17, "cmd");
 
     VkSemaphoreCreateInfo si = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-    vkCreateSemaphore(v->dev, &si, NULL, &v->sem_ready);
-    vkCreateSemaphore(v->dev, &si, NULL, &v->sem_done);
+    for (int i = 0; i < VF_FIF; i++) vkCreateSemaphore(v->dev, &si, NULL, &v->sem_ready_fif[i]);
+    for (uint32_t i = 0; i < MAX_SWAP; i++) vkCreateSemaphore(v->dev, &si, NULL, &v->sem_done_img[i]);
     VkFenceCreateInfo fi = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     fi.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-    vkCreateFence(v->dev, &fi, NULL, &v->fence);
+    for (int i = 0; i < VF_FIF; i++) vkCreateFence(v->dev, &fi, NULL, &v->fence_fif[i]);
+    v->cmd = v->cmd_fif[0];
+    v->fence = v->fence_fif[0];
+    v->sem_ready = v->sem_ready_fif[0];
+
+    /* Метки GPU на кадр: две на слот (начало и конец command buffer).
+     * Результат забирается на следующем кадре этого слота — внутри кадра
+     * ничего не ждётся, картинка и поток не сериализуются диагностикой. */
+    VkPhysicalDeviceProperties pr;
+    vkGetPhysicalDeviceProperties(v->phys, &pr);
+    v->ts_period_ms = (double)pr.limits.timestampPeriod * 1e-6;
+    /* Кадров в полёте: 2 (по умолчанию). VF_FIF=1 — прежний, однокадровый
+     * путь: он и даёт «кадр стоит, пока GPU рисует предыдущий». */
+    v->n_fif = VF_FIF;
+    if (getenv("VF_FIF")) {
+        int n = atoi(getenv("VF_FIF"));
+        if (n >= 1 && n <= VF_FIF) v->n_fif = n;
+    }
+    uint32_t qn = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(v->phys, &qn, NULL);
+    VkQueueFamilyProperties *qprops = calloc(qn ? qn : 1, sizeof(*qprops));
+    if (qprops) vkGetPhysicalDeviceQueueFamilyProperties(v->phys, &qn, qprops);
+    v->ts_ok = v->ts_period_ms > 0.0 && qprops && v->qfam < qn &&
+               qprops[v->qfam].timestampValidBits > 0;
+    free(qprops);
+    VkQueryPoolCreateInfo qci = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    qci.queryCount = 2;
+    if (v->ts_ok)
+    for (int i = 0; i < VF_FIF; i++) {
+        if (!ok(vkCreateQueryPool(v->dev, &qci, NULL, &v->fq[i]), "query pool(frame)")) return st(19, "fq");
+        if (!make_buffer(v, 2 * sizeof(uint64_t),
+                         VK_BUFFER_USAGE_TRANSFER_DST_BIT, &v->fts[i], &v->fts_mem[i],
+                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+            return st(19, "fts");
+        vkMapMemory(v->dev, v->fts_mem[i], 0, VK_WHOLE_SIZE, 0, (void **)&v->fts_ptr[i]);
+    }
+
 
     *out = v;
     fprintf(stderr, "[view] %s · %ux%u\n", v->gpu_name, v->extent.width, v->extent.height);
@@ -787,11 +910,16 @@ void vf_view_free(vf_view *v) {
     if (v->rp) vkDestroyRenderPass(v->dev, v->rp, NULL);
     if (v->dpool) vkDestroyDescriptorPool(v->dev, v->dpool, NULL);
     if (v->dsl) vkDestroyDescriptorSetLayout(v->dev, v->dsl, NULL);
-    free_buffer(v, v->ubo, v->ubo_mem);
+    for (int i = 0; i < VF_FIF; i++) {
+        free_buffer(v, v->ubo_slot[i], v->ubo_mem_slot[i]);
+        if (v->fq[i]) vkDestroyQueryPool(v->dev, v->fq[i], NULL);
+        free_buffer(v, v->fts[i], v->fts_mem[i]);
+        if (v->sem_ready_fif[i]) vkDestroySemaphore(v->dev, v->sem_ready_fif[i], NULL);
+        if (v->fence_fif[i]) vkDestroyFence(v->dev, v->fence_fif[i], NULL);
+    }
+    for (uint32_t i = 0; i < MAX_SWAP; i++)
+        if (v->sem_done_img[i]) vkDestroySemaphore(v->dev, v->sem_done_img[i], NULL);
     free_buffer(v, v->ui_vbuf, v->ui_vmem);
-    if (v->sem_ready) vkDestroySemaphore(v->dev, v->sem_ready, NULL);
-    if (v->sem_done) vkDestroySemaphore(v->dev, v->sem_done, NULL);
-    if (v->fence) vkDestroyFence(v->dev, v->fence, NULL);
     if (v->cmd_pool) vkDestroyCommandPool(v->dev, v->cmd_pool, NULL);
     /* девайс и instance принадлежат ядру — здесь только своё */
     if (v->surf) vkDestroySurfaceKHR(v->inst, v->surf, NULL);
@@ -940,9 +1068,138 @@ int32_t vf_view_add_lines(vf_view *v, const float *pts, uint32_t n_lines) {
 
 // ---------------------------------------------------------------- кадр
 
+/* Имена фаз — ASCII: оверлей рисует их встроенным шрифтом 5x7. */
+static const char *const ph_names[] = {"wait fence", "acquire", "record", "lock sub",
+                                       "submit", "lock pres", "present", "interval"};
+/* Фазы, которые стоит видеть в оверлее в этом порядке (без IVL — она есть в
+ * строке заголовка вместе с простоем GPU). */
+static const int ph_show[] = {VF_PH_WAIT, VF_PH_ACQ, VF_PH_REC, VF_PH_LOCK,
+                              VF_PH_SUB, VF_PH_PLOCK, VF_PH_PRES};
+
+/* Итог окна по ряду чисел: мин / среднее / макс / p99. */
+static void stat_of(const float *s, uint32_t n, float *out) {
+    float t[VF_PH_SAMPLES];
+    out[0] = out[1] = out[2] = out[3] = 0.0f;
+    if (n == 0) return;
+    double sum = 0.0;
+    uint32_t m = 0; /* сколько значений годных: отрицательные — «нет данных» */
+    float mn = 0.0f, mx = 0.0f;
+    for (uint32_t i = 0; i < n; i++) {
+        if (s[i] < 0.0f) continue;
+        if (m == 0 || s[i] < mn) mn = s[i];
+        if (m == 0 || s[i] > mx) mx = s[i];
+        sum += (double)s[i];
+        t[m++] = s[i];
+    }
+    if (m == 0) return;
+    /* p99 — сортировкой копии: сэмплов за секунду 200-400, это дешевле, чем
+     * держать гистограмму, и точно. */
+    for (uint32_t i = 1; i < m; i++) {
+        float x = t[i];
+        uint32_t j = i;
+        while (j > 0 && t[j - 1] > x) { t[j] = t[j - 1]; j--; }
+        t[j] = x;
+    }
+    out[0] = mn;
+    out[1] = (float)(sum / (double)m);
+    out[2] = mx;
+    out[3] = t[(uint32_t)((double)(m - 1) * 0.99)];
+}
+
+/* Итог окна по одной фазе кадра. */
+static void ph_summarize(vf_view *v, int ph, float *out) {
+    float s[VF_PH_SAMPLES];
+    uint32_t n = v->ph_n;
+    for (uint32_t i = 0; i < n; i++) s[i] = v->ph[i][ph];
+    stat_of(s, n, out);
+}
+
+/* Закрыть окно: посчитать итоги, напечатать блок «фазы кадра». */
+static void ph_close_window(vf_view *v) {
+    for (int p = 0; p < VF_PH_N; p++) ph_summarize(v, p, v->ph_stat[p]);
+    stat_of(v->ph_gap, v->ph_n, v->ph_gap_stat);
+    v->ph_win_frames = v->ph_n;
+    if (v->perf_show && v->ph_n > 0) {
+        printf("[perf] кадр: %u кадров · фазы CPU, мс (мин / среднее / макс / p99)\n",
+               (unsigned)v->ph_n);
+        for (unsigned k = 0; k < sizeof(ph_show) / sizeof(ph_show[0]); k++) {
+            int p = ph_show[k];
+            const float *st = v->ph_stat[p];
+            printf("  %-12s %6.3f %8.3f %8.3f %8.3f\n", ph_names[p], (double)st[0],
+                   (double)st[1], (double)st[2], (double)st[3]);
+        }
+        printf("  %-12s %6.3f %8.3f %8.3f %8.3f\n", "interval", (double)v->ph_stat[VF_PH_IVL][0],
+               (double)v->ph_stat[VF_PH_IVL][1], (double)v->ph_stat[VF_PH_IVL][2],
+               (double)v->ph_stat[VF_PH_IVL][3]);
+        if (v->ts_ok) {
+            const float *g = v->ph_gap_stat;
+            printf("  %-12s %6.3f %8.3f %8.3f %8.3f\n", "gpu idle", (double)g[0],
+                   (double)g[1], (double)g[2], (double)g[3]);
+        }
+        fflush(stdout);
+    }
+    v->ph_n = 0;
+    v->ph_w0 = now_ms();
+}
+
+/* Сложить фазы кадра в окно диагностики. Стоит микросекунды, поэтому работает
+ * всегда; печать — только когда таблица включена (F3 / VF_PERF=1). */
+static void push_frame_phases(vf_view *v) {
+    /* Простой GPU: начало этого кадра минус конец прошлого, тики → мс. Считаем
+     * ДО переключения слота: ts_start/ts_end этого слота прочитаны в begin. */
+    int slot = v->fif;
+    float gap = -1.0f; /* -1 — метки ещё не готовы (первые кадры) */
+    if (v->ts_ok && v->ts_prev_valid && v->ts_start[slot] > 0 && v->ts_prev_end > 0 &&
+        v->ts_start[slot] >= v->ts_prev_end) {
+        double g = (double)(v->ts_start[slot] - v->ts_prev_end) * v->ts_period_ms;
+        /* Санитарный потолок: если домен часов не тот, числа будут абсурдными,
+         * и лучше не показывать их вовсе, чем «простой 4000 секунд». */
+        if (g >= 0.0 && g < 1000.0) gap = (float)g;
+    }
+    if (v->ts_ok) {
+        v->ts_prev_end = v->ts_end[slot];
+        v->ts_prev_valid = 1;
+    }
+    if (v->ph_n >= VF_PH_SAMPLES) ph_close_window(v);
+    memcpy(v->ph[v->ph_n], v->ph_cur, sizeof(v->ph_cur));
+    v->ph_gap[v->ph_n] = gap;
+    v->ph_n++;
+    if (v->ph_w0 <= 0.0) v->ph_w0 = now_ms();
+    if (now_ms() - v->ph_w0 >= 1000.0) ph_close_window(v);
+}
+
 void vf_view_begin(vf_view *v, float r, float g, float b) {
-    vkWaitForFences(v->dev, 1, &v->fence, VK_TRUE, UINT64_MAX);
+    double t_begin = now_ms();
+    int slot = v->fif;
+    VkFence fen = v->fence_fif[slot];
+    for (int i = 0; i < VF_PH_N; i++) v->ph_cur[i] = 0.0f;
+    /* Интервал между началами кадров: с ним видно, сколько поток реально
+     * простаивает (интервал минус работа), а не только где он стоит. */
+    if (v->ph_prev_begin > 0.0) v->ph_cur[VF_PH_IVL] = (float)(t_begin - v->ph_prev_begin);
+    v->ph_prev_begin = t_begin;
+
+    /* Ждём ТОЛЬКО свой слот кольца: с двумя кадрами в полёте это кадр N-2, а не
+     * предыдущий. С одним кадром здесь стояло всё время кадра на GPU — отсюда и
+     * «ладнo, но иногда дёргается»: интервал = GPU + CPU, без перекрытия. */
+    double t = now_ms();
+    vkWaitForFences(v->dev, 1, &fen, VK_TRUE, UINT64_MAX);
+    v->ph_cur[VF_PH_WAIT] = (float)(now_ms() - t);
+
+    /* Метки GPU прошлого кадра этого слота: он закрыт (fence), значит буфер
+     * цел и читается без ожидания. */
+    if (v->ts_ok) {
+        v->ts_start[slot] = v->fts_ptr[slot][0];
+        v->ts_end[slot] = v->fts_ptr[slot][1];
+    }
+
+    v->cmd = v->cmd_fif[slot];
+    v->fence = fen;
+    v->sem_ready = v->sem_ready_fif[slot];
+    v->ubo_ptr = v->ubo_ptr_slot[slot];
+    v->dset = v->dset_fif[slot];
+
     uint32_t img = 0;
+    t = now_ms();
     VkResult ar = vkAcquireNextImageKHR(v->dev, v->sc, UINT64_MAX, v->sem_ready, VK_NULL_HANDLE, &img);
     if (ar == VK_ERROR_OUT_OF_DATE_KHR || ar == VK_SUBOPTIMAL_KHR) {
         vkDeviceWaitIdle(v->dev);
@@ -952,10 +1209,12 @@ void vf_view_begin(vf_view *v, float r, float g, float b) {
         make_framebuffers(v);
         ar = vkAcquireNextImageKHR(v->dev, v->sc, UINT64_MAX, v->sem_ready, VK_NULL_HANDLE, &img);
     }
+    v->ph_cur[VF_PH_ACQ] = (float)(now_ms() - t);
     if (ar != VK_SUCCESS) return;
     v->cur_img = img;
     vkResetFences(v->dev, 1, &v->fence);
     vkResetCommandBuffer(v->cmd, 0);
+    v->ph_rec_start = now_ms();
 
     float *u = (float *)v->ubo_ptr;
     memcpy(u, v->vp, sizeof(v->vp));
@@ -964,6 +1223,10 @@ void vf_view_begin(vf_view *v, float r, float g, float b) {
 
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     vkBeginCommandBuffer(v->cmd, &bi);
+    if (v->ts_ok) {
+        vkCmdResetQueryPool(v->cmd, v->fq[slot], 0, 2);
+        vkCmdWriteTimestamp(v->cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, v->fq[slot], 0);
+    }
     /* Физика отправляет такт асинхронно и не ждёт его: без барьера
      * вершинный шейдер может прочитать буфер тел, не увидев записи compute. */
     VkMemoryBarrier body_barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -972,6 +1235,7 @@ void vf_view_begin(vf_view *v, float r, float g, float b) {
     vkCmdPipelineBarrier(v->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, 0, 1, &body_barrier, 0,
                          NULL, 0, NULL);
+
     VkClearValue clear[2];
     memset(clear, 0, sizeof(clear));
     clear[0].color.float32[0] = r;
@@ -1016,14 +1280,18 @@ void vf_view_set_bodies(vf_view *v, void *buffer, uint32_t count) {
     v->body_buf = (VkBuffer)buffer;
     v->body_n = count;
     VkDescriptorBufferInfo dbi = {v->body_buf, 0, VK_WHOLE_SIZE};
-    VkWriteDescriptorSet wd = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    wd.dstSet = v->dset;
-    wd.dstBinding = 1;
-    wd.descriptorCount = 1;
-    wd.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    wd.pBufferInfo = &dbi;
+    VkWriteDescriptorSet wd[VF_FIF];
+    memset(wd, 0, sizeof(wd));
+    for (int i = 0; i < VF_FIF; i++) {
+        wd[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wd[i].dstSet = v->dset_fif[i];
+        wd[i].dstBinding = 1;
+        wd[i].descriptorCount = 1;
+        wd[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        wd[i].pBufferInfo = &dbi;
+    }
     vf_ctx_lock(v->core);
-    vkUpdateDescriptorSets(v->dev, 1, &wd, 0, NULL);
+    vkUpdateDescriptorSets(v->dev, VF_FIF, wd, 0, NULL);
     vf_ctx_unlock(v->core);
 }
 
@@ -1139,9 +1407,15 @@ static void draw_perf_overlay(vf_view *v) {
      * рядом читаются как разброс стадии, а не как три несвязанных колонки. */
     const float x0 = 10.0f, y0 = 10.0f, w = 620.0f;
     uint32_t nrows = v->perf_n;
+    /* Блок фаз кадра: заголовок + 7 фаз + строка интервала (+ простой GPU). */
+    uint32_t ph_rows = 0;
+    int ph_on = v->ph_win_frames > 0;
+    if (ph_on) ph_rows = (uint32_t)(sizeof(ph_show) / sizeof(ph_show[0])) + 2 + (v->ts_ok ? 1 : 0);
     /* Шапка + строки стадий + строка ИТОГО такта (+ строка тел, если есть). */
     float h = 30.0f + lh * (float)(nrows ? nrows + 2 + (v->perf_scene_ok ? 1 : 0) : 1) + 8.0f;
+    if (ph_on) h += lh * (float)(ph_rows + 1) + 6.0f;
     ui_quad(v, x0, y0, w, h, bg);
+
 
     char line[96];
     if (v->perf_tick_max_ms > 0.0f) {
@@ -1224,6 +1498,46 @@ static void draw_perf_overlay(vf_view *v) {
         ui_text(v, x0 + 12, y + 4, sc, head, line);
     }
 
+    /* Фазы кадра на CPU: где стоит главный поток. Строка interval — фактический
+     * ритм кадров; gpu idle — сколько GPU простаивал между кадрами (метки
+     * таймстемпов), то есть ждал CPU или развёртку. */
+    if (ph_on) {
+        float y = yhead + lh * (float)(nrows + 2 + (v->perf_scene_ok ? 1 : 0)) + 6.0f;
+        ui_text(v, x0 + 12, y + 4, sc, title, "FRAME (CPU, ms)");
+        y += lh;
+        ui_text(v, x0 + 12, y + 4, sc, head, "phase");
+        ui_text(v, x0 + 210, y + 4, sc, head, "min / mean / max");
+        ui_text(v, x0 + 470, y + 4, sc, head, "p99");
+        for (unsigned k = 0; k < sizeof(ph_show) / sizeof(ph_show[0]); k++) {
+            int p = ph_show[k];
+            const float *st = v->ph_stat[p];
+            y += lh;
+            ui_text(v, x0 + 12, y + 4, sc, text, ph_names[p]);
+            fmt_triplet(line, sizeof line, st[0], st[1], st[2]);
+            ui_text(v, x0 + 210, y + 4, sc, text, line);
+            snprintf(line, sizeof line, "%6.2f", (double)st[3]);
+            ui_text(v, x0 + 470, y + 4, sc, text, line);
+        }
+        y += lh;
+        {
+            const float *st = v->ph_stat[VF_PH_IVL];
+            ui_text(v, x0 + 12, y + 4, sc, title, "interval");
+            fmt_triplet(line, sizeof line, st[0], st[1], st[2]);
+            ui_text(v, x0 + 210, y + 4, sc, title, line);
+            snprintf(line, sizeof line, "%6.2f", (double)st[3]);
+            ui_text(v, x0 + 470, y + 4, sc, title, line);
+        }
+        if (v->ts_ok) {
+            const float *g = v->ph_gap_stat;
+            y += lh;
+            ui_text(v, x0 + 12, y + 4, sc, head, "gpu idle");
+            fmt_triplet(line, sizeof line, g[0], g[1], g[2]);
+            ui_text(v, x0 + 210, y + 4, sc, head, line);
+            snprintf(line, sizeof line, "%6.2f", (double)g[3]);
+            ui_text(v, x0 + 470, y + 4, sc, head, line);
+        }
+    }
+
     vkCmdBindPipeline(v->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v->pipe_ui);
     VkDeviceSize off = 0;
     vkCmdBindVertexBuffers(v->cmd, 0, 1, &v->ui_vbuf, &off);
@@ -1252,9 +1566,17 @@ void vf_view_perf(vf_view *v, const vf_perf_row *rows, uint32_t n,
 
 void vf_view_end(vf_view *v) {
     if (!v->recording) return;
+    int slot = v->fif;
     draw_perf_overlay(v);
     vkCmdEndRenderPass(v->cmd);
+    if (v->ts_ok) {
+        vkCmdWriteTimestamp(v->cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, v->fq[slot], 1);
+        vkCmdCopyQueryPoolResults(v->cmd, v->fq[slot], 0, 2, v->fts[slot], 0,
+                                  sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+    }
     vkEndCommandBuffer(v->cmd);
+    v->ph_cur[VF_PH_REC] = (float)(now_ms() - v->ph_rec_start);
+
     VkPipelineStageFlags wait = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.waitSemaphoreCount = 1;
@@ -1263,7 +1585,8 @@ void vf_view_end(vf_view *v) {
     si.commandBufferCount = 1;
     si.pCommandBuffers = &v->cmd;
     si.signalSemaphoreCount = 1;
-    si.pSignalSemaphores = &v->sem_done;
+    VkSemaphore done = v->sem_done_img[v->cur_img];
+    si.pSignalSemaphores = &done;
 
     /* Две очереди: (1) ждём тактовый таймлайн на значение опубликованного
      * банка, (2) сигналим свой кадровый таймлайн, чтобы такт не начал писать
@@ -1274,7 +1597,7 @@ void vf_view_end(vf_view *v) {
     VkSemaphore tl_ws[2] = {v->sem_ready, v->tl_tick};
     VkPipelineStageFlags tl_wss[2] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                                       VK_PIPELINE_STAGE_ALL_COMMANDS_BIT};
-    VkSemaphore tl_ss[2] = {v->sem_done, v->tl_frame};
+    VkSemaphore tl_ss[2] = {done, v->tl_frame};
     uint64_t tl_wv[2] = {0, v->tl_wait}; /* у бинарного значение игнорируется */
     uint64_t tl_sv[2] = {0, v->tl_value + 1};
     VkTimelineSemaphoreSubmitInfo tsi = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
@@ -1294,11 +1617,15 @@ void vf_view_end(vf_view *v) {
         si.signalSemaphoreCount = 2;
         si.pSignalSemaphores = tl_ss;
     }
-    /* Очередь общая с физикой: submit и present — под замком ядра.
-     * Fence ждём вне замка (см. vf_view_begin). */
-    vf_ctx_lock(v->core);
+    /* Замок ОЧЕРЕДИ кадра: при двух очередях он свой (тактовый submit его не
+     * ждёт), при одной — общий. Fence ждём вне замка (см. vf_view_begin). */
+    double t = now_ms();
+    vf_queue_lock(v->core, VF_STREAM_FRAME);
+    v->ph_cur[VF_PH_LOCK] = (float)(now_ms() - t);
+    t = now_ms();
     VkResult sres = vkQueueSubmit(v->queue, 1, &si, v->fence);
-    vf_ctx_unlock(v->core);
+    v->ph_cur[VF_PH_SUB] = (float)(now_ms() - t);
+    vf_queue_unlock(v->core, VF_STREAM_FRAME);
     if (sres != VK_SUCCESS) return;
     if (tl_on) {
         /* Кадр читает этот банк на значении tl_value: такт ждёт его, прежде
@@ -1307,15 +1634,19 @@ void vf_view_end(vf_view *v) {
     }
     VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.waitSemaphoreCount = 1;
-    pi.pWaitSemaphores = &v->sem_done;
+    pi.pWaitSemaphores = &done;
     pi.swapchainCount = 1;
     pi.pSwapchains = &v->sc;
     // pImageIndices обязателен: без него драйвер разыменовывает NULL и падает
     // в wsi_common_queue_present.
     pi.pImageIndices = &v->cur_img;
-    vf_ctx_lock(v->core);
+    t = now_ms();
+    vf_queue_lock(v->core, VF_STREAM_FRAME);
+    v->ph_cur[VF_PH_PLOCK] = (float)(now_ms() - t);
+    t = now_ms();
     VkResult pr = vkQueuePresentKHR(v->queue, &pi);
-    vf_ctx_unlock(v->core);
+    v->ph_cur[VF_PH_PRES] = (float)(now_ms() - t);
+    vf_queue_unlock(v->core, VF_STREAM_FRAME);
     if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) {
         vkDeviceWaitIdle(v->dev);
         drop_swapchain(v);
@@ -1323,5 +1654,10 @@ void vf_view_end(vf_view *v) {
         make_depth(v);
         make_framebuffers(v);
     }
+    /* Простой GPU между кадрами: начало этого кадра минус конец прошлого
+     * (один и тот же домен часов — обе метки пишет одна очередь). Больше нуля
+     * — GPU ждал CPU или развёртку; ноль — очередь была занята. */
+    push_frame_phases(v);
+    v->fif = (v->fif + 1) % (v->n_fif > 0 ? v->n_fif : 1);
     v->recording = 0;
 }
