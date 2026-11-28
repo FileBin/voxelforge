@@ -235,18 +235,16 @@ impl TetBody {
          * который заполняет объём ровно: 12 тетов на кубическую ячейку. Перебор
          * по узлам (bcc_tets_at) при обрезке по коробке недобирает (n=4: 480
          * вместо 768), то есть тело теряло бы массу — см. ignored-тест. */
-        let mut seen: std::collections::HashSet<[u64; 4]> = std::collections::HashSet::new();
+        /* Дедупликации здесь НЕТ и быть не должно: 12 тетов, которые даёт
+         * bcc_tets для своей ячейки, попарно различны во всём теле. Проверка
+         * объёмом это и поймала: с дедупликацией n=2 давало 54 тета вместо 96,
+         * то есть тело было на 44% легче — ломались масса, инерция и динамика. */
         let mut tets = Vec::with_capacity((n * n * n * 12) as usize);
         for i in 0..n {
             for j in 0..n {
                 for k in 0..n {
                     let base = (2 * i - n, 2 * j - n, 2 * k - n);
                     for t in bcc_tets(base).iter() {
-                        let mut key = [pack(t[0]), pack(t[1]), pack(t[2]), pack(t[3])];
-                        key.sort();
-                        if !seen.insert(key) {
-                            continue;
-                        }
                         tets.push(Tet {
                             level,
                             v: [t[0], t[1], t[2], t[3]],
@@ -1364,6 +1362,28 @@ mod bcc_node_tiling_tests {
                 assert!(keys.insert(k), "дубль тета: {:?}", t.v);
                 assert_eq!(edge_sq(&t.v), vec![3, 3, 3, 3, 4, 4], "не BCC-тет: {:?}", t.v);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod volume_tests {
+    use super::*;
+
+    /// Главный инвариант: объём тела равен объёму набора кубов. Если тетов
+    /// меньше 12·n³, тело легче, чем должно, — это ломает и массу, и инерцию.
+    #[test]
+    fn body_volume_matches_cube_grid() {
+        for n in [2i32, 4] {
+            let body = TetBody::cube([0.0; 3], n, 0);
+            let a = node_step(0) * 2.0; // ребро кубической ячейки, м
+            let want = (n * n * n) as f32 * a * a * a;
+            let got = body.volume() as f32;
+            assert!(
+                (got - want).abs() <= want * 0.02,
+                "n={n}: объём {got:.4} при ожидаемом {want:.4} (тетов {})",
+                body.tets.len()
+            );
         }
     }
 }
