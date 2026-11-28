@@ -82,7 +82,8 @@ fn main() {
         peak_plate_v = peak_plate_v.max(plate_speed);
         peak_ball_v = peak_ball_v.max(ball_speed);
         println!(
-            "кадр {f:2}: контактов {total:4} ({plate_state}/{ball_state}) · глубина max {pen:.4} · плита {plate_speed:6.3} м/с · снаряд {ball_speed:6.2} м/с · такт {dt_ms:6.1} мс"
+            "кадр {f:2}: контактов {total:4} ({plate_state}/{ball_state}) · глубина max {pen:.4} · плита {plate_speed:6.3} м/с · снаряд {ball_speed:6.2} м/с · такт {dt_ms:6.1} мс · ccd {} ({:.2} мс)",
+            w.last_ccd, w.last_ccd_ms
         );
     }
     println!(
