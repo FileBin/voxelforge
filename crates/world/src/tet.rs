@@ -626,6 +626,86 @@ impl TetBody {
         (lo, hi)
     }
 
+    /// Дробление ПО ПОЛЮ: каждый осколок — это поле родителя, отсечённое
+    /// плоскостями Вороного его затравки. Плоскость среза проходит где угодно
+    /// (не по границам тетов), поэтому сколы выходят плавными и точными.
+    pub fn shatter_fields(&self, pts: &[[f32; 3]]) -> Vec<TetBody> {
+        let parent = self.sdf().clone();
+        let step = parent.step;
+        let n_nodes = [
+            parent.lo[0], parent.lo[1], parent.lo[2],
+            parent.dims[0] as i32, parent.dims[1] as i32, parent.dims[2] as i32,
+        ];
+        let mut out: Vec<TetBody> = Vec::new();
+        for (i, si) in pts.iter().enumerate() {
+            let mut f = parent.clone();
+            for (j, sj) in pts.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                let mut n = [sj[0] - si[0], sj[1] - si[1], sj[2] - si[2]];
+                let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-6);
+                n = [n[0] / len, n[1] / len, n[2] / len];
+                let mid = [
+                    (si[0] + sj[0]) * 0.5,
+                    (si[1] + sj[1]) * 0.5,
+                    (si[2] + sj[2]) * 0.5,
+                ];
+                /* узлы в единицах решётки, поэтому и плоскость — в них */
+                let d = n[0] * mid[0] / step + n[1] * mid[1] / step + n[2] * mid[2] / step;
+                f = field::intersect_plane(&f, n, d);
+            }
+            /* теты — по занятости нового поля (они разметка узлов) */
+            let (nx, ny, nz) = (n_nodes[3] as usize, n_nodes[4] as usize, n_nodes[5] as usize);
+            let (nx_i, ny_i, nz_i) = (nx as i32, ny as i32, nz as i32);
+            let inside = |nd: Node| -> bool {
+                let x = nd.0 - n_nodes[0];
+                let y = nd.1 - n_nodes[1];
+                let z = nd.2 - n_nodes[2];
+                if x < 0 || y < 0 || z < 0 || x >= nx_i || y >= ny_i || z >= nz_i {
+                    return false;
+                }
+                f.val[(z as usize * ny + y as usize) * nx + x as usize] < 0.0
+            };
+            let mut tets = Vec::new();
+            let mut seen: std::collections::HashSet<[Node; 4]> = std::collections::HashSet::new();
+            let mut bz = n_nodes[2];
+            while bz <= n_nodes[2] + nz_i - 3 {
+                let mut by = n_nodes[1];
+                while by <= n_nodes[1] + ny_i - 3 {
+                    let mut bx = n_nodes[0];
+                    while bx <= n_nodes[0] + nx_i - 3 {
+                        for dir in 0..3 {
+                            for t in bcc_tets_around_edge((bx, by, bz), dir) {
+                                if !t.iter().all(|nd| inside(*nd)) {
+                                    continue;
+                                }
+                                if seen.insert(tet_key(&t)) {
+                                    tets.push(Tet { level: self.tets[0].level, v: t });
+                                }
+                            }
+                        }
+                        bx += 2;
+                    }
+                    by += 2;
+                }
+                bz += 2;
+            }
+            if tets.is_empty() {
+                continue;
+            }
+            let body = TetBody {
+                tets,
+                level_cap: self.level_cap,
+                origin: self.origin,
+                sdf: Default::default(),
+            };
+            let _ = body.sdf.set(f);
+            out.push(body);
+        }
+        out
+    }
+
     /// Раскол с упором на точку удара: часть затравок ставится рядом с ней,
     /// поэтому близко к попаданию образуется больше мелких отколов, а плита
     /// раскалывается крупными кусками вдали.
@@ -673,16 +753,20 @@ impl TetBody {
             }
             buckets[best].push(*t);
         }
-        buckets
-            .into_iter()
-            .filter(|v| !v.is_empty())
-            .map(|tets| TetBody {
-                tets,
-                level_cap: self.level_cap,
-                origin: self.origin,
-                sdf: Default::default(),
-            })
-            .collect()
+        let _ = &buckets;
+        /* Дробление ПО ПОЛЮ: плоскости режут внутри тетов, сколы плавные. */
+        let pts32: Vec<[f32; 3]> = pts
+            .iter()
+            .map(|p| [p[0] as f32, p[1] as f32, p[2] as f32])
+            .collect();
+        return self.shatter_fields(&pts32);
+        #[allow(unreachable_code)]
+        buckets.into_iter().filter(|v| !v.is_empty()).map(|tets| TetBody {
+            tets,
+            level_cap: self.level_cap,
+            origin: self.origin,
+            sdf: Default::default(),
+        }).collect()
     }
 
     /// Раскол: тетраэдры раздаются ближайшей затравке (Вороной). Осколки
