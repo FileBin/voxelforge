@@ -255,7 +255,7 @@ pub const PIPE_NAMES: [&str; 34] = [
 ];
 /// Число storage-буферов у каждого пайплайна — в том же порядке.
 const PIPE_BUFNS: [u32; 34] = [
-    1, 2, 2, 3, 4, 2, 5, 4, 1, 1, 4, 4, 7, 3, 2, 4, 3, 6, 8, 6, 4, 1, 2, 3, 2, 2, 4, 8, 1, 7, 5, 6,
+    1, 2, 2, 3, 4, 2, 5, 4, 1, 1, 4, 4, 7, 3, 2, 4, 3, 7, 8, 6, 4, 1, 2, 3, 2, 2, 4, 9, 1, 7, 5, 6,
     5, 6,
 ];
 /// Ячеек на блок в параллельном скане (совпадает с 16 * 64 в шейдере).
@@ -413,6 +413,9 @@ pub struct GpuSim {
     tetcursor: *mut c_void,
     /// Раскладка: (тело, индекс тета в пуле) по ячейкам.
     cell_tets: *mut c_void,
+    /// Номер ячейки для каждой записи раскладки (cell_tets): O(1) вместо
+    /// бинарного поиска по `tetstart` в проходе пар.
+    cellid: *mut c_void,
     /// Счётчик пар от tet_pairs.
     pair_count: *mut c_void,
     /// Энергия самого сильного удара на тело (2 vec4 на тело).
@@ -559,6 +562,9 @@ impl GpuSim {
         let tetstart = mk((ncells as usize + 1) * 4, true);
         let tetcursor = mk(ncells as usize * 4, false);
         let cell_tets = mk(MAX_CELL_TETS * 8, true);
+        /* Номер ячейки каждой записи: пишет tet_fill, читает tet_pairs_flat —
+         * вместо бинарного поиска по префиксу на каждую запись. */
+        let cellid = mk(MAX_CELL_TETS * 4, false);
         /* 8 слов: [0] пары, [1..] — диагностика прохода пар (см. bench). */
         let pair_count = mk(256, true);
         let impact = mk(MAX_BODIES * 32, true);
@@ -679,6 +685,7 @@ impl GpuSim {
             tetstart,
             tetcursor,
             cell_tets,
+            cellid,
             pair_count,
             impact,
             impact_ring,
@@ -1642,6 +1649,7 @@ impl GpuSim {
                     self.tetstart,
                     self.tetcursor,
                     self.cell_tets,
+                    self.cellid,
                 ],
                 push,
                 groups: [g_body, 1, 1],
@@ -1804,6 +1812,7 @@ impl GpuSim {
                     self.tetstart,
                     self.tetcursor,
                     self.cell_tets,
+                    self.cellid,
                 ],
                 push,
                 groups: [g_body, 1, 1],
@@ -1819,6 +1828,7 @@ impl GpuSim {
                     self.pairs,
                     self.pair_count,
                     self.baabb,
+                    self.cellid,
                 ],
                 push,
                 /* По записям: групп на весь потолок (записей не больше

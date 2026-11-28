@@ -5,7 +5,12 @@
  *
  * Здесь было два квадрата, и оба убраны:
  *
- * 1. Внешний цикл начинался с `idx`, а не с самой пары: invocation idx
+ * 1. Свою ячейку invocation искала бинарным поиском по префиксу `tetstart`
+ *    (~17 зависимых чтений по 400-килобайтному массиву на каждую запись).
+ *    Номер ячейки теперь лежит рядом с записью: `tet_fill` пишет его в
+ *    `cellid[at]`, здесь он читается одним обращением.
+ *
+ * 2. Внешний цикл начинался с `idx`, а не с самой пары: invocation idx
  *    перебирала ВСЕ i из [idx, e), поэтому пара (i, j) просматривалась
  *    (i - s + 1) раз. Работа ячейки была O(k^3/6) вместо O(k^2/2), а каждая
  *    пара попадала в список k раз — дубликаты съедали и буфер пар, и ёмкость
@@ -27,6 +32,7 @@ layout(std430, set = 0, binding = 5) buffer Pairs { uvec2 pairs[]; };
 layout(std430, set = 0, binding = 6) buffer PairCount { uint pcnt[]; };
 layout(std430, set = 0, binding = 7) buffer BodyAabb { vec4 baabb[]; };
 /* Номер ячейки каждой записи — пишет tet_fill (binding 6 того шейдера). */
+layout(std430, set = 0, binding = 8) buffer CellId { uint cellid[]; };
 
 /* Потолок пар — ровно столько, сколько выделено под `pairs` (sim::MAX_PAIRS).
  * Раньше здесь стояло 262144 при буфере на 65536 записей: всё, что сверх,
@@ -39,17 +45,6 @@ vec3 qrot(vec4 q, vec3 v) {
     float w = q.x;
     vec3 t = 2.0 * cross(u, v);
     return v + w * t + cross(u, t);
-}
-
-/* Ячейка, в которой лежит запись i: бинарный поиск по префиксу tetstart. */
-uint cell_of(uint i, uint nc) {
-    uint lo = 0u;
-    uint hi = nc; /* start[nc] закрывает всё */
-    while (lo + 1u < hi) {
-        uint mid = (lo + hi) >> 1u;
-        if (start[mid] <= i) lo = mid; else hi = mid;
-    }
-    return lo;
 }
 
 void aabb(uint body, uint tet_in_body, out vec3 lo, out vec3 hi, out bool ok) {
@@ -72,7 +67,7 @@ void main() {
     uint total = start[uint(pc.grid.x * pc.grid.y * pc.grid.z)];
     if (idx >= total) return;
 
-    uint c = cell_of(idx, uint(pc.grid.x * pc.grid.y * pc.grid.z));
+    uint c = cellid[idx]; /* O(1): ячейку записал tet_fill */
     uint e = start[c + 1u];
     /* Дальше в ячейке записей нет — пар у этой не будет. */
     if (idx + 1u >= e) return;
