@@ -68,6 +68,13 @@ int32_t vf_view_add_mesh(vf_view *v, const float *pos, const float *nrm, uint32_
                          const uint32_t *idx, uint32_t ni);
 int32_t vf_view_add_lines(vf_view *v, const float *pts, uint32_t n_lines);
 
+/* Меш, который целиком лежит в буферах ядра (вершины и индексы пишет compute
+ * на том же девайсе): рисуется vkCmdDrawIndexedIndirect, счётчик индексов
+ * приходит из indirect-команды. CPU вершин не видит. cmd_off — смещение
+ * команды в буфере (5 uint на тело). */
+int32_t vf_view_add_gpu_mesh(vf_view *v, void *vbuf, void *ibuf, void *indirect,
+                             uint64_t cmd_off);
+
 // Буфер тел физики: поза читается шейдером прямо оттуда (тот же девайс).
 void vf_view_set_bodies(vf_view *v, void *buffer, uint32_t count);
 

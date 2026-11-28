@@ -493,6 +493,9 @@ impl Live {
                 })
                 .collect();
             self.gpu.upload_sdf(&items);
+            /* Меши пересобираются ЗДЕСЬ же (марчинг на устройстве): вершины
+             * уходят в буферы рендера, окно рисует их indirect-командой. */
+            self.gpu.build_meshes();
             self.geom_dirty = false;
         }
 
@@ -1460,6 +1463,32 @@ impl Live {
         self.last_awake = MAX_BODIES as u32;
         self.pending_vmax = 0.0;
         self.last_log.clear();
+    }
+
+    /// Каркас тетов тела (отладка окна): только геометрия, поле не нужно.
+    pub fn edges_for(&self, i: usize) -> Option<Vec<[f32; 3]>> {
+        let b = self.bodies.get(i)?;
+        if !b.alive || b.tets.is_empty() {
+            return None;
+        }
+        let tb = TetBody {
+            tets: b.tets.clone(),
+            level_cap: b.level_cap,
+            origin: b.origin,
+            sdf: Default::default(),
+        };
+        Some(tb.edge_lines())
+    }
+
+    /// Буферы МЕША тела на устройстве (вершины, индексы, indirect, смещение
+    /// команды) — окну, чтобы нарисовать vkCmdDrawIndexedIndirect. CPU вершин
+    /// не видит: их пишет marching_tets.comp.
+    pub fn gpu_mesh_handle(&self, i: usize) -> Option<[u64; 4]> {
+        if i >= self.bodies.len() || !self.bodies[i].alive || self.bodies[i].tets.is_empty() {
+            return None;
+        }
+        let (v, ix, ind, off) = self.gpu.mesh_buffers(i);
+        Some([v as usize as u64, ix as usize as u64, ind as usize as u64, off])
     }
 
     /// Формы для окна: у каждого тела свой меш и каркас тетраэдров.

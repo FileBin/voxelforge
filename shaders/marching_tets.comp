@@ -1,0 +1,260 @@
+#version 450
+#include "common.glsl"
+
+/* Марчинг по тетам НА УСТРОЙСТВЕ — перенос `tet::extract_marching`.
+ *
+ * Зачем: даже с полем на GPU меш считался на CPU, и поле приходилось вычитывать
+ * обратно (60 КБ на осколок) только ради вершин. Теперь вершины и индексы
+ * пишутся сразу в буферы рендера, а CPU видит только счётчик (indirect-команду).
+ *
+ * Топология — ровно та же, что у CPU: ячейка 2×2×2 узла сетки ПОЛЯ, 12 тетов
+ * внутри, вершина — точка линейной интерполяции на пересечённом ребре, порядок
+ * обхода — по центроиду внутренних углов. ПОЭТОМУ формула поверхности не
+ * меняется: меняется только место счёта.
+ *
+ * Вершины НЕ делятся между треугольниками (нет хэша пар узлов): соседние
+ * треугольники получают свои копии. Нормали берутся из поля, а не усредняются
+ * по граням, поэтому швов не видно, зато вершин втрое больше.
+ *
+ * Раскладка буферов:
+ *   binding 0 — дескрипторы полей (бокс/шаг в системе тела)
+ *   binding 1 — значения полей (слот на тело)
+ *   binding 2 — ВЕРШИНЫ рендера: 6 float на вершину (pos.xyz, nrm.xyz)
+ *   binding 3 — ИНДЕКСЫ рендера (u32), те же номера, что у вершин
+ *   binding 4 — indirect-команды: 5 uint на тело
+ *               (indexCount, instanceCount, firstIndex, vertexOffset, firstInstance)
+ *
+ * Слот тела в буферах: MAX_VERTS вершин и столько же индексов подряд, поэтому
+ * firstIndex = vertexOffset + база слота, а indirect-команда собирается сама:
+ * count набирается atomicAdd'ом, остальные поля ставит хост один раз.
+ */
+
+layout(local_size_x = 64) in;
+
+const uint MAX_VERTS = 98304u;          /* вершин на тело (совпадает с sim.rs) */
+
+layout(std430, set = 0, binding = 0) readonly buffer Descs { SdfDesc descs[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Values { float vals[]; };
+layout(std430, set = 0, binding = 2) buffer Verts { float vtx[]; };
+layout(std430, set = 0, binding = 3) buffer Idx { uint idx[]; };
+layout(std430, set = 0, binding = 4) buffer Cmds { uint cmd[]; };
+
+/* 12 тетов кубической ячейки: углы — биты x+2y+4z, 8 — центр. */
+const int CUBE_TETS[48] = int[48](
+    0, 2, 6, 8,  0, 6, 4, 8,
+    1, 5, 7, 8,  1, 7, 3, 8,
+    0, 4, 5, 8,  0, 5, 1, 8,
+    2, 3, 7, 8,  2, 7, 6, 8,
+    0, 1, 3, 8,  0, 3, 2, 8,
+    4, 6, 7, 8,  4, 7, 5, 8);
+
+float at_node(SdfDesc d, uint base, ivec3 n) {
+    ivec3 dm = sdf_dims(d);
+    ivec3 c = clamp(n - d.lo_dims.xyz, ivec3(0), dm - ivec3(1));
+    uint i = (uint(c.z) * uint(dm.y) + uint(c.y)) * uint(dm.x) + uint(c.x);
+    return vals[base + i];
+}
+
+vec3 gradient_node(SdfDesc d, uint base, ivec3 n) {
+    ivec3 dm = sdf_dims(d);
+    ivec3 c = clamp(n - d.lo_dims.xyz, ivec3(0), dm - ivec3(1));
+    ivec3 xp = clamp(c + ivec3(1, 0, 0), ivec3(0), dm - ivec3(1));
+    ivec3 xm = clamp(c - ivec3(1, 0, 0), ivec3(0), dm - ivec3(1));
+    ivec3 yp = clamp(c + ivec3(0, 1, 0), ivec3(0), dm - ivec3(1));
+    ivec3 ym = clamp(c - ivec3(0, 1, 0), ivec3(0), dm - ivec3(1));
+    ivec3 zp = clamp(c + ivec3(0, 0, 1), ivec3(0), dm - ivec3(1));
+    ivec3 zm = clamp(c - ivec3(0, 0, 1), ivec3(0), dm - ivec3(1));
+    uint sy = uint(dm.x) * uint(dm.y);
+    float gx = vals[base + uint(xp.z) * sy + uint(xp.y) * uint(dm.x) + uint(xp.x)]
+             - vals[base + uint(xm.z) * sy + uint(xm.y) * uint(dm.x) + uint(xm.x)];
+    float gy = vals[base + uint(yp.z) * sy + uint(yp.y) * uint(dm.x) + uint(yp.x)]
+             - vals[base + uint(ym.z) * sy + uint(ym.y) * uint(dm.x) + uint(ym.x)];
+    float gz = vals[base + uint(zp.z) * sy + uint(zp.y) * uint(dm.x) + uint(zp.x)]
+             - vals[base + uint(zm.z) * sy + uint(zm.y) * uint(dm.x) + uint(zm.x)];
+    return vec3(gx, gy, gz);
+}
+
+/* Одна вершина меша: номер слота, позиция в системе тела, нормаль. */
+void put_vertex(uint slot, vec3 p, vec3 n, uint at) {
+    uint o = (slot * MAX_VERTS + at) * 6u;
+    vtx[o + 0u] = p.x;
+    vtx[o + 1u] = p.y;
+    vtx[o + 2u] = p.z;
+    vtx[o + 3u] = n.x;
+    vtx[o + 4u] = n.y;
+    vtx[o + 5u] = n.z;
+}
+
+/* Индексы хранят ГЛОБАЛЬНЫЙ номер вершины: firstIndex рисует с начала слота,
+ * vertexOffset = 0, поэтому значение индекса — адрес вершины в буфере. */
+void put_tri(uint slot, uint at) {
+    uint g = slot * MAX_VERTS + at;
+    idx[g + 0u] = g + 0u;
+    idx[g + 1u] = g + 1u;
+    idx[g + 2u] = g + 2u;
+}
+
+/* Треугольник с обходом «наружу»: нормаль против направления к центроиду
+ * внутренних углов тета (как `emit` в march_tet). */
+void emit_tri(uint slot, vec3 pa, vec3 pb, vec3 pc, vec3 cen_in,
+              SdfDesc d, uint base, ivec3 na, ivec3 nb, ivec3 nc) {
+    vec3 n = cross(pb - pa, pc - pa);
+    vec3 mid = (pa + pb + pc) / 3.0 - cen_in;
+    uint at = atomicAdd(cmd[slot * 5u], 3u);
+    if (at + 3u > MAX_VERTS) return;
+    bool flip = dot(n, mid) < 0.0;
+    vec3 ga = normalize(gradient_node(d, base, na) + vec3(1e-9));
+    vec3 gb = normalize(gradient_node(d, base, nb) + vec3(1e-9));
+    vec3 gc = normalize(gradient_node(d, base, nc) + vec3(1e-9));
+    if (flip) {
+        put_vertex(slot, pa, ga, at + 0u);
+        put_vertex(slot, pb, gc, at + 1u);
+        put_vertex(slot, pc, gb, at + 2u);
+    } else {
+        put_vertex(slot, pa, ga, at + 0u);
+        put_vertex(slot, pb, gb, at + 1u);
+        put_vertex(slot, pc, gc, at + 2u);
+    }
+    put_tri(slot, at);
+}
+
+void main() {
+    uint slot = gl_WorkGroupID.y;
+    if (slot >= uint(pc.grid.w)) return;
+    SdfDesc d = descs[slot];
+    if (!sdf_has_field(d)) return;
+    uint base = slot * 65536u;   /* SDF_STRIDE */
+    ivec3 dm = sdf_dims(d);
+    ivec3 flo = d.lo_dims.xyz;
+    ivec3 fhi = flo + dm - ivec3(1);
+
+    /* Ячейка занимает узлы base..base+2 — основание выравниваем по чётности,
+     * как на CPU, иначе крайние узлы прижаты и поверхность обрывается. */
+    ivec3 lo = flo + (ivec3(flo) & ivec3(1));
+    ivec3 hi = fhi - (ivec3(fhi) & ivec3(1));
+    ivec3 cells = max((hi - lo) / 2 + ivec3(1), ivec3(0));
+    uint total = uint(cells.x) * uint(cells.y) * uint(cells.z);
+    uint k = gl_WorkGroupID.x * 64u + gl_LocalInvocationID.x;
+    if (k >= total) return;
+
+    ivec3 cc = ivec3(int(k % uint(cells.x)),
+                     int((k / uint(cells.x)) % uint(cells.y)),
+                     int(k / (uint(cells.x) * uint(cells.y))));
+    ivec3 origin = lo + cc * 2;
+
+    /* 9 узлов ячейки: 8 углов + центр (индекс 8) */
+    ivec3 nodes[9];
+    float val[9];
+    vec3 pos[9];
+    for (int i = 0; i < 8; i++) {
+        nodes[i] = origin + ivec3(2 * (i & 1), 2 * ((i >> 1) & 1), 2 * ((i >> 2) & 1));
+    }
+    nodes[8] = origin + ivec3(1, 1, 1);
+    bool any_neg = false;
+    bool any_pos = false;
+    for (int i = 0; i < 9; i++) {
+        val[i] = at_node(d, base, nodes[i]);
+        pos[i] = d.shift.xyz + vec3(nodes[i]) * d.step_pad.x;
+        if (val[i] < 0.0) any_neg = true; else any_pos = true;
+    }
+    if (!(any_neg && any_pos)) return;
+
+    for (int t = 0; t < 12; t++) {
+        int c0 = CUBE_TETS[t * 4 + 0];
+        int c1 = CUBE_TETS[t * 4 + 1];
+        int c2 = CUBE_TETS[t * 4 + 2];
+        int c3 = CUBE_TETS[t * 4 + 3];
+        int ii[4] = int[4](c0, c1, c2, c3);
+        int nin = 0;
+        int inside[4];
+        for (int q = 0; q < 4; q++) {
+            if (val[ii[q]] < 0.0) inside[nin++] = ii[q];
+        }
+        if (nin == 0 || nin == 4) continue;
+
+        /* точки пересечения рёбер: внутри → снаружи, t по линейной интерполяции */
+        vec3 pts[4];
+        ivec3 kn[4];   /* узел ребра (меньший) — для градиента */
+        ivec3 ka[4];
+        ivec3 kb[4];
+        int np = 0;
+        for (int q = 0; q < nin; q++) {
+            int a = inside[q];
+            for (int j = 0; j < 4; j++) {
+                int b = ii[j];
+                if (val[b] < 0.0) continue;
+                float tt = val[a] / (val[a] - val[b]);
+                pts[np] = mix(pos[a], pos[b], tt);
+                /* канонический порядок пары — чтобы у соседей совпадало */
+                if ((a < b)) { ka[np] = nodes[a]; kb[np] = nodes[b]; kn[np] = nodes[a]; }
+                else { ka[np] = nodes[b]; kb[np] = nodes[a]; kn[np] = nodes[b]; }
+                np++;
+            }
+        }
+        /* убрать повторы (одна вершина на ребро) */
+        for (int q = 0; q < np; q++) {
+            for (int r = q + 1; r < np; r++) {
+                if (all(equal(ka[q], ka[r])) && all(equal(kb[q], kb[r]))) {
+                    for (int s = r; s < np - 1; s++) {
+                        pts[s] = pts[s + 1];
+                        ka[s] = ka[s + 1];
+                        kb[s] = kb[s + 1];
+                        kn[s] = kn[s + 1];
+                    }
+                    np--;
+                    r--;
+                }
+            }
+        }
+
+        vec3 cen_in = vec3(0.0);
+        for (int q = 0; q < nin; q++) cen_in += pos[inside[q]] / float(nin);
+
+        if (np == 3) {
+            emit_tri(slot, pts[0], pts[1], pts[2], cen_in, d, base, kn[0], kn[1], kn[2]);
+        } else if (np == 4) {
+            /* Порядок обхода — по углу вокруг нормали (как `order.sort_by` на
+             * CPU): иначе на четырёх точках получается «бабочка». */
+            vec3 n = cross(pts[1] - pts[0], pts[2] - pts[0]);
+            float nl = length(n);
+            n = nl > 1e-9 ? n / nl : vec3(0.0, 1.0, 0.0);
+            vec3 u = normalize(pts[0] - (pts[0] + pts[1] + pts[2] + pts[3]) / 4.0 + vec3(1e-9));
+            vec3 w = cross(n, u);
+            float ang[4];
+            for (int q = 0; q < 4; q++) {
+                vec3 dv = pts[q] - (pts[0] + pts[1] + pts[2] + pts[3]) / 4.0;
+                ang[q] = atan(dot(dv, w), dot(dv, u));
+            }
+            int ord[4] = int[4](0, 1, 2, 3);
+            for (int q = 0; q < 3; q++) {
+                for (int r = q + 1; r < 4; r++) {
+                    if (ang[ord[r]] < ang[ord[q]]) {
+                        int tmp = ord[q];
+                        ord[q] = ord[r];
+                        ord[r] = tmp;
+                    }
+                }
+            }
+            vec3 sp[4];
+            ivec3 sa[4];
+            for (int q = 0; q < 4; q++) {
+                sp[q] = pts[ord[q]];
+                sa[q] = kn[ord[q]];
+            }
+            /* диагональ — по НОМЕРАМ вершин, а не по порядку обхода: соседний
+             * тет режет ту же грань с другой вершины, и «по порядку» даёт
+             * другую диагональ — щель между тетами. */
+            /* ключ — пара узлов, как pack() на CPU: сравниваем лексикографически */
+            bool d02 = (sa[0].x < sa[2].x)
+                    || (sa[0].x == sa[2].x && (sa[0].y < sa[2].y
+                    || (sa[0].y == sa[2].y && sa[0].z < sa[2].z)));
+            if (d02) {
+                emit_tri(slot, sp[0], sp[1], sp[2], cen_in, d, base, sa[0], sa[1], sa[2]);
+                emit_tri(slot, sp[0], sp[2], sp[3], cen_in, d, base, sa[0], sa[2], sa[3]);
+            } else {
+                emit_tri(slot, sp[0], sp[1], sp[3], cen_in, d, base, sa[0], sa[1], sa[3]);
+                emit_tri(slot, sp[1], sp[2], sp[3], cen_in, d, base, sa[1], sa[2], sa[3]);
+            }
+        }
+    }
+}

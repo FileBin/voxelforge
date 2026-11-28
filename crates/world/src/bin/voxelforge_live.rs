@@ -59,6 +59,13 @@ unsafe extern "C" {
     fn vf_view_free(v: *mut c_void);
     fn vf_view_poll(v: *mut c_void, input: *mut VfInput) -> i32;
     fn vf_view_camera(v: *mut c_void, vp: *const f32, eye: *const f32, near_m: f32, far_m: f32);
+    fn vf_view_add_gpu_mesh(
+        v: *mut c_void,
+        vbuf: *mut c_void,
+        ibuf: *mut c_void,
+        indirect: *mut c_void,
+        cmd_off: u64,
+    ) -> i32;
     fn vf_view_add_mesh(
         v: *mut c_void,
         pos: *const f32,
@@ -231,6 +238,9 @@ struct MeshData {
     nrm: Vec<f32>,
     idx: Vec<u32>,
     edges: Vec<f32>,
+    /// Меш целиком на устройстве: (вершины, индексы, indirect, смещение
+    /// команды) как числа — кадр рисует его без единой вершины на CPU.
+    gpu: Option<[u64; 4]>,
 }
 
 struct Shared {
@@ -313,23 +323,21 @@ fn kind_code(k: voxelforge_world::live::Kind) -> u8 {
     }
 }
 
+/// Меш тела для окна: ВЕРШИНЫ уже на устройстве (marching_tets.comp), здесь
+/// только каркас тетов для отладки и адреса буферов.
 fn mesh_of(live: &Live, i: usize) -> Option<MeshData> {
-    let shape = live.shape_for(i)?;
-    let mut pos = Vec::with_capacity(shape.mesh.positions.len() * 3);
-    let mut nrm = Vec::with_capacity(shape.mesh.normals.len() * 3);
-    for (p, n) in shape.mesh.positions.iter().zip(shape.mesh.normals.iter()) {
-        pos.extend_from_slice(p);
-        nrm.extend_from_slice(n);
-    }
-    let mut edges = Vec::with_capacity(shape.edges.len() * 3);
-    for p in &shape.edges {
+    let gpu = live.gpu_mesh_handle(i)?;
+    let edges_src = live.edges_for(i).unwrap_or_default();
+    let mut edges = Vec::with_capacity(edges_src.len() * 3);
+    for p in &edges_src {
         edges.extend_from_slice(p);
     }
     Some(MeshData {
-        pos,
-        nrm,
-        idx: shape.mesh.indices.clone(),
+        pos: Vec::new(),
+        nrm: Vec::new(),
+        idx: Vec::new(),
         edges,
+        gpu: Some(gpu),
     })
 }
 
@@ -958,15 +966,27 @@ fn main() {
 
         // новые формы (появились осколки) — залить в окно
         for (id, m) in out.pending.iter() {
-            let mesh_id = unsafe {
-                vf_view_add_mesh(
-                    view,
-                    m.pos.as_ptr(),
-                    m.nrm.as_ptr(),
-                    (m.pos.len() / 3) as u32,
-                    m.idx.as_ptr(),
-                    m.idx.len() as u32,
-                )
+            let mesh_id = if let Some(g) = m.gpu {
+                unsafe {
+                    vf_view_add_gpu_mesh(
+                        view,
+                        g[0] as usize as *mut c_void,
+                        g[1] as usize as *mut c_void,
+                        g[2] as usize as *mut c_void,
+                        g[3],
+                    )
+                }
+            } else {
+                unsafe {
+                    vf_view_add_mesh(
+                        view,
+                        m.pos.as_ptr(),
+                        m.nrm.as_ptr(),
+                        (m.pos.len() / 3) as u32,
+                        m.idx.as_ptr(),
+                        m.idx.len() as u32,
+                    )
+                }
             };
             let line_id = if m.edges.is_empty() {
                 -1

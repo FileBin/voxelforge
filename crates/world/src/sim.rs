@@ -217,12 +217,14 @@ const P_STATEMIT: usize = 33;
 const P_CCD: usize = 34;
 /// Запекание поля осколка на устройстве: узел = max(f_родителя, плоскости).
 const P_SHARDFIELD: usize = 35;
+/// Марчинг по тетам на устройстве: вершины и индексы сразу в буферы рендера.
+const P_MESH: usize = 36;
 
 /// Имена пайплайнов в порядке `pipes` — ТОТ ЖЕ порядок, что у `P_*` выше и у
 /// массива `names` на устройстве. По этому индексу ядро возвращает номер
 /// стадии в диагностике производительности, поэтому список — единственный
 /// источник правды и для загрузки, и для таблицы.
-pub const PIPE_NAMES: [&str; 36] = [
+pub const PIPE_NAMES: [&str; 37] = [
     "integrate",
     "clear",
     "count",
@@ -259,11 +261,12 @@ pub const PIPE_NAMES: [&str; 36] = [
     "static_emit",
     "ccd",
     "shard_field",
+    "marching_tets",
 ];
 /// Число storage-буферов у каждого пайплайна — в том же порядке.
-const PIPE_BUFNS: [u32; 36] = [
+const PIPE_BUFNS: [u32; 37] = [
     1, 2, 2, 3, 4, 2, 5, 4, 1, 1, 4, 4, 7, 3, 2, 4, 3, 6, 8, 6, 4, 1, 2, 3, 2, 2, 4, 8, 1, 7, 5, 6,
-    5, 6, 6, 5,
+    5, 6, 6, 5, 5,
 ];
 /// Ячеек на блок в параллельном скане (совпадает с 16 * 64 в шейдере).
 pub const SCAN_BLOCK: usize = 1024;
@@ -296,6 +299,13 @@ pub const SDF_STRIDE: usize = 65536;
 /// Потолок пар тел в широком проходе SDF (64 тела → 2016; совпадает с
 /// MAX_SDF_PAIRS в common.glsl).
 pub const MAX_SDF_PAIRS: usize = MAX_BODIES * (MAX_BODIES - 1) / 2;
+/// Вершин меша на тело в буферах рендера (совпадает с MAX_VERTS в
+/// marching_tets.comp). Вершины не делятся между треугольниками, поэтому
+/// потолок держим с запасом: у плиты на шаге 0.035 — ~24 тыс.
+pub const MAX_MESH_VERTS: usize = 98304;
+/// Сколько ячеек марчинга может быть у одного тела (потолок диспатча).
+const MAX_MESH_CELLS: u32 = 12288;
+
 /// Плоскостей Вороного на осколок в запекании (совпадает с MAX_PLANES в
 /// shard_field.comp). У Вороного их n−1, у нас тел не больше 64.
 pub const SHARD_MAX_PLANES: usize = 64;
@@ -479,6 +489,12 @@ pub struct GpuSim {
     pub ccd: bool,
     /// Претензии CCD: пары и тела. Сбрасывается в нули перед тактом.
     ccd_claim: *mut c_void,
+    /// Буферы меша на устройстве: вершины (6 float), индексы (u32) и
+    /// indirect-команды (5 uint на тело). Вершины CPU не читает — окно рисует
+    /// прямо отсюда, vkCmdDrawIndexedIndirect берёт счётчик из памяти.
+    mesh_verts: *mut c_void,
+    mesh_idx: *mut c_void,
+    mesh_cmd: *mut c_void,
     /// Готовые нули под сброс претензий (не аллоцируем каждый такт).
     ccd_zero: Vec<u8>,
     lcount: *mut c_void,
@@ -610,6 +626,15 @@ impl GpuSim {
         /* Претензии CCD: пары (4096) + тела (MAX_BODIES). Своя память, чтобы
          * atomicCompSwap в шейдере никого не толкал локтем. */
         let ccd_claim = mk((CCD_PAIR_SLOTS + MAX_BODIES) * 4, true);
+        /* Меши: вершины и индексы — только на устройстве (окно рисует из них),
+         * indirect-команды — host-visible: их поля (instanceCount, firstIndex)
+         * ставит CPU, а count набирает atomicAdd в шейдере. */
+        /* VF_MESH_DEBUG=1 — буферы меша host-visible: только для сверки вершин
+         * в пробах (в обычном прогоне вершины с устройства не читаются). */
+        let mesh_host = std::env::var("VF_MESH_DEBUG").is_ok();
+        let mesh_verts = mk(MAX_BODIES * MAX_MESH_VERTS * 6 * 4, mesh_host);
+        let mesh_idx = mk(MAX_BODIES * MAX_MESH_VERTS * 4, mesh_host);
+        let mesh_cmd = mk(MAX_BODIES * 5 * 4, true);
         // Тела обязаны попасть на устройство до первого dispatch.
         unsafe {
             check_status(
@@ -734,6 +759,9 @@ impl GpuSim {
             ccd: !matches!(std::env::var("VF_CCD").as_deref(), Ok("0")),
             ccd_claim,
             ccd_zero: vec![0u8; (CCD_PAIR_SLOTS + MAX_BODIES) * 4],
+            mesh_verts,
+            mesh_idx,
+            mesh_cmd,
             lcount,
             cellcnt,
             starts,
@@ -1774,6 +1802,152 @@ impl GpuSim {
         out
     }
 
+
+    /// Собрать МЕШИ ВСЕХ ТЕЛ на устройстве (марчинг по тетам).
+    ///
+    /// Вершины и индексы уходят прямо в буферы рендера, CPU видит только
+    /// indirect-команду (5 uint на тело) — окно рисует её через
+    /// vkCmdDrawIndexedIndirect. Зовётся при смене геометрии (спавн, раскол,
+    /// сброс), а не каждый такт.
+    pub fn build_meshes(&mut self) {
+        if self.n == 0 {
+            return;
+        }
+        /* поля indirect-команд: count — из шейдера, остальные ставим здесь */
+        let mut cmd = vec![0u32; self.n * 5];
+        for (b, c) in cmd.chunks_mut(5).enumerate() {
+            c[0] = 0;                                   /* indexCount */
+            c[1] = 1;                                   /* instanceCount */
+            c[2] = (b * MAX_MESH_VERTS) as u32;         /* firstIndex */
+            c[3] = 0;                                   /* vertexOffset */
+            c[4] = 0;                                   /* firstInstance */
+        }
+        unsafe {
+            check_status(
+                vf_buffer_write(
+                    self.ctx,
+                    self.mesh_cmd,
+                    0,
+                    cmd.as_ptr() as *const c_void,
+                    cmd.len() * 4,
+                ),
+                "mesh cmd",
+            );
+        }
+        /* число ячеек у самого подробного тела — из таблицы дескрипторов */
+        let mut dtab = vec![0u8; MAX_BODIES * 64];
+        unsafe {
+            check_status(
+                vf_buffer_read(
+                    self.ctx,
+                    self.sdf_desc,
+                    0,
+                    dtab.as_mut_ptr() as *mut c_void,
+                    dtab.len(),
+                ),
+                "mesh: read descs",
+            );
+        }
+        let mut cells_max = 1u32;
+        for b in 0..self.n.min(MAX_BODIES) {
+            let o = b * 64;
+            let rd = |i: usize| {
+                i32::from_le_bytes([dtab[o + i * 4], dtab[o + i * 4 + 1], dtab[o + i * 4 + 2], dtab[o + i * 4 + 3]])
+            };
+            let (nx, ny, nz) = (rd(3), rd(4), rd(5));
+            if nx <= 1 || ny <= 1 || nz <= 1 {
+                continue;
+            }
+            let cells = (((nx - 1) / 2).max(0) as u32)
+                * (((ny - 1) / 2).max(0) as u32)
+                * (((nz - 1) / 2).max(0) as u32);
+            cells_max = cells_max.max(cells);
+        }
+        let mut bufs = [
+            self.sdf_desc,
+            self.sdf_vals,
+            self.mesh_verts,
+            self.mesh_idx,
+            self.mesh_cmd,
+        ];
+        let push = self.push(0.0, 0);
+        let mut d = VfDispatch {
+            pipeline: self.pipes[P_MESH],
+            buffers: bufs.as_mut_ptr(),
+            n_buffers: 5,
+            push: &push as *const Push as *const c_void,
+            push_bytes: 80,
+            groups: [
+                cells_max.min(MAX_MESH_CELLS).div_ceil(64).max(1),
+                self.n as u32,
+                1,
+            ],
+            stage: P_MESH as u32,
+        };
+        unsafe {
+            check_status(vf_run(self.ctx, &mut d, 1), "build_meshes");
+        }
+    }
+
+    /// Сколько индексов нарисовать у тела (из indirect-команды) — для сверок.
+    pub fn mesh_index_count(&mut self, body: usize) -> u32 {
+        let mut c = [0u32; 5];
+        unsafe {
+            check_status(
+                vf_buffer_read(self.ctx, self.mesh_cmd, body * 20, c.as_mut_ptr() as *mut c_void, 20),
+                "mesh cmd read",
+            );
+        }
+        c[0]
+    }
+
+    /// Буферы меша для окна: (вершины, индексы, indirect, смещение команды).
+    pub fn mesh_buffers(&self, body: usize) -> (*mut c_void, *mut c_void, *mut c_void, u64) {
+        unsafe {
+            (
+                vf_buffer_handle(self.mesh_verts),
+                vf_buffer_handle(self.mesh_idx),
+                vf_buffer_handle(self.mesh_cmd),
+                (body * 20) as u64,
+            )
+        }
+    }
+
+    /// Отладочное чтение ВЕРШИН меша (только для сверки в пробах: в такте и в
+    /// окне вершины с устройства не читаются).
+    pub fn read_mesh_debug(&mut self, body: usize, count: usize) -> (Vec<[f32; 6]>, Vec<u32>) {
+        let n = count.min(MAX_MESH_VERTS);
+        let mut f = vec![0f32; n * 6];
+        let mut i = vec![0u32; n];
+        unsafe {
+            check_status(
+                vf_buffer_read(
+                    self.ctx,
+                    self.mesh_verts,
+                    (body * MAX_MESH_VERTS) * 6 * 4,
+                    f.as_mut_ptr() as *mut c_void,
+                    n * 6 * 4,
+                ),
+                "mesh verts read",
+            );
+            check_status(
+                vf_buffer_read(
+                    self.ctx,
+                    self.mesh_idx,
+                    (body * MAX_MESH_VERTS) * 4,
+                    i.as_mut_ptr() as *mut c_void,
+                    n * 4,
+                ),
+                "mesh idx read",
+            );
+        }
+        self.bytes_down += (n * 6 * 4 + n * 4) as u64;
+        let verts: Vec<[f32; 6]> = f
+            .chunks(6)
+            .map(|c| [c[0], c[1], c[2], c[3], c[4], c[5]])
+            .collect();
+        (verts, i)
+    }
 
     /// Пары тел из широкого прохода SDF (диагностика: сколько их нашлось и
     /// какие именно — если контактов нет, сразу видно, чья это вина).

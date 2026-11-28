@@ -24,6 +24,11 @@ typedef struct gpu_shape {
     VkDeviceMemory vmem, imem;
     uint32_t n_idx;
     int is_lines;
+    /* Внешний меш: буферы принадлежат ядру (compute их заполняет), счётчик
+     * индексов лежит в indirect-команде — CPU его не читает и не копирует. */
+    int external;
+    VkBuffer indirect;
+    uint64_t cmd_off;
 } gpu_shape;
 
 struct vf_view {
@@ -767,6 +772,9 @@ void vf_view_free(vf_view *v) {
     if (!v) return;
     vkDeviceWaitIdle(v->dev);
     for (int i = 0; i < v->n_shapes; i++) {
+        /* Внешние буферы принадлежат ядру: их освобождает vf_shutdown, второй
+         * vkDestroyBuffer по тому же handle — падение на выходе. */
+        if (v->shapes[i].external) continue;
         free_buffer(v, v->shapes[i].vbuf, v->shapes[i].vmem);
         if (!v->shapes[i].is_lines) free_buffer(v, v->shapes[i].ibuf, v->shapes[i].imem);
     }
@@ -1004,6 +1012,24 @@ void vf_view_set_bodies(vf_view *v, void *buffer, uint32_t count) {
     vf_ctx_unlock(v->core);
 }
 
+/* Меш, который целиком лежит в буферах ядра: вершины и индексы пишет
+ * compute (marching_tets.comp), а здесь — только vkCmdDrawIndexedIndirect.
+ * Возвращает id формы (>=0) или -1. */
+int32_t vf_view_add_gpu_mesh(vf_view *v, void *vbuf, void *ibuf, void *indirect, uint64_t cmd_off) {
+    if (!vbuf || !ibuf || !indirect) return -1;
+    if (v->n_shapes >= MAX_SHAPES) return -1;
+    vf_ctx_lock(v->core);
+    gpu_shape *g = &v->shapes[v->n_shapes];
+    memset(g, 0, sizeof(*g));
+    g->external = 1;
+    g->vbuf = (VkBuffer)vbuf;
+    g->ibuf = (VkBuffer)ibuf;
+    g->indirect = (VkBuffer)indirect;
+    g->cmd_off = cmd_off;
+    vf_ctx_unlock(v->core);
+    return v->n_shapes++;
+}
+
 void vf_view_draw(vf_view *v, int32_t mesh, uint32_t body, float alpha, const float *tint) {
     if (!v->recording || mesh < 0 || mesh >= v->n_shapes) return;
     gpu_shape *g = &v->shapes[mesh];
@@ -1016,6 +1042,17 @@ void vf_view_draw(vf_view *v, int32_t mesh, uint32_t body, float alpha, const fl
     vkCmdPushConstants(v->cmd, v->lay_mesh, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                        16, 16, pick);
     VkDeviceSize off = 0;
+    if (g->external) {
+        /* вершины и команда — в памяти устройства: CPU не знает ни числа
+         * вершин, ни вершин вообще */
+        vkCmdBindDescriptorSets(v->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v->lay_mesh, 0, 1,
+                                &v->dset, 0, NULL);
+        vkCmdBindVertexBuffers(v->cmd, 0, 1, &g->vbuf, &off);
+        vkCmdBindIndexBuffer(v->cmd, g->ibuf, 0, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexedIndirect(v->cmd, g->indirect, g->cmd_off, 1,
+                                 sizeof(VkDrawIndexedIndirectCommand));
+        return;
+    }
     vkCmdBindVertexBuffers(v->cmd, 0, 1, &g->vbuf, &off);
     vkCmdBindIndexBuffer(v->cmd, g->ibuf, 0, VK_INDEX_TYPE_UINT32);
     vkCmdDrawIndexed(v->cmd, g->n_idx, 1, 0, 0, 0);
