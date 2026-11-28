@@ -1,20 +1,21 @@
 #version 450
 #include "common.glsl"
 
-/* Пары тетов — РАВНОМЕРНО по работе, а не по ячейкам.
+/* Пары тетов — одна invocation на ЗАПИСЬ cell_tets[i], пара (i, j) — один раз.
  *
- * Было: одна invocation на ячейку, внутри двойной цикл по записям ячейки. На
- * целом теле ячейка набита десятками тетов одного тела, и худшая ячейка делает
- * O(k^2) работы — она и определяет время такта, пока остальные 99 тысяч ячеек
- * простаивают.
+ * Здесь было два квадрата, и оба убраны:
  *
- * Стало: одна invocation на ЗАПИСЬ (cell_tets[i]). Свою ячейку invocation
- * находит бинарным поиском по tetstart, затем перебирает только пары с
- * записями после себя. Сумма работы та же, но она размазана по записям:
- * худшая invocation делает O(k) вместо O(k^2).
+ * 1. Внешний цикл начинался с `idx`, а не с самой пары: invocation idx
+ *    перебирала ВСЕ i из [idx, e), поэтому пара (i, j) просматривалась
+ *    (i - s + 1) раз. Работа ячейки была O(k^3/6) вместо O(k^2/2), а каждая
+ *    пара попадала в список k раз — дубликаты съедали и буфер пар, и ёмкость
+ *    списков контактов. Теперь invocation делает ровно свои пары (idx, j),
+ *    j > idx.
  *
- * Число записей известно только устройству, поэтому групп столько, сколько
- * влезет записей; лишние invocation выходят по первой проверке.
+ * Дедуп между ячейками — как раньше: пара испускается только в ячейке
+ * минимального угла пересечения AABB пары (`canon`). Эта ячейка заведомо
+ * входит в диапазон раскладки обоих тетов: оба лежат в `c`, значит c внутри
+ * пересечения их диапазонов, а `canon` — нижний угол этого пересечения.
  */
 layout(local_size_x = 64) in;
 layout(std430, set = 0, binding = 0) buffer Bodies { Body b[]; };
@@ -25,14 +26,30 @@ layout(std430, set = 0, binding = 4) buffer CellTets { uvec2 cell_tets[]; };
 layout(std430, set = 0, binding = 5) buffer Pairs { uvec2 pairs[]; };
 layout(std430, set = 0, binding = 6) buffer PairCount { uint pcnt[]; };
 layout(std430, set = 0, binding = 7) buffer BodyAabb { vec4 baabb[]; };
+/* Номер ячейки каждой записи — пишет tet_fill (binding 6 того шейдера). */
 
-const uint MAX_PAIRS = 262144u;
+/* Потолок пар — ровно столько, сколько выделено под `pairs` (sim::MAX_PAIRS).
+ * Раньше здесь стояло 262144 при буфере на 65536 записей: всё, что сверх,
+ * писалось за границу буфера — в соседнюю раскладку сетки, — а SAT читал
+ * этот мусор как пары. */
+const uint MAX_PAIRS = 65536u;
 
 vec3 qrot(vec4 q, vec3 v) {
     vec3 u = q.yzw;
     float w = q.x;
     vec3 t = 2.0 * cross(u, v);
     return v + w * t + cross(u, t);
+}
+
+/* Ячейка, в которой лежит запись i: бинарный поиск по префиксу tetstart. */
+uint cell_of(uint i, uint nc) {
+    uint lo = 0u;
+    uint hi = nc; /* start[nc] закрывает всё */
+    while (lo + 1u < hi) {
+        uint mid = (lo + hi) >> 1u;
+        if (start[mid] <= i) lo = mid; else hi = mid;
+    }
+    return lo;
 }
 
 void aabb(uint body, uint tet_in_body, out vec3 lo, out vec3 hi, out bool ok) {
@@ -49,72 +66,64 @@ void aabb(uint body, uint tet_in_body, out vec3 lo, out vec3 hi, out bool ok) {
     ok = true;
 }
 
-/* Ячейка, в которой лежит запись i: бинарный поиск по префиксу tetstart. */
-uint cell_of(uint i, uint nc) {
-    uint lo = 0u;
-    uint hi = nc; /* start[nc] закрывает всё */
-    while (lo + 1u < hi) {
-        uint mid = (lo + hi) >> 1u;
-        if (start[mid] <= i) lo = mid; else hi = mid;
-    }
-    return lo;
-}
-
 void main() {
     uint idx = gl_GlobalInvocationID.x;
-    uint nc = uint(pc.grid.x * pc.grid.y * pc.grid.z);
-    uint total = start[nc];
+    /* Записей не больше MAX_CELL_TETS, групп столько же — лишние выходят. */
+    uint total = start[uint(pc.grid.x * pc.grid.y * pc.grid.z)];
     if (idx >= total) return;
-    if (total < 2u) return;
 
-    /* Диагностика (VF_PAIR_STATS=1): pcnt[1..] — счётчики прохода. */
-    bool dbg = pc.hi.w > 0.5;
-    if (dbg) atomicAdd(pcnt[4], 1u);
-
-    uint c = cell_of(idx, nc);
-    uint s = start[c];
+    uint c = cell_of(idx, uint(pc.grid.x * pc.grid.y * pc.grid.z));
     uint e = start[c + 1u];
-    if (dbg) {
-        atomicMax(pcnt[2], e - s);
-        atomicAdd(pcnt[1], e - idx);
-    }
-    if (e - s < 2u) return;
+    /* Дальше в ячейке записей нет — пар у этой не будет. */
+    if (idx + 1u >= e) return;
 
     ivec3 dims = pc.grid.xyz;
     float cell = pc.prm1.w;
     vec3 lo_box = pc.lo.xyz;
+    /* Диагностика (VF_PAIR_STATS=1): счётчики в pcnt[1..]. Выключены — ноль
+     * работы: одна униформа на invocation. */
+    bool dbg = pc.hi.w > 0.5;
+    if (dbg) {
+        atomicAdd(pcnt[1], e - idx); /* сколько пар рассмотрит эта запись */
+        atomicMax(pcnt[2], e - start[c]);
+    }
 
-    for (uint i = idx; i < e; i++) {
-        uvec2 A = cell_tets[i];
-        for (uint j = i + 1u; j < e; j++) {
-            uvec2 B = cell_tets[j];
-            if (dbg) atomicAdd(pcnt[6], 1u);
-            if (A.x == B.x) continue;
-            vec3 alo_p = baabb[A.x * 2u].xyz, ahi_p = baabb[A.x * 2u + 1u].xyz;
-            vec3 blo_p = baabb[B.x * 2u].xyz, bhi_p = baabb[B.x * 2u + 1u].xyz;
-            if (any(greaterThan(alo_p, bhi_p)) || any(greaterThan(blo_p, ahi_p))) continue;
+    uvec2 A = cell_tets[idx];
+    uint ta = A.y - span[A.x].x;
+    vec3 alo, ahi;
+    bool oka;
+    aabb(A.x, ta, alo, ahi, oka);
+    vec3 alo_p = baabb[A.x * 2u].xyz, ahi_p = baabb[A.x * 2u + 1u].xyz;
+    vec3 inflA = abs(b[A.x].vel_m.xyz) * pc.prm0.x;
+    ivec3 ca = clamp(ivec3(floor((alo - inflA - lo_box) / cell)), ivec3(0), dims - ivec3(1));
 
-            uint ta = A.y - span[A.x].x;
-            uint tb = B.y - span[B.x].x;
+    for (uint j = idx + 1u; j < e; j++) {
+        uvec2 B = cell_tets[j];
+        /* Теты одного тела не сталкиваются между собой. */
+        if (A.x == B.x) continue;
+        if (dbg) atomicAdd(pcnt[6], 1u);
+        /* Префильтр по AABB тел: 6 сравнений отсекают тела, которые лишь
+         * делят клетку сетки, но разъехались по пространству. */
+        vec3 blo_p = baabb[B.x * 2u].xyz, bhi_p = baabb[B.x * 2u + 1u].xyz;
+        if (any(greaterThan(alo_p, bhi_p)) || any(greaterThan(blo_p, ahi_p))) continue;
 
-            vec3 alo, ahi, blo, bhi;
-            bool oka, okb;
-            aabb(A.x, ta, alo, ahi, oka);
-            aabb(B.x, tb, blo, bhi, okb);
-            if (!oka || !okb) continue;
+        uint tb = B.y - span[B.x].x;
+        vec3 blo, bhi;
+        bool okb;
+        aabb(B.x, tb, blo, bhi, okb);
+        if (!oka || !okb) continue;
+        vec3 inflB = abs(b[B.x].vel_m.xyz) * pc.prm0.x;
+        ivec3 cb = clamp(ivec3(floor((blo - inflB - lo_box) / cell)), ivec3(0), dims - ivec3(1));
+        ivec3 canon3 = max(ca, cb);
+        int canon = (canon3.z * dims.y + canon3.y) * dims.x + canon3.x;
+        if (uint(canon) != c) continue;
 
-            vec3 inflA = abs(b[A.x].vel_m.xyz) * pc.prm0.x;
-            vec3 inflB = abs(b[B.x].vel_m.xyz) * pc.prm0.x;
-            ivec3 ca = clamp(ivec3(floor((alo - inflA - lo_box) / cell)), ivec3(0), dims - ivec3(1));
-            ivec3 cb = clamp(ivec3(floor((blo - inflB - lo_box) / cell)), ivec3(0), dims - ivec3(1));
-            ivec3 canon3 = max(ca, cb);
-            int canon = (canon3.z * dims.y + canon3.y) * dims.x + canon3.x;
-            if (uint(canon) != c) continue;
-
-            if (dbg) atomicAdd(pcnt[5], 1u);
-            uint k = atomicAdd(pcnt[0], 1u);
-            if (k >= MAX_PAIRS) continue;
+        if (dbg) atomicAdd(pcnt[5], 1u);
+        uint k = atomicAdd(pcnt[0], 1u);
+        if (k < MAX_PAIRS) {
             pairs[k] = uvec2((A.x << 20) | ta, (B.x << 20) | tb);
+        } else if (dbg) {
+            atomicAdd(pcnt[7], 1u); /* сколько пар не влезло в буфер */
         }
     }
 }
