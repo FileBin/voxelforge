@@ -835,8 +835,21 @@ fn march_tet(
             }
         }
     }
-    pts.sort_by_key(|(id, _)| *id);
-    pts.dedup_by_key(|(id, _)| *id);
+    /* Порядок точек — это порядок обхода многоугольника сечения. Сортировать
+     * по номеру вершины НЕЛЬЗЯ: на четырёх точках это даёт «бабочку», и
+     * половина треугольников выходит вывернутой/пересечённой (в окне это
+     * выглядит как дырки). Убираем только повторы, сохраняя порядок. */
+    {
+        let mut seen: Vec<u32> = Vec::with_capacity(4);
+        pts.retain(|(id, _)| {
+            if seen.contains(id) {
+                false
+            } else {
+                seen.push(*id);
+                true
+            }
+        });
+    }
 
     let centroid_in = {
         let mut c = [0.0f32; 3];
@@ -1434,5 +1447,50 @@ mod volume_tests {
                 body.tets.len()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod march_tet_patterns {
+    use super::*;
+
+    /// Каждая из 14 нетривиальных комбинаций знаков в тетре обязана дать
+    /// треугольники: 1 или 3 узла внутри — один треугольник, 2 внутри — два.
+    /// Ноль треугольников там, где они обязаны быть, и есть та половина
+    /// «дырок», которую видно в окне.
+    #[test]
+    fn every_sign_pattern_emits_triangles() {
+        let corners: [Node; 4] = [(0, 0, 0), (4, 0, 0), (0, 4, 0), (0, 0, 4)];
+        let pos = [
+            [0.0f32, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
+        let mut bad = Vec::new();
+        for mask in 1u32..15 {
+            let val: [f32; 4] = std::array::from_fn(|i| {
+                if mask & (1 << i) != 0 {
+                    -1.0
+                } else {
+                    1.0
+                }
+            });
+            let mut idx: Vec<u32> = Vec::new();
+            let mut next = 0u32;
+            let mut vertex = |_a: Node, _b: Node, _t: f32| -> u32 {
+                let id = next;
+                next += 1;
+                id
+            };
+            march_tet(&corners, &pos, &val, &mut vertex, &mut idx);
+            let n_in = (0..4).filter(|i| val[*i] < 0.0).count();
+            let want = if n_in == 2 { 2 } else { 1 };
+            let got = idx.len() / 3;
+            if got != want {
+                bad.push(format!("маска {mask:04b}: внутри {n_in}, треугольников {got}, ждали {want}"));
+            }
+        }
+        assert!(bad.is_empty(), "марчинг теряет треугольники:\n{}", bad.join("\n"));
     }
 }
