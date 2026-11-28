@@ -185,6 +185,8 @@ const P_TETSCANP: usize = 26;
 const P_TETPAIRSFLAT: usize = 27;
 /// Заполнение сетки SDF аналитическим примитивом на устройстве.
 const P_SDFFILL: usize = 28;
+/// Контакты SDF↔SDF (шаг 2 плана docs/sdf-collisions.md).
+const P_SDFCONTACT: usize = 29;
 /// Ячеек на блок в параллельном скане (совпадает с 16 * 64 в шейдере).
 pub const SCAN_BLOCK: usize = 1024;
 /// Потолок изменений тел за одно событие (спавн/деспавн).
@@ -439,7 +441,7 @@ impl GpuSim {
             )
         };
 
-        let names: [(&str, u32); 29] = [
+        let names: [(&str, u32); 30] = [
             ("integrate", 1),
             ("clear", 2),
             ("count", 2),
@@ -469,6 +471,7 @@ impl GpuSim {
             ("tet_scan_p", 4),
             ("tet_pairs_flat", 8),
             ("sdf_fill", 1),
+            ("sdf_contact", 5),
         ];
         let mut pipes = Vec::new();
         for (nm, nb) in names.iter() {
