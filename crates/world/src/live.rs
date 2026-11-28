@@ -197,10 +197,10 @@ pub struct Live {
 fn scene_plate() -> (Params, LiveBody, Vec<GpuBody>) {
     // Плита сразу лежит на полу: центр на высоте полуразмера, иначе она
     // падает с 1.2 м и к первому выстрелу оказывается не там, куда целятся.
-    let plate0 = TetBody::cube([0.0, 0.0, 0.0], 4, 0);
+    let plate0 = TetBody::cube([0.0, 0.0, 0.0], 8, 1);
     let (lo0, hi0) = plate0.bounds();
     let rest_y = 0.5 * (hi0[1] - lo0[1]) + 0.001;
-    let plate = TetBody::cube([0.0, rest_y, 0.0], 4, 0);
+    let plate = TetBody::cube([0.0, rest_y, 0.0], 8, 1);
     let params = Params {
         lo: [-8.0, 0.0, -8.0],
         hi: [8.0, 10.0, 8.0],
