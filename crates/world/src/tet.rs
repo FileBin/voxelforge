@@ -18,6 +18,7 @@
 use std::collections::HashMap;
 
 use crate::bcc::BASE;
+use crate::field;
 
 /// Узел в единицах половины шага решётки на своём уровне.
 pub type Node = (i32, i32, i32);
@@ -455,7 +456,14 @@ impl TetBody {
     /// То же, но с явным сглаживанием: 0 — гранёная поверхность (как у
     /// настоящего скола), больше — «обтекаемая».
     pub fn surface_grid_smoothed(&self, iterations: usize, lambda: f32) -> (Mesh, Grid) {
-        let mut mesh = self.extract_faces();
+        /* Марчинг по полю — по умолчанию: поверхность изоповерхность, а не
+         * набор граней тетов. VF_MARCH=old возвращает старую выборку граней
+         * для сравнения. */
+        let mut mesh = if std::env::var("VF_MARCH").as_deref() == Ok("old") {
+            self.extract_faces()
+        } else {
+            self.extract_marching()
+        };
         smooth(&mut mesh, iterations, lambda);
         let level = mesh.level;
         let _step = node_step(level);
@@ -469,6 +477,91 @@ impl TetBody {
                 step: BASE / (1u32 << level) as f32,
             },
         )
+    }
+
+    /// Настоящий marching tetrahedra по непрерывному полю занятости.
+    ///
+    /// Проходит ВСЕМИ тетами покрывающей сетки (в том числе пустыми рядом с
+    /// поверхностью — иначе по границе тела не хватало бы треугольников), по
+    /// 12 тетов на кубическую ячейку, и берёт пересечение нуля поля с рёбрами.
+    /// Вершины кэшируются по паре узлов, поэтому соседние теты делят одну
+    /// вершину и швов нет.
+    fn extract_marching(&self) -> Mesh {
+        let mut corners: Vec<Node> = Vec::with_capacity(self.tets.len() * 4);
+        for t in &self.tets {
+            corners.extend_from_slice(&t.v);
+        }
+        let f = field::from_occupied(corners.into_iter(), 2);
+        let level = self.tets.iter().map(|t| t.level).max().unwrap_or(0);
+        let origin = self.origin;
+
+        let mut positions: Vec<[f32; 3]> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+        let mut cache: HashMap<(Node, Node), u32> = HashMap::new();
+
+        let lo = f.lo;
+        let hi = [
+            f.lo[0] + f.dims[0] as i32 - 3,
+            f.lo[1] + f.dims[1] as i32 - 3,
+            f.lo[2] + f.dims[2] as i32 - 3,
+        ];
+
+        for bz in (lo[2]..=hi[2]).step_by(2) {
+            for by in (lo[1]..=hi[1]).step_by(2) {
+                for bx in (lo[0]..=hi[0]).step_by(2) {
+                    let cube = cube_nodes((bx, by, bz));
+                    let mut pos = [[0.0f32; 3]; 4];
+                    for t in CUBE_TETS.iter() {
+                        let tet_corners: [Node; 4] = [
+                            cube[t[0] as usize],
+                            cube[t[1] as usize],
+                            cube[t[2] as usize],
+                            cube[t[3] as usize],
+                        ];
+                        let val: [f32; 4] = std::array::from_fn(|i| {
+                            let q = tet_corners[i];
+                            pos[i] = node_pos(q, level, origin);
+                            f.at([q.0, q.1, q.2])
+                        });
+                        let mut vertex = |a: Node, b: Node, t: f32| -> u32 {
+                            /* Кэш по упорядоченной паре: соседний тет может
+                             * прийти с обратным порядком вершин, тогда параметр
+                             * инвертируется, иначе вершина уедет. */
+                            let (a, b, t) = if pack(a) <= pack(b) {
+                                (a, b, t)
+                            } else {
+                                (b, a, 1.0 - t)
+                            };
+                            let key = (a, b);
+                            if let Some(&id) = cache.get(&key) {
+                                return id;
+                            }
+                            let pa = node_pos(a, level, origin);
+                            let pb = node_pos(b, level, origin);
+                            let p = [
+                                pa[0] + (pb[0] - pa[0]) * t,
+                                pa[1] + (pb[1] - pa[1]) * t,
+                                pa[2] + (pb[2] - pa[2]) * t,
+                            ];
+                            let id = positions.len() as u32;
+                            positions.push(p);
+                            cache.insert(key, id);
+                            id
+                        };
+                        march_tet(&tet_corners, &pos, &val, &mut vertex, &mut indices);
+                    }
+                }
+            }
+        }
+
+        let mut mesh = Mesh {
+            normals: vec![[0.0f32; 3]; positions.len()],
+            positions,
+            indices,
+            level,
+        };
+        recompute_normals(&mut mesh);
+        mesh
     }
 
     /// Точная поверхность: грани, встречающиеся у одного тетраэдра.
@@ -1001,5 +1094,53 @@ fn recompute_normals(m: &mut Mesh) {
     for (i, n) in vn.iter().enumerate() {
         let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-12);
         m.normals[i] = [n[0] / l, n[1] / l, n[2] / l];
+    }
+}
+
+#[cfg(test)]
+mod marching_tests {
+    use super::*;
+
+    /// Замкнутость: каждое ребро поверхности принадлежит ровно двум
+    /// треугольникам. Дыра или щель сразу дают рёбра с кратностью 1.
+    fn closedness(m: &Mesh) -> usize {
+        let mut e: HashMap<(u32, u32), i32> = HashMap::new();
+        for t in m.indices.chunks(3) {
+            for k in 0..3 {
+                let (a, b) = (t[k], t[(k + 1) % 3]);
+                let key = if a < b { (a, b) } else { (b, a) };
+                *e.entry(key).or_insert(0) += 1;
+            }
+        }
+        e.values().filter(|&&c| c != 2).count()
+    }
+
+    #[test]
+    fn marching_cube_is_closed_and_denser_than_faces() {
+        let body = TetBody::cube([0.0, 0.0, 0.0], 4, 0);
+        let marched = body.extract_marching();
+        let faces = body.extract_faces();
+        assert!(marched.triangles() > 0, "марчинг не дал треугольников");
+        assert_eq!(
+            closedness(&marched),
+            0,
+            "поверхность марчинга не замкнута: {} рёбер с кратностью != 2",
+            closedness(&marched)
+        );
+        println!(
+            "куб: марчинг {} вершин / {} треугольников, грани {} / {}",
+            marched.positions.len(),
+            marched.triangles(),
+            faces.positions.len(),
+            faces.triangles()
+        );
+    }
+
+    #[test]
+    fn marching_ball_is_closed() {
+        let body = TetBody::ball([0.0, 0.0, 0.0], 1.3, 0);
+        let marched = body.extract_marching();
+        assert!(marched.triangles() > 0);
+        assert_eq!(closedness(&marched), 0, "шар: поверхность не замкнута");
     }
 }
