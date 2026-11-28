@@ -715,6 +715,21 @@ impl TetBody {
             self.extract_marching()
         };
         smooth(&mut mesh, iterations, lambda);
+        /* Нормали — из ГРАДИЕНТА поля, а не из граней треугольников: поле
+         * гладкое (расстояние), поэтому затенение перестаёт показывать
+         * тетраэдры и поверхность читается как одна оболочка. */
+        if let Some(f) = self.sdf.get() {
+            let step = node_step(mesh.level);
+            for (i, p) in mesh.positions.iter().enumerate() {
+                let local = [
+                    (p[0] - self.origin[0]) / step,
+                    (p[1] - self.origin[1]) / step,
+                    (p[2] - self.origin[2]) / step,
+                ];
+                let g = f.gradient(local);
+                mesh.normals[i] = g;
+            }
+        }
         let level = mesh.level;
         let _step = node_step(level);
         let origin = self.centroid();

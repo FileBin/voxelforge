@@ -41,6 +41,40 @@ impl NodeField {
         self.val[i] = v;
     }
 
+    /// Трилинейная выборка поля в произвольной точке (в координатах узлов).
+    pub fn sample(&self, p: [f32; 3]) -> f32 {
+        let x0 = p[0].floor();
+        let y0 = p[1].floor();
+        let z0 = p[2].floor();
+        let fx = p[0] - x0;
+        let fy = p[1] - y0;
+        let fz = p[2] - z0;
+        let (x0, y0, z0) = (x0 as i32, y0 as i32, z0 as i32);
+        let mut acc = 0.0;
+        for dz in 0..2 {
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let w = (if dx == 1 { fx } else { 1.0 - fx })
+                        * (if dy == 1 { fy } else { 1.0 - fy })
+                        * (if dz == 1 { fz } else { 1.0 - fz });
+                    acc += w * self.at([x0 + dx, y0 + dy, z0 + dz]);
+                }
+            }
+        }
+        acc
+    }
+
+    /// Градиент поля — нормаль изоповерхности (смотрит наружу: значение растёт
+    /// от минуса внутри к плюсу снаружи).
+    pub fn gradient(&self, p: [f32; 3]) -> [f32; 3] {
+        let h = 0.5f32;
+        let gx = self.sample([p[0] + h, p[1], p[2]]) - self.sample([p[0] - h, p[1], p[2]]);
+        let gy = self.sample([p[0], p[1] + h, p[2]]) - self.sample([p[0], p[1] - h, p[2]]);
+        let gz = self.sample([p[0], p[1], p[2] + h]) - self.sample([p[0], p[1], p[2] - h]);
+        let len = (gx * gx + gy * gy + gz * gz).sqrt().max(1e-9);
+        [gx / len, gy / len, gz / len]
+    }
+
     /// Ближайший к нулю узел — проверка «поверхность есть».
     pub fn min_abs(&self) -> f32 {
         self.val.iter().fold(f32::MAX, |m, v| m.min(v.abs()))
