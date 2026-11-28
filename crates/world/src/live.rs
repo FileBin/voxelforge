@@ -34,6 +34,9 @@ pub struct LiveBody {
     pub tets: Vec<Tet>,
     pub origin: [f32; 3],
     pub level_cap: u8,
+    /// Запечённое поле расстояний (SDF) тела: им пользуется и меш, и физика.
+    /// Считается ОДИН раз при создании тела, в такте не пересчитывается.
+    pub sdf: Option<crate::field::NodeField>,
     local: Vec<[[f32; 3]; 4]>,
     pub mesh: i32,
     pub lines: i32,
@@ -43,11 +46,17 @@ pub struct LiveBody {
 
 impl LiveBody {
     fn rebuild(&mut self) {
-        let tb = TetBody {
-            tets: self.tets.clone(),
-            level_cap: self.level_cap,
-            origin: self.origin,
-           sdf: Default::default(),
+        let tb = {
+            let mut b = TetBody {
+                tets: self.tets.clone(),
+                level_cap: self.level_cap,
+                origin: self.origin,
+                sdf: Default::default(),
+            };
+            if let Some(f) = &self.sdf {
+                let _ = b.sdf.set(f.clone());
+            }
+            b
         };
         let c = tb.world_centroid();
         self.local = self
@@ -207,6 +216,7 @@ fn scene_plate() -> (Params, LiveBody, Vec<GpuBody>) {
         lines: -1,
         kind: Kind::Target,
         alive: true,
+        sdf: None,
     };
     body.rebuild();
     // Ставим плиту ровно на пол по ЛОКАЛЬНЫМ тетраэдрам (это и есть
@@ -605,6 +615,7 @@ impl Live {
                 lines: -1,
                 kind: Kind::Shard,
                 alive: false,
+                sdf: None,
             });
             return Some(self.bodies.len() - 1);
         }
@@ -1151,6 +1162,7 @@ impl Live {
                 lines: -1,
                 kind: Kind::Shard,
                 alive: true,
+                sdf: None,
             };
             body.rebuild();
             body.radius = body.radius_of();
@@ -1234,8 +1246,10 @@ impl Live {
             }
         }
         let Some(slot) = self.free_slot() else { return false };
-        // снаряд — гранёный кусок, а не шар
-        let ball = TetBody::cube([0.0, 0.0, 0.0], 2, 1);
+        /* Снаряд — ШАР, заданный SDF (аналитическая сфера, запечённая в узлы).
+         * Раньше здесь стоял гранёный куб, и никакая правка ball() до снаряда
+         * не доходила — снаружи это и выглядело как угловатый бок с шипом. */
+        let ball = TetBody::ball([0.0, 0.0, 0.0], 0.14, 0);
         let id = self.new_id();
         let mut body = LiveBody {
             id,
@@ -1251,6 +1265,7 @@ impl Live {
             tets: ball.tets.clone(),
             origin: ball.origin,
             level_cap: ball.level_cap,
+            sdf: ball.sdf.get().cloned(),
             local: Vec::new(),
             mesh: -1,
             lines: -1,

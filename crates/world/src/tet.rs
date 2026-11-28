@@ -427,6 +427,17 @@ impl TetBody {
             }
             lv += 1;
         }
+        /* Бюджет: пул тетов на тело ограничен, поэтому плотность держим так,
+         * чтобы шар занимал не больше ~3000 тетов (12·V/a³). */
+        loop {
+            let a = node_step(lv) * 2.0;
+            let vol = 4.0 / 3.0 * std::f32::consts::PI * radius * radius * radius;
+            let est = 12.0 * vol / (a * a * a);
+            if est <= 3000.0 || lv == 0 {
+                break;
+            }
+            lv -= 1;
+        }
         let step = node_step(lv);
         let rn = radius / step;
         /* +5 слоёв: марчинг идёт ячейками и внешний слой тетов ему нужен с
