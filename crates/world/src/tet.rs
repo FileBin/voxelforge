@@ -58,7 +58,7 @@ const FIELD_NODE_BUDGET: usize = 60000;
 
 /// Бокс поля осколка: тот же кусок мира, но, если влезает в слот SDF, на
 /// более мелкой сетке (см. `shatter_fields`). Возвращает `(шаг, lo, dims)`.
-fn shard_field_box(step: f32, lo: &[i32; 3], dims: &[usize; 3]) -> (f32, [i32; 3], [usize; 3]) {
+pub(crate) fn shard_field_box(step: f32, lo: &[i32; 3], dims: &[usize; 3]) -> (f32, [i32; 3], [usize; 3]) {
     for r in [2.0f32, 1.5, 1.25] {
         let fs = step / r;
         let mut f_lo = [0i32; 3];
@@ -317,6 +317,30 @@ pub struct TetBody {
     /// числам, а не по BFS-расстояниям сетки.
     pub sdf: std::sync::OnceLock<field::NodeField>,
 }
+
+/// Описание ЗАПЕКАНИЯ поля осколка на устройстве (`shard_field.comp`).
+///
+/// CPU здесь отдаёт только параметры: какой кусок решётки, насколько мелко
+/// и какими плоскостями Вороного резать. Значения узлов считает шейдер —
+/// узел равен `max(f_родителя, плоскости)`, ровно как `intersect_plane`
+/// на CPU, но без копирования поля туда-обратно.
+#[derive(Clone, Debug)]
+pub struct ShardBake {
+    /// Теты осколка: раздача по центроидам, как в `shatter_fields`.
+    pub tets: Vec<Tet>,
+    /// Узел с минимальными координатами сетки поля осколка.
+    pub lo: [i32; 3],
+    /// Размер поля в узлах (обязан влезть в слот SDF).
+    pub dims: [usize; 3],
+    /// Метров на узел поля осколка.
+    pub step: f32,
+    /// Плоскости среза: `(n, d)` в МЕТРАХ, `n·p = d` — своя сторона.
+    pub planes: Vec<([f32; 3], f32)>,
+    /// Объём и центроид (метры, в системе решётки родителя) — от тетов.
+    pub volume: f32,
+    pub centroid: [f32; 3],
+}
+
 
 impl TetBody {
     /// Поле расстояний по узлам, посчитанное один раз.
@@ -887,38 +911,49 @@ impl TetBody {
         out
     }
 
-    /// Раскол с упором на точку удара: часть затравок ставится рядом с ней,
-    /// поэтому близко к попаданию образуется больше мелких отколов, а плита
-    /// раскалывается крупными кусками вдали.
-    pub fn shatter_biased(&self, seeds: usize, seed: u64, focus: [f32; 3]) -> Vec<TetBody> {
+    /// Затравки Вороного для раскола с упором на точку удара: 60% вокруг неё
+    /// (у попадания мельче сколы), остальные — по всему объёму. Отдельной
+    /// функцией, потому что те же затравки нужны и запеканию поля на
+    /// устройстве (`shatter_bakes`), и CPU-эталону.
+    pub fn shatter_pts(&self, seeds: usize, seed: u64, focus: [f32; 3]) -> Vec<[f32; 3]> {
         let (lo, hi) = self.bounds();
         let lo = [lo[0] - self.origin[0], lo[1] - self.origin[1], lo[2] - self.origin[2]];
         let hi = [hi[0] - self.origin[0], hi[1] - self.origin[1], hi[2] - self.origin[2]];
         let f = [focus[0] - self.origin[0], focus[1] - self.origin[1], focus[2] - self.origin[2]];
         let mut rng = Lcg::new(seed);
-        let n_near = (seeds * 3) / 5; // 60% затравок — у места удара
+        let n_near = (seeds * 3) / 5;
         let spread = 0.35 * (hi[0] - lo[0]).max(hi[2] - lo[2]).max(0.1);
-        let pts: Vec<[f64; 3]> = (0..seeds)
+        (0..seeds)
             .map(|i| {
                 if i < n_near {
-                    // вокруг точки удара, ближе к краю — отколы
                     let jx = (rng.unit() - 0.5) * 2.0 * spread;
                     let jy = (rng.unit() - 0.5) * 2.0 * spread;
                     let jz = (rng.unit() - 0.5) * 2.0 * spread;
                     [
-                        (f[0] as f64 + jx as f64).clamp(lo[0] as f64, hi[0] as f64),
-                        (f[1] as f64 + jy as f64).clamp(lo[1] as f64, hi[1] as f64),
-                        (f[2] as f64 + jz as f64).clamp(lo[2] as f64, hi[2] as f64),
+                        (f[0] as f64 + jx as f64).clamp(lo[0] as f64, hi[0] as f64) as f32,
+                        (f[1] as f64 + jy as f64).clamp(lo[1] as f64, hi[1] as f64) as f32,
+                        (f[2] as f64 + jz as f64).clamp(lo[2] as f64, hi[2] as f64) as f32,
                     ]
                 } else {
                     [
-                        lo[0] as f64 + (hi[0] - lo[0]) as f64 * rng.unit() as f64,
-                        lo[1] as f64 + (hi[1] - lo[1]) as f64 * rng.unit() as f64,
-                        lo[2] as f64 + (hi[2] - lo[2]) as f64 * rng.unit() as f64,
+                        (lo[0] as f64 + (hi[0] - lo[0]) as f64 * rng.unit() as f64) as f32,
+                        (lo[1] as f64 + (hi[1] - lo[1]) as f64 * rng.unit() as f64) as f32,
+                        (lo[2] as f64 + (hi[2] - lo[2]) as f64 * rng.unit() as f64) as f32,
                     ]
                 }
             })
-            .collect();
+            .collect()
+    }
+
+    /// Раскол с упором на точку удара: часть затравок ставится рядом с ней,
+    /// поэтому близко к попаданию образуется больше мелких отколов, а плита
+    /// раскалывается крупными кусками вдали.
+    pub fn shatter_biased(&self, seeds: usize, seed: u64, focus: [f32; 3]) -> Vec<TetBody> {
+        let pts32 = self.shatter_pts(seeds, seed, focus);
+        let pts: Vec<[f64; 3]> = pts32.iter().map(|p| [p[0] as f64, p[1] as f64, p[2] as f64]).collect();
+        let (lo, hi) = self.bounds();
+        let lo = [lo[0] - self.origin[0], lo[1] - self.origin[1], lo[2] - self.origin[2]];
+        let hi = [hi[0] - self.origin[0], hi[1] - self.origin[1], hi[2] - self.origin[2]];
 
         let mut buckets: Vec<Vec<Tet>> = vec![Vec::new(); seeds];
         for t in &self.tets {
@@ -936,10 +971,6 @@ impl TetBody {
         }
         let _ = &buckets;
         /* Дробление ПО ПОЛЮ: плоскости режут внутри тетов, сколы плавные. */
-        let pts32: Vec<[f32; 3]> = pts
-            .iter()
-            .map(|p| [p[0] as f32, p[1] as f32, p[2] as f32])
-            .collect();
         return self.shatter_fields(&pts32);
         #[allow(unreachable_code)]
         buckets.into_iter().filter(|v| !v.is_empty()).map(|tets| TetBody {
@@ -950,8 +981,136 @@ impl TetBody {
         }).collect()
     }
 
+    /// Раскладка осколков БЕЗ запекания поля: теты по центроидам, плоскости
+    /// Вороного и бокс поля — настолько мелкий, насколько влезает слот.
+    pub fn shatter_bakes(&self, pts: &[[f32; 3]]) -> Vec<ShardBake> {
+        let f = self.sdf();
+        let step = f.step;
+        let planes = self.shard_planes(pts);
+        let mut out: Vec<ShardBake> = Vec::with_capacity(pts.len());
+        for (i, _) in pts.iter().enumerate() {
+            let mut tets: Vec<Tet> = Vec::new();
+            let (mut lo_n, mut hi_n) = ([i32::MAX; 3], [i32::MIN; 3]);
+            let (mut lo_all, mut hi_all) = ([i32::MAX; 3], [i32::MIN; 3]);
+            for t in &self.tets {
+                /* центроид тета — В УЗЛАХ ПОЛЯ: у тета свой шаг (`node_step`),
+                 * у поля свой, поэтому переводим через отношение шагов. */
+                let c = t.centroid();
+                let mut best = f64::MAX;
+                let mut best_i = usize::MAX;
+                for (k, sk) in pts.iter().enumerate() {
+                    let dx = c[0] - sk[0] as f64;
+                    let dy = c[1] - sk[1] as f64;
+                    let dz = c[2] - sk[2] as f64;
+                    let d2 = dx * dx + dy * dy + dz * dz;
+                    if d2 < best {
+                        best = d2;
+                        best_i = k;
+                    }
+                }
+                if best_i != i {
+                    continue;
+                }
+                tets.push(*t);
+                /* бокс — по УЗЛАМ поля, в которые попадают вершины тета, но
+                 * ТОЛЬКО те, что стоят на своей стороне среза: за плоскостями
+                 * Вороного поверхности осколка нет, а вершины там бокс раздувают
+                 * и он перестаёт влезать в слот на мелком шаге (замер: мелкие
+                 * осколки уходили на шаг родителя и теряли половину объёма
+                 * меша). Глубина допуска — 3 узла: срез идёт ВНУТРИ тетов. */
+                let s = node_step(t.level) / step;
+                let lim = 0.0;
+                for v in t.v.iter() {
+                    let q = [(v.0 as f32 * s).round() as i32,
+                             (v.1 as f32 * s).round() as i32,
+                             (v.2 as f32 * s).round() as i32];
+                    let pm = [q[0] as f32 * step, q[1] as f32 * step, q[2] as f32 * step];
+                    let mut over = f32::MIN;
+                    for (n, d) in &planes[i] {
+                        over = over.max(n[0] * pm[0] + n[1] * pm[1] + n[2] * pm[2] - *d * step);
+                    }
+                    for k in 0..3 {
+                        lo_all[k] = lo_all[k].min(q[k]);
+                        hi_all[k] = hi_all[k].max(q[k]);
+                    }
+                    if over > lim {
+                        continue;
+                    }
+                    for k in 0..3 {
+                        lo_n[k] = lo_n[k].min(q[k]);
+                        hi_n[k] = hi_n[k].max(q[k]);
+                    }
+                }
+            }
+            if tets.is_empty() {
+                eprintln!("DIAG shatter: осколок {i} пропущен — нет тетов");
+                continue;
+            }
+            /* ни одна вершина не прошла фильтр (тонкий скол целиком за
+             * плоскостью) — берём бокс по всем вершинам, иначе осколок
+             * останется без поля и без меша */
+            if lo_n[0] > hi_n[0] {
+                lo_n = lo_all;
+                hi_n = hi_all;
+            }
+            /* Запас 4 узла — это ровно один тет (у тета вершины через ДВА узла
+             * поля): срез идёт внутри тетов, и вершина поверхности может стоять
+             * на тет от бокса. Дальше бокс РЕЖЕТСЯ по полю родителя: занятая
+             * область осколка за него не выходит, а вершины тетов на краю
+             * плиты торчат наружу и раздували бокс — крупный бокс не влезал в
+             * слот на мелком шаге, и мелкие осколки теряли половину объёма. */
+            let flo = [f.lo[0], f.lo[1], f.lo[2]];
+            let fhi = [
+                f.lo[0] + f.dims[0] as i32 - 1,
+                f.lo[1] + f.dims[1] as i32 - 1,
+                f.lo[2] + f.dims[2] as i32 - 1,
+            ];
+            let mut lo = [0i32; 3];
+            let mut hi = [0i32; 3];
+            for k in 0..3 {
+                lo[k] = (lo_n[k] - 4).max(flo[k]);
+                hi[k] = (hi_n[k] + 4).min(fhi[k]);
+            }
+            if lo[0] > hi[0] || lo[1] > hi[1] || lo[2] > hi[2] {
+                eprintln!("DIAG shatter: осколок {i} пропущен — пустой бокс поля");
+                continue;
+            }
+            let dims = [
+                (hi[0] - lo[0] + 1) as usize,
+                (hi[1] - lo[1] + 1) as usize,
+                (hi[2] - lo[2] + 1) as usize,
+            ];
+            let (fstep, flo, fdims) = shard_field_box(step, &lo, &dims);
+            let pl: Vec<([f32; 3], f32)> =
+                planes[i].iter().map(|(n, d)| (*n, d * step)).collect();
+            /* объём и центроид — от тетов, а не от поля: масса обязана
+             * сохраняться точно, поле её только «рисует». */
+            let mut vol = 0.0f32;
+            let mut cen = [0.0f64; 3];
+            for t in &tets {
+                let v = t.volume();
+                let c = t.centroid();
+                vol += v;
+                for k in 0..3 {
+                    cen[k] += c[k] as f64 * v as f64;
+                }
+            }
+            let w = vol.max(1e-12) as f64;
+            out.push(ShardBake {
+                tets,
+                lo: flo,
+                dims: fdims,
+                step: fstep,
+                planes: pl,
+                volume: vol,
+                centroid: [(cen[0] / w) as f32, (cen[1] / w) as f32, (cen[2] / w) as f32],
+            });
+        }
+        out
+    }
+
     /// Тетраэдры в локальных координатах (относительно центроида) — для
-    /// столкновений и для показа самих тетраэдров во вьюере.
+    /// столкновений и для показа самих тетов во вьюере.
     pub fn local_tets(&self) -> Vec<[[f32; 3]; 4]> {
         let c = self.world_centroid();
         self.tets

@@ -215,12 +215,14 @@ const P_STATEMIT: usize = 33;
 /// CCD по SDF на устройстве: зазор вдоль пути, сферный трейсинг, бисекция и
 /// событие касания в кольцо. Позы не покидают GPU.
 const P_CCD: usize = 34;
+/// Запекание поля осколка на устройстве: узел = max(f_родителя, плоскости).
+const P_SHARDFIELD: usize = 35;
 
 /// Имена пайплайнов в порядке `pipes` — ТОТ ЖЕ порядок, что у `P_*` выше и у
 /// массива `names` на устройстве. По этому индексу ядро возвращает номер
 /// стадии в диагностике производительности, поэтому список — единственный
 /// источник правды и для загрузки, и для таблицы.
-pub const PIPE_NAMES: [&str; 35] = [
+pub const PIPE_NAMES: [&str; 36] = [
     "integrate",
     "clear",
     "count",
@@ -256,11 +258,12 @@ pub const PIPE_NAMES: [&str; 35] = [
     "static_tie",
     "static_emit",
     "ccd",
+    "shard_field",
 ];
 /// Число storage-буферов у каждого пайплайна — в том же порядке.
-const PIPE_BUFNS: [u32; 35] = [
+const PIPE_BUFNS: [u32; 36] = [
     1, 2, 2, 3, 4, 2, 5, 4, 1, 1, 4, 4, 7, 3, 2, 4, 3, 6, 8, 6, 4, 1, 2, 3, 2, 2, 4, 8, 1, 7, 5, 6,
-    5, 6, 6,
+    5, 6, 6, 5,
 ];
 /// Ячеек на блок в параллельном скане (совпадает с 16 * 64 в шейдере).
 pub const SCAN_BLOCK: usize = 1024;
@@ -293,6 +296,20 @@ pub const SDF_STRIDE: usize = 65536;
 /// Потолок пар тел в широком проходе SDF (64 тела → 2016; совпадает с
 /// MAX_SDF_PAIRS в common.glsl).
 pub const MAX_SDF_PAIRS: usize = MAX_BODIES * (MAX_BODIES - 1) / 2;
+/// Плоскостей Вороного на осколок в запекании (совпадает с MAX_PLANES в
+/// shard_field.comp). У Вороного их n−1, у нас тел не больше 64.
+pub const SHARD_MAX_PLANES: usize = 64;
+
+/// Что уехало в слот SDF после запекания осколка: бокс, шаг и (по запросу)
+/// сами значения. CPU узнаёт про поле только это.
+#[derive(Clone, Debug, Default)]
+pub struct BakedShard {
+    pub lo: [i32; 3],
+    pub dims: [usize; 3],
+    pub step: f32,
+    pub vals: Vec<f32>,
+}
+
 /// Слов под претензии CCD: пары (64×64) и следом тела (по одному на слот).
 /// Совпадает с PAIR_SLOTS в ccd.comp и сбрасывается в нули перед каждым тактом.
 pub const CCD_PAIR_SLOTS: usize = 4096;
@@ -1477,6 +1494,286 @@ impl GpuSim {
         }
         self.bytes_up += (descs.len() * 64) as u64;
     }
+
+    /// Запечь поля осколков НА УСТРОЙСТВЕ: узел = max(f_родителя, плоскости).
+    ///
+    /// CPU отдаёт только параметры (слот родителя и осколка, плоскости и
+    /// ЧЕРНОВОЙ бокс по тетам) — значения узлов с хоста не заливаются.
+    /// Два прохода:
+    ///   1) скан: где у осколка значение < 0 (бокс занятой области);
+    ///   2) запекание в этот бокс, с шагом настолько мелким, насколько влезает
+    ///      слот SDF.
+    /// Наружу (на CPU) из первого прохода уходят ШЕСТЬ ЦЕЛЫХ на осколок — сам
+    /// бокс. Значения узлов CPU видит только при `read_back` (сверка и
+    /// временный CPU-мешер).
+    pub fn bake_shard_fields(
+        &mut self,
+        jobs: &[(usize, usize, &crate::tet::ShardBake)],
+        read_back: bool,
+    ) -> Vec<Option<BakedShard>> {
+        if jobs.is_empty() {
+            return Vec::new();
+        }
+        let nj = jobs.len();
+        /* шаг родителя — из таблицы дескрипторов одним чтением */
+        let mut dtab = vec![0u8; MAX_BODIES * 64];
+        unsafe {
+            check_status(
+                vf_buffer_read(
+                    self.ctx,
+                    self.sdf_desc,
+                    0,
+                    dtab.as_mut_ptr() as *mut c_void,
+                    dtab.len(),
+                ),
+                "shard: read descs",
+            );
+        }
+        let step_of = |slot: usize| -> f32 {
+            let o = slot * 64 + 32;
+            f32::from_le_bytes([dtab[o], dtab[o + 1], dtab[o + 2], dtab[o + 3]])
+        };
+
+        let mut make = |bytes: usize| {
+            let mut b: *mut c_void = std::ptr::null_mut();
+            unsafe {
+                check_status(vf_buffer_new(self.ctx, bytes, 1, &mut b), "shard: buffer");
+            }
+            b
+        };
+        let jb = make(nj * 3 * 16);
+        let pb = make(nj * SHARD_MAX_PLANES * 16);
+        let bb = make(nj * 8 * 4);
+
+        /* --- проход 0: скан занятой области -------------------------------- */
+        let mut jbuf: Vec<[f32; 4]> = Vec::with_capacity(nj * 3);
+        let mut pbuf: Vec<[f32; 4]> = vec![[0.0; 4]; nj * SHARD_MAX_PLANES];
+        let mut scan_groups = 1u32;
+        for (w, (parent, _out, b)) in jobs.iter().enumerate() {
+            let pstep = step_of(*parent);
+            jbuf.push([*parent as f32, 0.0, b.lo[0] as f32, b.lo[1] as f32]);
+            jbuf.push([
+                b.lo[2] as f32,
+                b.dims[0] as f32,
+                b.dims[1] as f32,
+                b.dims[2] as f32,
+            ]);
+            /* в скане узел — родительский, поэтому шаг «осколка» = шаг родителя */
+            jbuf.push([pstep, pstep, b.planes.len() as f32, 0.0]);
+            for (k, (n, d)) in b.planes.iter().take(SHARD_MAX_PLANES).enumerate() {
+                pbuf[w * SHARD_MAX_PLANES + k] = [n[0], n[1], n[2], *d];
+            }
+            scan_groups = scan_groups.max(
+                ((b.dims[0] * b.dims[1] * b.dims[2]) as u32).div_ceil(64),
+            );
+        }
+        let mut binit = vec![0u8; nj * 32];
+        for w in 0..nj {
+            let min = [i32::MAX; 4];
+            let max = [i32::MIN; 4];
+            for (k, v) in min.iter().chain(max.iter()).enumerate() {
+                binit[w * 32 + k * 4..w * 32 + 4 + k * 4]
+                    .copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        unsafe {
+            check_status(
+                vf_buffer_write(self.ctx, jb, 0, jbuf.as_ptr() as *const c_void, jbuf.len() * 16),
+                "shard: jobs",
+            );
+            check_status(
+                vf_buffer_write(self.ctx, pb, 0, pbuf.as_ptr() as *const c_void, pbuf.len() * 16),
+                "shard: planes",
+            );
+            check_status(
+                vf_buffer_write(self.ctx, bb, 0, binit.as_ptr() as *const c_void, binit.len()),
+                "shard: box",
+            );
+        }
+        let mut bufs = [self.sdf_desc, self.sdf_vals, jb, pb, bb];
+        let mut push = self.push(0.0, 0);
+        push.prm1[3] = 1.0;   /* режим «скан» */
+        let mut d = VfDispatch {
+            pipeline: self.pipes[P_SHARDFIELD],
+            buffers: bufs.as_mut_ptr(),
+            n_buffers: 5,
+            push: &push as *const Push as *const c_void,
+            push_bytes: 80,
+            groups: [scan_groups, nj as u32, 1],
+            stage: P_SHARDFIELD as u32,
+        };
+        unsafe {
+            check_status(vf_run(self.ctx, &mut d, 1), "shard_scan");
+        }
+        let mut braw = vec![0i32; nj * 8];
+        unsafe {
+            check_status(
+                vf_buffer_read(self.ctx, bb, 0, braw.as_mut_ptr() as *mut c_void, braw.len() * 4),
+                "shard: box read",
+            );
+        }
+        self.bytes_down += (braw.len() * 4) as u64;
+
+        /* --- проход 1: запекание в найденный бокс --------------------------- */
+        let mut out: Vec<Option<BakedShard>> = Vec::with_capacity(nj);
+        let mut keep: Vec<usize> = Vec::new();      /* какие работы пойдут */
+        let mut jbuf2: Vec<[f32; 4]> = Vec::new();
+        let mut descs: Vec<SdfDescGpu> = Vec::new();
+        let mut bake_groups = 1u32;
+        let mut meta: Vec<([i32; 3], [usize; 3], f32)> = Vec::new();
+        for (w, (parent, out_slot, b)) in jobs.iter().enumerate() {
+            let pstep = step_of(*parent);
+            let mn = [braw[w * 8], braw[w * 8 + 1], braw[w * 8 + 2]];
+            let mx = [braw[w * 8 + 4], braw[w * 8 + 5], braw[w * 8 + 6]];
+            if mn[0] > mx[0] || mn[1] > mx[1] || mn[2] > mx[2] {
+                out.push(None);       /* занятой области нет — осколок пуст */
+                continue;
+            }
+            /* запас 3 узла: срезу нужен слой внешних узлов, иначе поверхность
+             * обрывается на границе бокса (как в CPU-эталоне) */
+            let lo = [mn[0] - 3, mn[1] - 3, mn[2] - 3];
+            let dims = [
+                (mx[0] - mn[0] + 7) as usize,
+                (mx[1] - mn[1] + 7) as usize,
+                (mx[2] - mn[2] + 7) as usize,
+            ];
+            let (fstep, flo, fdims) = crate::tet::shard_field_box(pstep, &lo, &dims);
+            let nodes = (fdims[0] * fdims[1] * fdims[2]) as u32;
+            if nodes as usize > SDF_STRIDE {
+                out.push(None);
+                continue;
+            }
+            jbuf2.push([*parent as f32, *out_slot as f32, flo[0] as f32, flo[1] as f32]);
+            jbuf2.push([
+                flo[2] as f32,
+                fdims[0] as f32,
+                fdims[1] as f32,
+                fdims[2] as f32,
+            ]);
+            jbuf2.push([pstep, fstep, b.planes.len() as f32, 0.0]);
+            bake_groups = bake_groups.max(nodes.div_ceil(64));
+            descs.push(SdfDescGpu {
+                lo_dims: [flo[0], flo[1], flo[2], fdims[0] as i32],
+                dims2: [fdims[1] as i32, fdims[2] as i32, 0, 0],
+                step_pad: [fstep, 0.0, 0.0, 0.0],
+                shift: [0.0; 4],
+            });
+            meta.push((flo, fdims, fstep));
+            keep.push(w);
+            out.push(Some(BakedShard {
+                lo: flo,
+                dims: fdims,
+                step: fstep,
+                vals: Vec::new(),
+            }));
+        }
+        if keep.is_empty() {
+            unsafe {
+                vf_buffer_free(self.ctx, jb);
+                vf_buffer_free(self.ctx, pb);
+                vf_buffer_free(self.ctx, bb);
+            }
+            return out;
+        }
+        /* плоскости — заново, уже в порядке keep */
+        let mut pbuf2: Vec<[f32; 4]> = vec![[0.0; 4]; keep.len() * SHARD_MAX_PLANES];
+        for (k, w) in keep.iter().enumerate() {
+            let b = jobs[*w].2;
+            for (q, (n, d)) in b.planes.iter().take(SHARD_MAX_PLANES).enumerate() {
+                pbuf2[k * SHARD_MAX_PLANES + q] = [n[0], n[1], n[2], *d];
+            }
+        }
+        unsafe {
+            check_status(
+                vf_buffer_write(
+                    self.ctx,
+                    jb,
+                    0,
+                    jbuf2.as_ptr() as *const c_void,
+                    jbuf2.len() * 16,
+                ),
+                "shard: jobs2",
+            );
+            check_status(
+                vf_buffer_write(
+                    self.ctx,
+                    pb,
+                    0,
+                    pbuf2.as_ptr() as *const c_void,
+                    pbuf2.len() * 16,
+                ),
+                "shard: planes2",
+            );
+            for (k, w) in keep.iter().enumerate() {
+                let out_slot = jobs[*w].1;
+                let raw = unsafe {
+                    std::slice::from_raw_parts(&descs[k] as *const SdfDescGpu as *const u8, 64)
+                };
+                if out_slot < MAX_BODIES {
+                    check_status(
+                        vf_buffer_write(
+                            self.ctx,
+                            self.sdf_desc,
+                            out_slot * 64,
+                            raw.as_ptr() as *const c_void,
+                            64,
+                        ),
+                        "shard: desc",
+                    );
+                }
+            }
+        }
+        let mut bufs2 = [self.sdf_desc, self.sdf_vals, jb, pb, bb];
+        let mut push2 = self.push(0.0, 0);
+        push2.prm1[3] = 0.0;  /* режим «запекание» */
+        let mut d2 = VfDispatch {
+            pipeline: self.pipes[P_SHARDFIELD],
+            buffers: bufs2.as_mut_ptr(),
+            n_buffers: 5,
+            push: &push2 as *const Push as *const c_void,
+            push_bytes: 80,
+            groups: [bake_groups, keep.len() as u32, 1],
+            stage: P_SHARDFIELD as u32,
+        };
+        unsafe {
+            check_status(vf_run(self.ctx, &mut d2, 1), "shard_bake");
+        }
+        self.bytes_up += (jbuf2.len() * 16 + pbuf2.len() * 16 + keep.len() * 64) as u64;
+
+        if read_back {
+            for (k, w) in keep.iter().enumerate() {
+                let slot = jobs[*w].1;
+                let (_, dims, _) = meta[k];
+                let n = dims[0] * dims[1] * dims[2];
+                let mut v = vec![0.0f32; n];
+                unsafe {
+                    check_status(
+                        vf_buffer_read(
+                            self.ctx,
+                            self.sdf_vals,
+                            slot * SDF_STRIDE * 4,
+                            v.as_mut_ptr() as *mut c_void,
+                            n * 4,
+                        ),
+                        "shard: read",
+                    );
+                }
+                self.bytes_down += (n * 4) as u64;
+                if let Some(o) = out.get_mut(*w) {
+                    if let Some(o) = o.as_mut() {
+                        o.vals = v;
+                    }
+                }
+            }
+        }
+        unsafe {
+            vf_buffer_free(self.ctx, jb);
+            vf_buffer_free(self.ctx, pb);
+            vf_buffer_free(self.ctx, bb);
+        }
+        out
+    }
+
 
     /// Пары тел из широкого прохода SDF (диагностика: сколько их нашлось и
     /// какие именно — если контактов нет, сразу видно, чья это вина).

@@ -1,0 +1,144 @@
+#version 450
+#include "common.glsl"
+
+/* Запекание поля осколка НА УСТРОЙСТВЕ.
+ *
+ * Раньше поле осколка считалось на CPU (`TetBody::shatter_fields`): родитель
+ * расширялся, трилинейно пересэмплировался на мелкую сетку, резался плоскостями
+ * Вороного и уезжал обратно на устройство. При 1000 осколков это секунды на
+ * CPU и сотни мегабайт копирования туда-сюда.
+ *
+ * Теперь CPU отдаёт только ПАРАМЕТРЫ (слот родителя, бокс, шаг, плоскости), а
+ * узлы считает шейдер:
+ *
+ *     val(p) = max( f_родителя(p),  max_k( n_k·p_м - d_k ) )
+ *
+ * в единицах узла поля осколка — ровно та же формула, что `intersect_plane`
+ * на CPU (значения поля живут в шагах узла, плоскости CPU тоже переводит в них).
+ *
+ * Раскладка: gl_WorkGroupID.y — номер работы (осколка), gl_WorkGroupID.x —
+ * кусок узлов этого осколка. Всё в одном диспатче, поэтому 1000 осколков — это
+ * один проход, а не 1000.
+ *
+ * Почему узел вне бокса родителя — «далеко снаружи»: расширение родителя
+ * (`field::expand`) на CPU ставило в наросшие слои `far = 2·max(dims)`, а не
+ * зажатое крайнее значение. Иначе у края поля осколка получался бы ложный
+ * нулевой переход и лишняя поверхность.
+ */
+
+layout(local_size_x = 64) in;
+
+/* Слов на слот в пуле значений — как `sim::SDF_STRIDE`. */
+const uint SDF_STRIDE = 65536u;
+/* Плоскостей на осколок в буфере работ (у Вороного их n−1, у нас n ≤ 64). */
+const uint MAX_PLANES = 64u;
+
+/* Работа: 3 vec4 на осколок (целые лежат как float — так один буфер держит
+ * и индексы, и шаги):
+ *   a = (слот родителя, слот осколка, lo.x, lo.y)
+ *   b = (lo.z, nx, ny, nz)
+ *   c = (шаг родителя, шаг осколка, плоскостей, 0) */
+layout(std430, set = 0, binding = 0) readonly buffer Descs { SdfDesc descs[]; };
+layout(std430, set = 0, binding = 1) buffer Values { float vals[]; };
+layout(std430, set = 0, binding = 2) readonly buffer Jobs { vec4 job[]; };
+layout(std430, set = 0, binding = 3) readonly buffer Planes { vec4 planes[]; };
+/* Бокс ЗАНЯТОЙ области (режим 0): 2 ivec4 на работу — min.xyz и max.xyz.
+ * Это единственное, что CPU узнаёт про поле, — шесть целых на осколок. */
+layout(std430, set = 0, binding = 4) buffer BoxOut { ivec4 box[]; };
+
+ivec4 ij(vec4 v) { return ivec4(floor(v + vec4(0.5))); }
+
+float at_node(SdfDesc d, uint base, ivec3 n) {
+    ivec3 dm = sdf_dims(d);
+    ivec3 c = clamp(n, ivec3(0), dm - ivec3(1));
+    uint i = (uint(c.z) * uint(dm.y) + uint(c.y)) * uint(dm.x) + uint(c.x);
+    return vals[base + i];
+}
+
+float sample_node(SdfDesc d, uint base, vec3 n) {
+    vec3 p = n - vec3(d.lo_dims.xyz);
+    vec3 f = floor(p);
+    vec3 t = p - f;
+    ivec3 i = ivec3(f);
+    float v000 = at_node(d, base, i + ivec3(0, 0, 0));
+    float v100 = at_node(d, base, i + ivec3(1, 0, 0));
+    float v010 = at_node(d, base, i + ivec3(0, 1, 0));
+    float v110 = at_node(d, base, i + ivec3(1, 1, 0));
+    float v001 = at_node(d, base, i + ivec3(0, 0, 1));
+    float v101 = at_node(d, base, i + ivec3(1, 0, 1));
+    float v011 = at_node(d, base, i + ivec3(0, 1, 1));
+    float v111 = at_node(d, base, i + ivec3(1, 1, 1));
+    float a = mix(mix(v000, v100, t.x), mix(v010, v110, t.x), t.y);
+    float c = mix(mix(v001, v101, t.x), mix(v011, v111, t.x), t.y);
+    return mix(a, c, t.z);
+}
+
+void main() {
+    uint w = gl_WorkGroupID.y;
+    ivec4 j0 = ij(job[w * 3u]);
+    ivec4 j1 = ij(job[w * 3u + 1u]);
+    vec4 j2 = job[w * 3u + 2u];
+    ivec3 dims = ivec3(j1.y, j1.z, j1.w);
+    if (dims.x <= 0 || dims.y <= 0 || dims.z <= 0) return;
+    uint total = uint(dims.x) * uint(dims.y) * uint(dims.z);
+    uint node = gl_WorkGroupID.x * 64u + gl_LocalInvocationID.x;
+    if (node >= total) return;
+
+    ivec3 c = ivec3(int(node % uint(dims.x)),
+                    int((node / uint(dims.x)) % uint(dims.y)),
+                    int(node / (uint(dims.x) * uint(dims.y))));
+    ivec3 p = ivec3(j0.z, j0.w, j1.x) + c;   /* узел в сетке осколка */
+
+    uint pslot = uint(j0.x);
+    uint oslot = uint(j0.y);
+    float pstep = float(j2.x);
+    float ostep = float(j2.y);
+    uint nplanes = uint(j2.z);
+
+    /* --- родитель -------------------------------------------------------- */
+    /* Узел осколка — в СВОЁМ узле сетки, у родителя другой шаг: переводим в
+     * его узлы и только там проверяем «внутри ли поля». Проверка в чужих
+     * координатах путала край поля с серединой (замер: мелкие осколки давали
+     * пустой меш). */
+    SdfDesc pd = descs[pslot];
+    vec3 pn = vec3(p) * (ostep / pstep);
+    ivec3 pmin = pd.lo_dims.xyz;
+    ivec3 pmax = pmin + sdf_dims(pd) - ivec3(1);
+    float parent_val;
+    bool inside = all(greaterThanEqual(ivec3(floor(pn + vec3(0.5))), pmin))
+               && all(lessThanEqual(ivec3(floor(pn + vec3(0.5))), pmax));
+    if (inside) {
+        parent_val = sample_node(pd, pslot * SDF_STRIDE, pn) * (pstep / ostep);
+    } else {
+        /* «далеко снаружи», как `field::expand`: 2·max(dims) узлов родителя */
+        ivec3 pdm = sdf_dims(pd);
+        float far = float(max(pdm.x, max(pdm.y, pdm.z))) * 2.0;
+        parent_val = far;
+    }
+
+    /* --- плоскости Вороного (в метрах, n·p = d) -------------------------- */
+    vec3 pm = vec3(p) * ostep;
+    float plane_val = -1e30;
+    for (uint k = 0u; k < nplanes; k++) {
+        vec4 pl = planes[w * MAX_PLANES + k];
+        plane_val = max(plane_val, dot(pl.xyz, pm) - pl.w);
+    }
+    float plane_node = plane_val / ostep;
+    float v = max(parent_val, plane_node);
+
+    /* Режим 0 — СКАН: только бокс занятой области (узлы со значением < 0).
+     * Проход нужен потому, что бокс по вершинам тетов не годится: тет на
+     * срезе выходит за поверхность на свой размер, и поле обрезалось. */
+    if (pc.prm1.w > 0.5) {
+        if (v < 0.0) {
+            atomicMin(box[w * 2u].x, p.x);
+            atomicMin(box[w * 2u].y, p.y);
+            atomicMin(box[w * 2u].z, p.z);
+            atomicMax(box[w * 2u + 1u].x, p.x);
+            atomicMax(box[w * 2u + 1u].y, p.y);
+            atomicMax(box[w * 2u + 1u].z, p.z);
+        }
+        return;
+    }
+    vals[oslot * SDF_STRIDE + node] = v;
+}

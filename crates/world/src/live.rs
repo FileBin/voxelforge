@@ -1170,13 +1170,17 @@ impl Live {
         } else {
             want.clamp(3.0, hi) as usize
         };
-        let mut frags = tb.shatter_biased(n, 0x51ED_2A17 ^ (self.cracks as u64 + 1), focus);
-        frags.truncate(max_new);
-        if frags.len() < 2 {
+        /* Затравки и раскладка — на CPU (это ВХОД: параметры раскола), а поле
+         * каждого осколка печёт shard_field.comp: узел = max(f_родителя,
+         * плоскости). Значения узлов с хоста больше не заливаются. */
+        let pts = tb.shatter_pts(n, 0x51ED_2A17 ^ (self.cracks as u64 + 1), focus);
+        let mut bakes = tb.shatter_bakes(&pts);
+        bakes.truncate(max_new);
+        if bakes.len() < 2 {
             return;
         }
 
-        let mass_total: f64 = frags.iter().map(|f| DENSITY * f.volume()).sum();
+        let mass_total: f64 = bakes.iter().map(|b| DENSITY * b.volume as f64).sum();
         let v_rms = (2.0 * 0.20 * energy as f64 / mass_total.max(1e-6))
             .sqrt()
             .min(20.0);
@@ -1187,10 +1191,14 @@ impl Live {
         // 20 м/с, хотя импульс снаряда (90 кг × 26 м/с) на 590 кг плиты
         // даёт всего ~4 м/с.
         let mut net = [0.0f64; 3];
-        for fr in frags.iter() {
+        for b in bakes.iter() {
             // центроид осколка в координатах РЕШЁТКИ; c — центроид родителя
             // в тех же координатах, поэтому смещение = разность
-            let fc = fr.world_centroid();
+            let fc = [
+                b.centroid[0] + tb.origin[0],
+                b.centroid[1] + tb.origin[1],
+                b.centroid[2] + tb.origin[2],
+            ];
             let off = rot(tq, [
                 (fc[0] - c[0]) as f64,
                 (fc[1] - c[1]) as f64,
@@ -1199,7 +1207,7 @@ impl Live {
             let w = [off[0] + tpos[0], off[1] + tpos[1], off[2] + tpos[2]];
             let d = [w[0] - point[0] as f64, w[1] - point[1] as f64, w[2] - point[2] as f64];
             let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-3);
-            let m = DENSITY * fr.volume();
+            let m = DENSITY * b.volume as f64;
             for k in 0..3 {
                 net[k] += m * (d[k] / l) as f64;
             }
@@ -1207,11 +1215,16 @@ impl Live {
         let drift = [net[0] / mass_total, net[1] / mass_total, net[2] / mass_total];
 
         let mut rng = crate::tet::Lcg::new(0xB17E_5EED ^ (self.cracks as u64));
-        let mut created = 0usize;
         let mut new_slots: Vec<usize> = Vec::new();
+        /* (слот, номер раскладки) — поле поедет на устройство следующим шагом */
+        let mut born: Vec<(usize, usize)> = Vec::new();
 
-        for (k, fr) in frags.iter().enumerate() {
-            let lc = fr.world_centroid();
+        for (k, b) in bakes.iter().enumerate() {
+            let lc = [
+                b.centroid[0] + tb.origin[0],
+                b.centroid[1] + tb.origin[1],
+                b.centroid[2] + tb.origin[2],
+            ];
             // Мировой центр осколка: `lc` — в координатах решётки, `c` — центроид
             // РОДИТЕЛЯ в тех же координатах (он же и есть tpos). Без вычитания
             // `c` позиция родителя прибавлялась дважды, и осколки рождались
@@ -1240,13 +1253,15 @@ impl Live {
                     d[1] / len * speed + tvel[1] * 0.4 - drift[1],
                     d[2] / len * speed + tvel[2] * 0.4 - drift[2],
                 ],
-                mass: DENSITY * fr.volume(),
+                mass: DENSITY * b.volume as f64,
                 radius: 0.2,
-                tets: fr.tets.clone(),
-                origin: fr.origin,
-            sdf: fr.sdf.get().cloned(),
+                tets: b.tets.clone(),
+                origin: tb.origin,
+                /* поле осколка печётся на устройстве — сюда приедет ниже
+                 * (в этой ревизии — обратным чтением, ради CPU-мешера) */
+                sdf: None,
                 sdf_shift: [0.0; 3],
-                level_cap: fr.level_cap,
+                level_cap: tb.level_cap,
                 local: Vec::new(),
                 mesh: -1,
                 lines: -1,
@@ -1258,14 +1273,52 @@ impl Live {
             if !self.gpu_collide {
                 self.mirror[slot] = gpu_body(&body);
             }
+            born.push((slot, k));
             if slot < self.bodies.len() {
                 self.bodies[slot] = body;
             } else {
                 self.bodies.push(body);
             }
             new_slots.push(slot);
-            created += 1;
         }
+
+        /* --- поле осколков: ЗАПЕКАНИЕ НА УСТРОЙСТВЕ -------------------------
+         * CPU отдаёт только параметры (бокс, шаг, плоскости Вороного).
+         * Слот родителя `ti` один из осколков забирает себе, поэтому он идёт
+         * ВТОРЫМ диспатчем: первый пишет в чужие слоты и ещё читает поле
+         * родителя, второй — уже поверх него. */
+        let jobs: Vec<(usize, usize, &crate::tet::ShardBake)> = born
+            .iter()
+            .map(|(slot, k)| (ti, *slot, &bakes[*k]))
+            .collect();
+        if !jobs.is_empty() {
+            let (own, rest): (Vec<_>, Vec<_>) = jobs
+                .into_iter()
+                .partition(|(_, slot, _)| *slot == ti);
+            let mut got: Vec<(usize, Option<crate::sim::BakedShard>)> =
+                Vec::with_capacity(born.len());
+            let v1 = self.gpu.bake_shard_fields(&rest, true);
+            for (i, (_p, slot, _)) in rest.iter().enumerate() {
+                got.push((*slot, v1.get(i).cloned().flatten()));
+            }
+            let v2 = self.gpu.bake_shard_fields(&own, true);
+            for (i, (_p, slot, _)) in own.iter().enumerate() {
+                got.push((*slot, v2.get(i).cloned().flatten()));
+            }
+            for (slot, b) in got {
+                let Some(b) = b else { continue };
+                if b.vals.is_empty() {
+                    continue;
+                }
+                self.bodies[slot].sdf = Some(crate::field::NodeField {
+                    lo: b.lo,
+                    dims: b.dims,
+                    val: b.vals,
+                    step: b.step,
+                });
+            }
+        }
+        let created = new_slots.len();
 
         // Слоты осколков ОБЯЗАНЫ уехать на GPU в этом же кадре: иначе снимок
         // вернёт в этот слот старое тело, и новый осколок «телепортируется»
