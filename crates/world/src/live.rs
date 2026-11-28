@@ -1169,13 +1169,13 @@ impl Live {
                 radius: 0.2,
                 tets: fr.tets.clone(),
                 origin: fr.origin,
+            sdf: fr.sdf.get().cloned(),
                 level_cap: fr.level_cap,
                 local: Vec::new(),
                 mesh: -1,
                 lines: -1,
                 kind: Kind::Shard,
                 alive: true,
-                sdf: None,
             };
             body.rebuild();
             body.radius = body.radius_of();
