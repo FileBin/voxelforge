@@ -429,10 +429,26 @@ impl TetBody {
         for z in -nf..=nf {
             for y in -nf..=nf {
                 for x in -nf..=nf {
+                    /* Коробка повёрнута на 45° вокруг (1,1,1): рёбра идут
+                     * наискось к решётке, и ступеньки марчинга не складываются
+                     * в заметный глазу узор по осям. */
+                    let (px, py, pz) = (x as f32 - 0.5, y as f32 - 0.5, z as f32 - 0.5);
+                    let inv3 = 1.0f32 / 3f32.sqrt();
+                    let a = std::f32::consts::FRAC_PI_4.cos();
+                    let b = std::f32::consts::FRAC_PI_4.sin();
+                    let (ux, uy, uz) = (inv3, inv3, inv3);
+                    /* поворот на -45° вокруг (1,1,1) (обратный к повороту тела) */
+                    let dot = ux * px + uy * py + uz * pz;
+                    let cr_x = uy * pz - uz * py;
+                    let cr_y = uz * px - ux * pz;
+                    let cr_z = ux * py - uy * px;
+                    let rx = px * a - cr_x * b + ux * dot * (1.0 - a);
+                    let ry = py * a - cr_y * b + uy * dot * (1.0 - a);
+                    let rz = pz * a - cr_z * b + uz * dot * (1.0 - a);
                     let q = [
-                        ((x as f32 - 0.5).abs()) - half / step,
-                        ((y as f32 - 0.5).abs()) - half / step,
-                        ((z as f32 - 0.5).abs()) - half / step,
+                        rx.abs() - half / step,
+                        ry.abs() - half / step,
+                        rz.abs() - half / step,
                     ];
                     let outside = (q[0].max(0.0).powi(2) + q[1].max(0.0).powi(2)
                         + q[2].max(0.0).powi(2))
