@@ -852,10 +852,13 @@ impl TetBody {
             even_up(f.lo[1]),
             even_up(f.lo[2]),
         ];
+        /* Ещё ОДИН СЛОЙ ячеек за границей блока поля: с дальней стороны
+         * поверхности иначе не из чего строить, и марчинг выдаёт шипы. Это
+         * только сетка марчинга — набор тетов тела (масса) не меняется. */
         let hi = [
-            even_dn(end[0] - 2),
-            even_dn(end[1] - 2),
-            even_dn(end[2] - 2),
+            even_dn(end[0]),
+            even_dn(end[1]),
+            even_dn(end[2]),
         ];
         let mut tet_seen: std::collections::HashSet<[Node; 4]> = std::collections::HashSet::new();
         for bz in (lo[2]..=hi[2]).step_by(2) {
