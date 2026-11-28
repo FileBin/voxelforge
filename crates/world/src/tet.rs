@@ -403,7 +403,7 @@ impl TetBody {
             bz += 2;
         }
 
-        Self {
+        let body = Self {
             tets,
             // Предел дробления: ещё один уровень. Два уровня — это 8× тетраэдров,
             // и столкновения по тетраэдрам на CPU становятся слишком дорогими
@@ -411,7 +411,43 @@ impl TetBody {
             level_cap: level + 1,
             origin: center,
             sdf: Default::default(),
+        };
+        /* SDF коробки — АНАЛИТИЧЕСКИЙ, на том же шаге, что теты (плотность не
+         * меняем). BFS-расстояние по занятости давало гребни на рёбрах: там
+         * сходятся три плоскости, и волна обходит их ступеньками — отсюда
+         * «шип» на угле. Аналитика рёбер не боится. */
+        let step = node_step(level);
+        /* half - полшага: тогда ноль поля НЕ попадает в узлы решётки (иначе
+         * значения в них ровно 0, срез вырождается и поверхность рвётся). */
+        let half = n as f32 * step - 0.5 * step;
+        let nf = (half / step).ceil() as i32 + 6;
+        let dim = (2 * nf + 1) as usize;
+        let mut val = vec![0.0f32; dim * dim * dim];
+        for z in -nf..=nf {
+            for y in -nf..=nf {
+                for x in -nf..=nf {
+                    let q = [
+                        (x as f32).abs() - half / step,
+                        (y as f32).abs() - half / step,
+                        (z as f32).abs() - half / step,
+                    ];
+                    let outside = (q[0].max(0.0).powi(2) + q[1].max(0.0).powi(2)
+                        + q[2].max(0.0).powi(2))
+                    .sqrt();
+                    let inside = q[0].max(q[1]).max(q[2]).min(0.0);
+                    let i = (((z + nf) as usize) * dim + ((y + nf) as usize)) * dim
+                        + ((x + nf) as usize);
+                    val[i] = (outside + inside) * step;
+                }
+            }
         }
+        let _ = body.sdf.set(field::NodeField {
+            lo: [-nf, -nf, -nf],
+            dims: [dim, dim, dim],
+            val,
+            step,
+        });
+        body
     }
 
     /// Шар из тетраэдров: всё, что ближе радиуса к центру.
