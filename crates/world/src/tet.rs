@@ -961,6 +961,9 @@ impl TetBody {
         let f = self.sdf();
         let level = self.tets.iter().map(|t| t.level).max().unwrap_or(0);
         let origin = self.origin;
+        /* Сетка марчинга — сетка ПОЛЯ, а не тетов: поле может быть запечено
+         * мельче, и тогда поверхность строится по его шагу. */
+        let fstep = f.step;
 
         let mut positions: Vec<[f32; 3]> = Vec::new();
         let mut indices: Vec<u32> = Vec::new();
@@ -1021,7 +1024,7 @@ impl TetBody {
                         let mut pos = [[0.0f32; 3]; 4];
                         let val: [f32; 4] = std::array::from_fn(|i| {
                             let q = tet_corners[i];
-                            pos[i] = node_pos(q, level, origin);
+                            pos[i] = [origin[0] + q.0 as f32 * fstep, origin[1] + q.1 as f32 * fstep, origin[2] + q.2 as f32 * fstep];
                             f.at([q.0, q.1, q.2])
                         });
                         let mut vertex = |a: Node, b: Node, tp: f32| -> u32 {
@@ -1034,8 +1037,8 @@ impl TetBody {
                             if let Some(&id) = cache.get(&key) {
                                 return id;
                             }
-                            let pa = node_pos(a, level, origin);
-                            let pb = node_pos(b, level, origin);
+                            let pa = [origin[0] + a.0 as f32 * fstep, origin[1] + a.1 as f32 * fstep, origin[2] + a.2 as f32 * fstep];
+                            let pb = [origin[0] + b.0 as f32 * fstep, origin[1] + b.1 as f32 * fstep, origin[2] + b.2 as f32 * fstep];
                             let p = [
                                 pa[0] + (pb[0] - pa[0]) * tp,
                                 pa[1] + (pb[1] - pa[1]) * tp,
