@@ -14,6 +14,7 @@ pub mod sdf_contact;
 pub mod collide;
 pub mod live;
 pub mod sim;
+pub mod t1;
 pub mod tet;
 pub mod types;
 pub mod vfw;
