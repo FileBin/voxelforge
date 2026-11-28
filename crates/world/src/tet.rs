@@ -593,11 +593,11 @@ impl TetBody {
     /// Вершины кэшируются по паре узлов, поэтому соседние теты делят одну
     /// вершину и швов нет.
     fn extract_marching(&self) -> Mesh {
-        let mut corners: Vec<Node> = Vec::with_capacity(self.tets.len() * 4);
-        for t in &self.tets {
-            corners.extend_from_slice(&t.v);
-        }
-        let f = field::from_occupied(corners.into_iter(), 2);
+        /* Поле по ОБЪЁМУ тетов: заполнение одними вершинами даёт дырявую
+         * занятость, ноль поля не встречается и марчинг выдаёт ноль
+         * треугольников. Запас 3 узла: тет заходит за своё основание. */
+        let tet_nodes: Vec<[Node; 4]> = self.tets.iter().map(|t| t.v).collect();
+        let f = field::from_tets(&tet_nodes, 3);
         let level = self.tets.iter().map(|t| t.level).max().unwrap_or(0);
         let origin = self.origin;
 
@@ -610,14 +610,25 @@ impl TetBody {
          * полушагах): у BCC-тетов занятость выходит за чётную сетку, и середина
          * блока может оказаться нечётной — тогда «кубы» строятся по центрам,
          * куда поле не попадает, и марчинг не даёт ни одного треугольника. */
-        let even_from = |v: i32| if v & 1 != 0 { v + 1 } else { v };
-        let lo = [even_from(f.lo[0]), even_from(f.lo[1]), even_from(f.lo[2])];
-        /* Последнее основание куба: нужны узлы base..base+2, поэтому от конца
-         * блока отступаем на два узла. Считаем ПОСЛЕ выравнивания lo. */
+        /* Углы тела лежат на ЧЁТНЫХ узлах (n чётное), значит основание куба тоже
+         * чётное. bcc_tets(base) заходит на base-1 и base+2, поэтому основание
+         * держим внутри блока с отступом: base-1 >= f.lo и base+2 <= конец. */
+        let end = [
+            f.lo[0] + f.dims[0] as i32 - 1,
+            f.lo[1] + f.dims[1] as i32 - 1,
+            f.lo[2] + f.dims[2] as i32 - 1,
+        ];
+        let even_up = |v: i32| if v & 1 != 0 { v + 1 } else { v };
+        let even_dn = |v: i32| if v & 1 != 0 { v - 1 } else { v };
+        let lo = [
+            even_up(f.lo[0] + 1),
+            even_up(f.lo[1] + 1),
+            even_up(f.lo[2] + 1),
+        ];
         let hi = [
-            lo[0] + f.dims[0] as i32 - 3,
-            lo[1] + f.dims[1] as i32 - 3,
-            lo[2] + f.dims[2] as i32 - 3,
+            even_dn(end[0] - 2),
+            even_dn(end[1] - 2),
+            even_dn(end[2] - 2),
         ];
         for bz in (lo[2]..=hi[2]).step_by(2) {
             for by in (lo[1]..=hi[1]).step_by(2) {
@@ -1225,7 +1236,7 @@ mod marching_tests {
     }
 
     #[test]
-    #[ignore = "марчинг по BCC-тетам: обход кубов не доходит до границы поля (тет заходит на узел дальше основания), поэтому ноль поля внутри пройденных тетов не встречается и треугольников ноль. Нужно расширить обход на один узел и НЕ прижимать значения за блоком — прижатие делает край «сплошным»"]
+    #[ignore = "марчинг даёт геометрию, но поверхность не замкнута: bcc_tets(base) даёт 2 тета на куб, а полное заполнение BCC — 24 тета (6 по каждой телесной диагонали); при частичном покрытии соседние кубы не стыкуются (807 рёбер кратности != 2)"]
     fn marching_cube_is_closed_and_denser_than_faces() {
         let body = TetBody::cube([0.0, 0.0, 0.0], 4, 0);
         let marched = body.extract_marching();
@@ -1247,7 +1258,7 @@ mod marching_tests {
     }
 
     #[test]
-    #[ignore = "см. marching_cube_is_closed: обход кубов не доходит до границы поля"]
+    #[ignore = "марчинг даёт геометрию, но поверхность не замкнута: bcc_tets(base) даёт 2 тета на куб, а полное заполнение BCC — 24 тета (6 по каждой телесной диагонали); при частичном покрытии соседние кубы не стыкуются (807 рёбер кратности != 2)"]
     fn marching_ball_is_closed() {
         let body = TetBody::ball([0.0, 0.0, 0.0], 1.3, 0);
         let marched = body.extract_marching();
