@@ -416,53 +416,82 @@ impl TetBody {
 
     /// Шар из тетраэдров: всё, что ближе радиуса к центру.
     pub fn ball(center: [f32; 3], radius: f32, level: u8) -> Self {
-        /* Уровень подбираем ПО РАДИУСУ: при крупном шаге шар сэмплируется
-         * двумя-тремя узлами и выходит многогранником (на снаряде это видно
-         * как угловатый бок). Целимся в ~6 узлов на радиус: шаг <= radius/6. */
+        /* ШАР ИЗ SDF: аналитическая сфера запекается в узлы решётки, теты —
+         * только разметка, где стоят воксели (тет входит, если все четыре его
+         * узла внутри). Поверхность берётся из запечённого поля, поэтому шар
+         * круглый независимо от формы тетов. */
         let mut lv = level;
         while lv < level.saturating_add(6) {
-            let a_lv = BASE / (1u32 << lv) as f32;
-            if a_lv * 0.5 <= radius / 6.0 {
+            if node_step(lv) <= radius / 6.0 {
                 break;
             }
             lv += 1;
         }
-        let level = lv;
-        let a = BASE / (1u32 << level) as f32;
-        let n = (radius / a).ceil() as i32 + 1;
-        let mut tets = Vec::new();
-        for i in -n..n {
-            for j in -n..n {
-                for k in -n..n {
-                    let base = (2 * i, 2 * j, 2 * k);
-                    let nodes = cube_nodes(base);
-                    for t in CUBE_TETS.iter() {
-                        let tet = Tet {
-                            level,
-                            v: [
-                                nodes[t[0] as usize],
-                                nodes[t[1] as usize],
-                                nodes[t[2] as usize],
-                                nodes[t[3] as usize],
-                            ],
-                        };
-                        // центроид локальный (узлы — без origin), центр шара в
-                        // локальных координатах — это ноль
-                        let c = tet.centroid();
-                        let d = (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt();
-                        if d <= radius as f64 {
-                            tets.push(tet);
-                        }
-                    }
+        let step = node_step(lv);
+        let rn = radius / step;
+        let n = (rn.ceil() as i32) + 3;
+        let dim = (2 * n + 1) as usize;
+        let idx = |x: i32, y: i32, z: i32| -> usize {
+            (((z + n) as usize) * dim + ((y + n) as usize)) * dim + ((x + n) as usize)
+        };
+        let mut val = vec![0.0f32; dim * dim * dim];
+        let mut solid = vec![false; dim * dim * dim];
+        for z in -n..=n {
+            for y in -n..=n {
+                for x in -n..=n {
+                    let d = ((x * x + y * y + z * z) as f32).sqrt() - rn;
+                    let i = idx(x, y, z);
+                    solid[i] = d < 0.0;
+                    /* без сдвига: у запечённого SDF ноль и есть поверхность,
+                     * а |значение| — настоящее расстояние до неё */
+                    val[i] = d;
                 }
             }
         }
-        Self {
+        let mut tets = Vec::new();
+        let mut seen: std::collections::HashSet<[Node; 4]> = std::collections::HashSet::new();
+        let inside = |nd: Node| -> bool {
+            let (x, y, z) = (nd.0, nd.1, nd.2);
+            if x < -n || y < -n || z < -n || x > n || y > n || z > n {
+                return false;
+            }
+            solid[idx(x, y, z)]
+        };
+        let mut bz = -n;
+        while bz <= n - 2 {
+            let mut by = -n;
+            while by <= n - 2 {
+                let mut bx = -n;
+                while bx <= n - 2 {
+                    for d in 0..3 {
+                        for t in bcc_tets_around_edge((bx, by, bz), d) {
+                            if !t.iter().all(|nd| inside(*nd)) {
+                                continue;
+                            }
+                            if seen.insert(tet_key(&t)) {
+                                tets.push(Tet { level: lv, v: t });
+                            }
+                        }
+                    }
+                    bx += 2;
+                }
+                by += 2;
+            }
+            bz += 2;
+        }
+        let body = Self {
             tets,
-            level_cap: level,
+            level_cap: lv,
             origin: center,
             sdf: Default::default(),
-        }
+        };
+        let _ = body.sdf.set(field::NodeField {
+            lo: [-n, -n, -n],
+            dims: [dim, dim, dim],
+            val,
+            step,
+        });
+        body
     }
 
     pub fn volume(&self) -> f64 {
@@ -730,7 +759,12 @@ impl TetBody {
         } else {
             self.extract_marching()
         };
-        smooth(&mut mesh, iterations, lambda);
+        /* Поле уже гладкое (SDF запечён и сглажен) — лапласиан по вершинам
+         * только сдвигал бы их с изоповерхности. Крутим его лишь для старого
+         * пути без SDF. */
+        if self.sdf.get().is_none() {
+            smooth(&mut mesh, iterations, lambda);
+        }
         /* Нормали — из ГРАДИЕНТА поля, а не из граней треугольников: поле
          * гладкое (расстояние), поэтому затенение перестаёт показывать
          * тетраэдры и поверхность читается как одна оболочка. */
@@ -1813,8 +1847,9 @@ mod sdf_quality_tests {
     #[test]
     fn marching_mesh_lies_on_the_sdf_zero() {
         let body = TetBody::ball([0.0, 0.0, 0.0], 1.0, 0);
-        let step = node_step(0);
         let f = body.sdf();
+        /* шаг берём ИЗ ПОЛЯ: уровень шара подбирается по радиусу */
+        let step = f.step;
         let m = body.extract_marching();
         assert!(m.positions.len() > 100, "меш подозрительно бедный");
         let mut worst: f32 = 0.0;
@@ -1826,6 +1861,13 @@ mod sdf_quality_tests {
             ];
             worst = worst.max(f.sample(local).abs() * step);
         }
+        let (mut rmin, mut rmax) = (f32::MAX, f32::MIN);
+        for p in &m.positions {
+            let r = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+            rmin = rmin.min(r);
+            rmax = rmax.max(r);
+        }
+        println!("радиус вершин меша: {rmin:.3} .. {rmax:.3} (шар r=1.0)");
         println!(
             "меш на нуле поля: вершин {}, худшее |f| {:.4} м (шаг {:.4})",
             m.positions.len(),
