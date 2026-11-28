@@ -699,3 +699,32 @@ pub fn from_occupancy_metric(tets: &[[Node; 4]], pad: i32, smooth_iters: usize, 
     f.smooth(smooth_iters, 0.6);
     f
 }
+
+/// Отсечь полупространством: CSG-пересечение поля с плоскостью `n·p <= d`.
+///
+/// Это и есть «дробление в любом соотношении»: режем НЕ по границам тетов, а
+/// само поле, поэтому скол идёт по произвольной плоскости, а новая поверхность
+/// получается гладкой и точной — вершины марчинга лягут ровно на плоскость.
+pub fn intersect_plane(f: &NodeField, n: [f32; 3], d: f32) -> NodeField {
+    let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-9);
+    let n = [n[0] / len, n[1] / len, n[2] / len];
+    let d = d / len;
+    let mut out = f.clone();
+    let (nx, ny, nz) = (f.dims[0], f.dims[1], f.dims[2]);
+    for z in 0..nz {
+        for y in 0..ny {
+            for x in 0..nx {
+                let i = (z * ny + y) * nx + x;
+                let p = [
+                    (f.lo[0] + x as i32) as f32,
+                    (f.lo[1] + y as i32) as f32,
+                    (f.lo[2] + z as i32) as f32,
+                ];
+                /* расстояние до плоскости в единицах узла, со знаком «снаружи» */
+                let plane = (n[0] * p[0] + n[1] * p[1] + n[2] * p[2] - d) * f.step;
+                out.val[i] = f.val[i].max(plane);
+            }
+        }
+    }
+    out
+}
