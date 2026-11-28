@@ -120,6 +120,108 @@ impl NodeField {
     }
 }
 
+/// Разметка связности поля: каждая НЕСВЯЗНАЯ занятая область (`val < 0`)
+/// получает свой номер.
+///
+/// Занятость читается по ЗНАКУ поля: сглаживание знак не меняет (см.
+/// `build_from_solid`), поэтому разметка описывает ровно ту форму, которую
+/// потом марчит мешер.
+#[derive(Clone, Debug, Default)]
+pub struct Components {
+    /// Метка на каждый узел блока: `u32::MAX` — узел пуст.
+    pub label: Vec<u32>,
+    /// Габарит каждой области в координатах узлов, включительно.
+    pub bounds: Vec<([i32; 3], [i32; 3])>,
+    /// Сколько занятых узлов в каждой области.
+    pub sizes: Vec<usize>,
+}
+
+impl Components {
+    /// Число областей: 1 — тело связное.
+    pub fn count(&self) -> usize {
+        self.bounds.len()
+    }
+}
+
+/// Поставить узлу метку области и положить его в очередь обхода.
+#[inline]
+fn link(label: &mut [u32], val: &[f32], stack: &mut Vec<usize>, j: usize, id: u32) {
+    if label[j] == u32::MAX && val[j] < 0.0 {
+        label[j] = id;
+        stack.push(j);
+    }
+}
+
+/// Разбить занятость поля на связные области по 6-связности УЗЛОВ.
+///
+/// `min_gap` — сколько ПУСТЫХ узлов должно лежать между областями, чтобы они
+/// считались РАЗНЫМИ телами. `min_gap = 1` — обычная 6-связность: занятые
+/// узлы соединяются, только если они соседи ПО ГРАНИ. Поэтому перемычка
+/// тоньше шага поля (угловой контакт узел-в-узел, диагональ) связью НЕ
+/// считается и два куска не склеиваются в одно тело. Больше 1 — допуск:
+/// области, разделённые меньше чем `min_gap` пустыми узлами, остаются одним
+/// телом (грубая сетка не должна рвать тело по одному слою пустоты).
+///
+/// Стоимость линейна по числу узлов блока: каждый занятый узел посещается
+/// ровно один раз, на узел 6 проверок.
+pub fn components(f: &NodeField, min_gap: i32) -> Components {
+    let gap = min_gap.max(1) as usize;
+    let (nx, ny, nz) = (f.dims[0], f.dims[1], f.dims[2]);
+    let n = nx * ny * nz;
+    let mut label = vec![u32::MAX; n];
+    let mut bounds: Vec<([i32; 3], [i32; 3])> = Vec::new();
+    let mut sizes: Vec<usize> = Vec::new();
+    let mut stack: Vec<usize> = Vec::new();
+    let (sx, sy) = (1usize, nx);
+    let sz = nx * ny;
+    for start in 0..n {
+        if f.val[start] >= 0.0 || label[start] != u32::MAX {
+            continue;
+        }
+        let id = bounds.len() as u32;
+        label[start] = id;
+        stack.clear();
+        stack.push(start);
+        let mut lo = [i32::MAX; 3];
+        let mut hi = [i32::MIN; 3];
+        let mut size = 0usize;
+        while let Some(i) = stack.pop() {
+            size += 1;
+            let x = i % nx;
+            let y = (i / nx) % ny;
+            let z = i / sz;
+            let c = [f.lo[0] + x as i32, f.lo[1] + y as i32, f.lo[2] + z as i32];
+            for k in 0..3 {
+                lo[k] = lo[k].min(c[k]);
+                hi[k] = hi[k].max(c[k]);
+            }
+            for d in 1..=gap {
+                if x + d < nx {
+                    link(&mut label, &f.val, &mut stack, i + d * sx, id);
+                }
+                if x >= d {
+                    link(&mut label, &f.val, &mut stack, i - d * sx, id);
+                }
+                if y + d < ny {
+                    link(&mut label, &f.val, &mut stack, i + d * sy, id);
+                }
+                if y >= d {
+                    link(&mut label, &f.val, &mut stack, i - d * sy, id);
+                }
+                if z + d < nz {
+                    link(&mut label, &f.val, &mut stack, i + d * sz, id);
+                }
+                if z >= d {
+                    link(&mut label, &f.val, &mut stack, i - d * sz, id);
+                }
+            }
+        }
+        bounds.push((lo, hi));
+        sizes.push(size);
+    }
+    Components { label, bounds, sizes }
+}
+
 /// Границы блока узлов по набору узлов плюс запас `pad`.
 fn bounds_of<'a, I: Iterator<Item = &'a Node>>(it: I, pad: i32) -> ([i32; 3], [usize; 3]) {
     let mut lo = [i32::MAX; 3];
@@ -344,6 +446,170 @@ fn bfs(dist: &mut [f32], queue: &mut std::collections::VecDeque<usize>, dims: [u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Узлы шара радиусом `r` (в узлах) с центром `c`.
+    fn ball_nodes(c: (i32, i32, i32), r: i32) -> Vec<(i32, i32, i32)> {
+        let mut out = Vec::new();
+        for z in c.2 - r..=c.2 + r {
+            for y in c.1 - r..=c.1 + r {
+                for x in c.0 - r..=c.0 + r {
+                    let (dx, dy, dz) = (x - c.0, y - c.1, z - c.2);
+                    if dx * dx + dy * dy + dz * dz <= r * r {
+                        out.push((x, y, z));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Узлы куба `lo..=hi`.
+    fn cube_nodes(lo: (i32, i32, i32), hi: (i32, i32, i32)) -> Vec<(i32, i32, i32)> {
+        let mut out = Vec::new();
+        for z in lo.2..=hi.2 {
+            for y in lo.1..=hi.1 {
+                for x in lo.0..=hi.0 {
+                    out.push((x, y, z));
+                }
+            }
+        }
+        out
+    }
+
+    fn field_of(nodes: &[(i32, i32, i32)], pad: i32) -> NodeField {
+        from_occupied(nodes.iter().copied(), pad)
+    }
+
+    /// Метка области в узле с мировыми координатами.
+    fn label_at(f: &NodeField, c: &Components, p: [i32; 3]) -> u32 {
+        let i = (((p[2] - f.lo[2]) as usize) * f.dims[1] + (p[1] - f.lo[1]) as usize)
+            * f.dims[0]
+            + (p[0] - f.lo[0]) as usize;
+        c.label[i]
+    }
+
+    /// Два шара БЕЗ перемычки — две компоненты (базовый случай).
+    #[test]
+    fn two_balls_without_bridge_are_two_components() {
+        let mut occ = ball_nodes((10, 16, 16), 5);
+        occ.extend(ball_nodes((28, 16, 16), 5));
+        let f = field_of(&occ, 3);
+        let c = components(&f, 1);
+        assert_eq!(c.count(), 2, "два раздельных шара обязаны дать 2 компоненты");
+        assert!(c.sizes.iter().all(|&s| s > 100), "области не должны быть пустыми: {:?}", c.sizes);
+        assert_ne!(
+            label_at(&f, &c, [10, 16, 16]),
+            label_at(&f, &c, [28, 16, 16]),
+            "центры шаров попали в одну компоненту"
+        );
+    }
+
+    /// Перемычка ТОНЬШЕ ШАГА поля: узлы шаров соприкасаются только УГЛОМ
+    /// (разность (1,1,0)). Физически это перемычка нулевой толщины по
+    /// решётке — связью она быть не должна: две части, а не одно тело.
+    /// 26-связность склеила бы их, 6-связность — нет.
+    #[test]
+    fn corner_thin_neck_does_not_join_parts() {
+        /* Два блока, у которых ближайшие узлы — диагональ: (9,9,9) и (10,10,9). */
+        let mut occ = cube_nodes((2, 2, 2), (9, 9, 9));
+        occ.extend(cube_nodes((10, 10, 9), (17, 17, 16)));
+        let f = field_of(&occ, 3);
+        let c = components(&f, 1);
+        assert!(
+            c.count() >= 2,
+            "угловой контакт склеил куски в одно тело: count={}",
+            c.count()
+        );
+        assert_ne!(
+            label_at(&f, &c, [2, 2, 2]),
+            label_at(&f, &c, [17, 17, 16]),
+            "два куска оказались в одной компоненте через угол"
+        );
+    }
+
+    /// Перемычка ШИРИНОЙ В ОДИН УЗЕЛ (грань-в-грань) — это уже связь:
+    /// тело одно, и разбивать его нельзя.
+    #[test]
+    fn one_node_neck_joins_parts() {
+        let mut occ = cube_nodes((2, 2, 2), (9, 9, 9));
+        /* перемычка ровно в один узел по x на уровне y=z=9 */
+        occ.extend(cube_nodes((10, 9, 9), (11, 9, 9)));
+        occ.extend(cube_nodes((12, 9, 9), (19, 16, 16)));
+        let f = field_of(&occ, 3);
+        let c = components(&f, 1);
+        assert_eq!(c.count(), 1, "перемычка в узел обязана держать тело целым");
+    }
+
+    /// Куб с ДЫРКОЙ (полостью внутри и сквозным каналом) — одна компонента:
+    /// дырка не разрывает тело.
+    #[test]
+    fn cube_with_hole_is_one_component() {
+        let lo = (2, 2, 2);
+        let hi = (20, 20, 20);
+        let mut occ = cube_nodes(lo, hi);
+        /* полость внутри */
+        occ.retain(|&(x, y, z)| {
+            !(x > 6 && x < 16 && y > 6 && y < 16 && z > 6 && z < 16)
+        });
+        /* сквозной канал по x — тоже дырка, а не разрыв */
+        occ.retain(|&(_, y, z)| !(y == 10 && z == 10));
+        let f = field_of(&occ, 3);
+        let c = components(&f, 1);
+        assert_eq!(c.count(), 1, "куб с дыркой обязан остаться одним телом");
+    }
+
+    /// Порог связности: области, разделённые ОДНИМ пустым узлом, при
+    /// `min_gap = 1` разные тела, при `min_gap = 2` — одно.
+    #[test]
+    fn gap_threshold_merges_parts() {
+        let mut occ = cube_nodes((2, 2, 2), (9, 9, 9));
+        /* второй куб начинается через ОДИН пустой узел (x = 11) */
+        occ.extend(cube_nodes((11, 2, 2), (18, 9, 9)));
+        let f = field_of(&occ, 3);
+        assert_eq!(components(&f, 1).count(), 2, "слой пустоты разделяет при gap=1");
+        assert_eq!(components(&f, 2).count(), 1, "gap=2 обязан терпеть один пустой узел");
+    }
+
+    /// Цена поиска компонент: 64³ и 128³ узлов, по три прогона.
+    #[test]
+    fn components_cost_at_64_and_128() {
+        let mut line = String::from("компоненты: ");
+        for dim in [64usize, 128] {
+            let f = blob_field(dim, &[([-10.0, 0.0, 0.0], 9.0), ([10.0, 0.0, 0.0], 9.0)]);
+            let mut best = f32::MAX;
+            let mut got = 0;
+            for _ in 0..3 {
+                let t = std::time::Instant::now();
+                let c = components(&f, 1);
+                let ms = t.elapsed().as_secs_f32() * 1e3;
+                best = best.min(ms);
+                got = c.count();
+            }
+            assert_eq!(got, 2, "{dim}³: должно быть две области");
+            line.push_str(&format!("{dim}³ = {best:.2} мс; "));
+        }
+        println!("{line}");
+    }
+
+    /// Аналитическое поле из шаров (без BFS): нужно только для замера цены.
+    fn blob_field(dim: usize, balls: &[([f32; 3], f32)]) -> NodeField {
+        let mut val = vec![1.0f32; dim * dim * dim];
+        let c = dim as f32 * 0.5;
+        for z in 0..dim {
+            for y in 0..dim {
+                for x in 0..dim {
+                    let p = [x as f32 - c, y as f32 - c, z as f32 - c];
+                    let mut d = f32::MAX;
+                    for (bc, r) in balls {
+                        let q = [p[0] - bc[0], p[1] - bc[1], p[2] - bc[2]];
+                        d = d.min((q[0] * q[0] + q[1] * q[1] + q[2] * q[2]).sqrt() - r);
+                    }
+                    val[(z * dim + y) * dim + x] = d;
+                }
+            }
+        }
+        NodeField { lo: [0; 3], dims: [dim, dim, dim], val, step: 1.0 }
+    }
 
     /// Куб из узлов 0..=4: внутри минус, снаружи плюс, переход через ноль есть.
     #[test]

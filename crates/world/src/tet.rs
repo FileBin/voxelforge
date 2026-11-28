@@ -950,6 +950,172 @@ impl TetBody {
         }).collect()
     }
 
+    /// Номер области поля, к которой относится тет: по его ЦЕНТРОИДУ.
+    ///
+    /// Центроид тета считается в координатах УЗЛОВ ПОЛЯ (`node_step(level)` /
+    /// `step`), как и в `shatter_fields`: у тета и поля шаги разные, и без
+    /// пересчёта раздача тетов уезжает. Если центроид попал в пустой узел
+    /// (тет крупнее зазора между кусками), берётся ближайший помеченный узел в
+    /// радиусе трёх; если и такого нет — ближайший габарит области.
+    fn part_of_tet(&self, t: &Tet, f: &field::NodeField, comps: &field::Components) -> usize {
+        let s = node_step(t.level) / f.step;
+        let cx = (t.v[0].0 + t.v[1].0 + t.v[2].0 + t.v[3].0) as f32 * 0.25 * s;
+        let cy = (t.v[0].1 + t.v[1].1 + t.v[2].1 + t.v[3].1) as f32 * 0.25 * s;
+        let cz = (t.v[0].2 + t.v[1].2 + t.v[2].2 + t.v[3].2) as f32 * 0.25 * s;
+        let (nx, ny, nz) = (f.dims[0], f.dims[1], f.dims[2]);
+        let idx = |x: i32, y: i32, z: i32| -> Option<usize> {
+            let (ix, iy, iz) = (x - f.lo[0], y - f.lo[1], z - f.lo[2]);
+            if ix < 0 || iy < 0 || iz < 0 {
+                return None;
+            }
+            let (ix, iy, iz) = (ix as usize, iy as usize, iz as usize);
+            if ix >= nx || iy >= ny || iz >= nz {
+                return None;
+            }
+            Some((iz * ny + iy) * nx + ix)
+        };
+        let (gx, gy, gz) = (cx.round() as i32, cy.round() as i32, cz.round() as i32);
+        if let Some(i) = idx(gx, gy, gz) {
+            let l = comps.label[i];
+            if l != u32::MAX {
+                return l as usize;
+            }
+        }
+        let mut best = u32::MAX;
+        let mut best_d = f32::MAX;
+        for dz in -3i32..=3 {
+            for dy in -3i32..=3 {
+                for dx in -3i32..=3 {
+                    if let Some(i) = idx(gx + dx, gy + dy, gz + dz) {
+                        let l = comps.label[i];
+                        if l != u32::MAX {
+                            let d = (dx * dx + dy * dy + dz * dz) as f32;
+                            if d < best_d {
+                                best_d = d;
+                                best = l;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if best != u32::MAX {
+            return best as usize;
+        }
+        /* Совсем пусто рядом — по ближайшему центру габарита области. */
+        let mut bi = 0usize;
+        let mut bd = f32::MAX;
+        for (k, (lo, hi)) in comps.bounds.iter().enumerate() {
+            let c = [
+                (lo[0] + hi[0]) as f32 * 0.5,
+                (lo[1] + hi[1]) as f32 * 0.5,
+                (lo[2] + hi[2]) as f32 * 0.5,
+            ];
+            let d = (c[0] - cx).powi(2) + (c[1] - cy).powi(2) + (c[2] - cz).powi(2);
+            if d < bd {
+                bd = d;
+                bi = k;
+            }
+        }
+        bi
+    }
+
+    /// Разбить тело на СВЯЗНЫЕ части по занятости его поля.
+    ///
+    /// `None` — тело связное (одна область) или поля нет; `Some(parts)` —
+    /// поле распалось на несколько несвязных кусков, частей не меньше двух.
+    ///
+    /// `min_gap` — допуск связности (см. [`field::components`]), `pad` — сколько
+    /// узлов ПУСТОТЫ оставить вокруг каждой части: марчингу нужны внешние узлы,
+    /// иначе срез выходит «впуклым» (то же правило, что в `shatter_fields`).
+    ///
+    /// Теты делятся по ЦЕНТРОИДУ, как в `shatter_fields`: каждый родительский
+    /// тет уходит РОВНО в одну часть, поэтому сумма объёмов частей равна
+    /// объёму родителя — масса сохраняется точно, без квантования по решётке.
+    pub fn split_disconnected(&self, min_gap: i32, pad: i32) -> Option<Vec<TetBody>> {
+        let f = self.sdf();
+        let comps = field::components(f, min_gap);
+        if comps.count() < 2 {
+            return None;
+        }
+        let mut buckets: Vec<Vec<Tet>> = vec![Vec::new(); comps.count()];
+        for t in &self.tets {
+            let k = self.part_of_tet(t, f, &comps);
+            buckets[k].push(*t);
+        }
+        let pad = pad.max(1);
+        let mut out: Vec<TetBody> = Vec::with_capacity(buckets.len());
+        /* Области БЕЗ тетов — шум поля (одиночные узлы у среза): массы у них
+         * нет, тела из них не сделать. Считаем их разом, чтобы не заливать
+         * лог строкой на каждый осколок. */
+        let mut noise_areas = 0usize;
+        let mut noise_nodes = 0usize;
+        for (k, tets) in buckets.into_iter().enumerate() {
+            if tets.is_empty() {
+                noise_areas += 1;
+                noise_nodes += comps.sizes[k];
+                continue;
+            }
+            let (blo, bhi) = comps.bounds[k];
+            /* Бокс части: её габарит плюс `pad` узлов пустоты. Обрезка по
+             * границам родителя — внутри `field::crop`. */
+            let lo = [blo[0] - pad, blo[1] - pad, blo[2] - pad];
+            let dims = [
+                (bhi[0] - blo[0] + 1 + 2 * pad) as usize,
+                (bhi[1] - blo[1] + 1 + 2 * pad) as usize,
+                (bhi[2] - blo[2] + 1 + 2 * pad) as usize,
+            ];
+            let mut part = field::crop(f, lo, dims);
+            /* Чужие области, попавшие в бокс, гасим в ПЛЮС: иначе их
+             * отрицательные узлы дадут в поле части вторую изоповерхность
+             * (меш с дырой и лишним куском). Знак переворачиваем, а не ставим
+             * «далеко»: так в поле не появляется НОВОГО перехода через ноль —
+             * все перевёрнутые узлы положительные, а своих отрицательных узлов
+             * у чужой области в боксе больше нет. */
+            let (pnx, pny) = (part.dims[0], part.dims[1]);
+            for z in 0..part.dims[2] {
+                for y in 0..pny {
+                    for x in 0..pnx {
+                        let (gx, gy, gz) = (
+                            part.lo[0] + x as i32,
+                            part.lo[1] + y as i32,
+                            part.lo[2] + z as i32,
+                        );
+                        let si = (((gz - f.lo[2]) as usize) * f.dims[1]
+                            + ((gy - f.lo[1]) as usize))
+                            * f.dims[0]
+                            + ((gx - f.lo[0]) as usize);
+                        let l = comps.label[si];
+                        if l != u32::MAX && l != k as u32 {
+                            let i = (z * pny + y) * pnx + x;
+                            part.val[i] = part.val[i].abs().max(0.5);
+                        }
+                    }
+                }
+            }
+            let body = TetBody {
+                tets,
+                level_cap: self.level_cap,
+                origin: self.origin,
+                sdf: Default::default(),
+            };
+            let _ = body.sdf.set(part);
+            out.push(body);
+        }
+        if out.len() < 2 {
+            return None;
+        }
+        /* Шум гасим молча, когда областей много и все они мелкие (узлы у
+         * среза); крупную «область без тетов» показываем — это уже потеря
+         * массы или кривое поле. */
+        if noise_areas > 0 && noise_nodes > 8 {
+            eprintln!(
+                "DIAG split_disconnected: {noise_areas} областей без тетов ({noise_nodes} узлов) погашены как шум поля"
+            );
+        }
+        Some(out)
+    }
+
     /// Тетраэдры в локальных координатах (относительно центроида) — для
     /// столкновений и для показа самих тетраэдров во вьюере.
     pub fn local_tets(&self) -> Vec<[[f32; 3]; 4]> {
@@ -2949,5 +3115,182 @@ mod rot_check {
             top_max <= 1e-3,
             "верхняя грань не плоская: {top_max} м (это ошибка в значениях поля, не геометрия)"
         );
+    }
+}
+
+#[cfg(test)]
+mod connectivity_tests {
+    //! Разбиение НЕСВЯЗНЫХ тел: аналитические случаи (два шара с перемычкой
+    //! тоньше шага, куб с дыркой, два шара без перемычки), сохранение массы и
+    //! свои боксы поля у каждой части.
+    use super::*;
+    use std::collections::HashSet;
+
+    fn ball_nodes(c: Node, r: i32) -> Vec<Node> {
+        let mut out = Vec::new();
+        for z in c.2 - r..=c.2 + r {
+            for y in c.1 - r..=c.1 + r {
+                for x in c.0 - r..=c.0 + r {
+                    let (dx, dy, dz) = (x - c.0, y - c.1, z - c.2);
+                    if dx * dx + dy * dy + dz * dz <= r * r {
+                        out.push((x, y, z));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn box_nodes(lo: Node, hi: Node) -> Vec<Node> {
+        let mut out = Vec::new();
+        for z in lo.2..=hi.2 {
+            for y in lo.1..=hi.1 {
+                for x in lo.0..=hi.0 {
+                    out.push((x, y, z));
+                }
+            }
+        }
+        out
+    }
+
+    /// Теты тела по занятым узлам: 24 тета вокруг каждого узла плюс глобальный
+    /// дедуп по каноническому ключу (как в `TetBody::cube`).
+    fn tets_of(nodes: &[Node]) -> Vec<Tet> {
+        let mut seen: HashSet<[Node; 4]> = HashSet::new();
+        let mut out = Vec::new();
+        for &n in nodes {
+            for t in bcc_tets_at_dedup(n) {
+                if seen.insert(tet_key(&t)) {
+                    out.push(Tet { level: 0, v: t });
+                }
+            }
+        }
+        out
+    }
+
+    /// Тело из занятых узлов: поле строится по ним же, шаг поля равен шагу
+    /// узлов тетов (как у настоящего тела, иначе центроиды уедут).
+    fn body_of(nodes: &[Node], pad: i32) -> TetBody {
+        let mut f = field::from_occupied(nodes.iter().copied(), pad);
+        f.step = node_step(0);
+        let mut b = TetBody {
+            tets: tets_of(nodes),
+            level_cap: 0,
+            origin: [0.0; 3],
+            sdf: Default::default(),
+        };
+        let _ = b.sdf.set(f);
+        b
+    }
+
+    /// Два шара С ПЕРЕМЫЧКОЙ ТОНЬШЕ ШАГА поля: в поле это две раздельные
+    /// области (перемычка не заняла ни одного узла), значит тело обязано
+    /// распасться на два, а объём (масса) — остаться у суммы частей.
+    #[test]
+    fn thin_bridge_splits_into_two_and_keeps_volume() {
+        let mut occ = ball_nodes((8, 12, 12), 5);
+        occ.extend(ball_nodes((28, 12, 12), 5));
+        let body = body_of(&occ, 4);
+        let v_parent = body.volume();
+        let parts = body
+            .split_disconnected(1, 3)
+            .expect("несвязное поле обязано разбиться");
+        assert_eq!(parts.len(), 2, "два шара — два тела");
+        let v_sum: f64 = parts.iter().map(|p| p.volume()).sum();
+        assert!(
+            (v_sum - v_parent).abs() <= v_parent * 0.01,
+            "объём не сохранился: {v_sum} против {v_parent} ({:.2}%)",
+            (v_sum - v_parent).abs() / v_parent * 100.0
+        );
+        /* У каждой части СВОЙ бокс: меньше узлов, чем у родителя, и ровно одна
+         * занятая область (чужой кусок в бокс не попал или погашен). */
+        let parent_nodes = body.sdf().val.len();
+        for (k, p) in parts.iter().enumerate() {
+            let f = p.sdf();
+            assert!(
+                f.val.len() < parent_nodes,
+                "часть {k} несёт бокс родителя: {} узлов",
+                f.val.len()
+            );
+            let c = field::components(f, 1);
+            assert_eq!(c.count(), 1, "в поле части {k} осталось {} области", c.count());
+        }
+        /* Два шара далеко друг от друга: бокс одной части не накрывает центр
+         * другой. */
+        let f0 = parts[0].sdf();
+        let f1 = parts[1].sdf();
+        let inside = |f: &field::NodeField, p: Node| {
+            let a = [p.0, p.1, p.2];
+            (0..3).all(|k| a[k] >= f.lo[k] && a[k] <= f.lo[k] + f.dims[k] as i32 - 1)
+        };
+        assert!(
+            !inside(f0, (28, 12, 12)) && !inside(f1, (8, 12, 12)),
+            "бокс одной части накрывает чужой шар"
+        );
+    }
+
+    /// Два шара БЕЗ перемычки — тоже два тела (тот же механизм, другая форма).
+    #[test]
+    fn two_balls_without_bridge_split() {
+        let mut occ = ball_nodes((8, 12, 12), 4);
+        occ.extend(ball_nodes((24, 12, 12), 4));
+        let body = body_of(&occ, 4);
+        let parts = body.split_disconnected(1, 3).expect("два шара — два тела");
+        assert_eq!(parts.len(), 2);
+        let v_parent = body.volume();
+        let v_sum: f64 = parts.iter().map(|p| p.volume()).sum();
+        assert!((v_sum - v_parent).abs() <= v_parent * 0.01);
+    }
+
+    /// Куб С ДЫРКОЙ (полость внутри) — одно тело: не режем.
+    #[test]
+    fn cube_with_hole_is_not_split() {
+        let mut occ = box_nodes((2, 2, 2), (18, 18, 18));
+        occ.retain(|&(x, y, z)| !(x > 6 && x < 14 && y > 6 && y < 14 && z > 6 && z < 14));
+        let body = body_of(&occ, 4);
+        assert!(
+            body.split_disconnected(1, 3).is_none(),
+            "куб с дыркой обязан остаться одним телом"
+        );
+    }
+
+    /// Цельный куб не делится вообще.
+    #[test]
+    fn solid_cube_is_not_split() {
+        let b = TetBody::cube([0.0, 0.0, 0.0], 4, 1);
+        assert!(b.split_disconnected(1, 3).is_none(), "цельный куб разрезан быть не должен");
+    }
+
+    /// Три куска — три тела, объём сохранён.
+    #[test]
+    fn three_parts_make_three_bodies() {
+        let mut occ = ball_nodes((6, 12, 12), 4);
+        occ.extend(ball_nodes((22, 12, 12), 4));
+        occ.extend(ball_nodes((14, 12, 26), 4));
+        let body = body_of(&occ, 4);
+        let parts = body.split_disconnected(1, 3).expect("три шара — три тела");
+        assert_eq!(parts.len(), 3);
+        let v_parent = body.volume();
+        let v_sum: f64 = parts.iter().map(|p| p.volume()).sum();
+        assert!((v_sum - v_parent).abs() <= v_parent * 0.01);
+        for p in &parts {
+            assert!(!p.tets.is_empty(), "часть без тетов — потеря массы");
+        }
+    }
+
+    /// Меш каждой части замкнут: в поле части нет второй изоповерхности от
+    /// чужого куска (иначе на срезе была бы дыра).
+    #[test]
+    fn parts_meshes_are_closed() {
+        let mut occ = ball_nodes((8, 12, 12), 5);
+        occ.extend(ball_nodes((26, 12, 12), 5));
+        let body = body_of(&occ, 4);
+        let parts = body.split_disconnected(1, 3).expect("два шара — два тела");
+        for (k, p) in parts.iter().enumerate() {
+            let m = p.surface();
+            let open = super::marching_tests::closedness(&m);
+            assert_eq!(open, 0, "меш части {k} не замкнут: {open} рёбер непарные");
+            assert!(mesh_volume(&m).abs() > 0.0, "меш части {k} пуст");
+        }
     }
 }
