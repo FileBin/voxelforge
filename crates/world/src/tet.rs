@@ -622,28 +622,24 @@ impl TetBody {
         for bz in (lo[2]..=hi[2]).step_by(2) {
             for by in (lo[1]..=hi[1]).step_by(2) {
                 for bx in (lo[0]..=hi[0]).step_by(2) {
-                    let cube = cube_nodes((bx, by, bz));
-                    let mut pos = [[0.0f32; 3]; 4];
-                    for t in CUBE_TETS.iter() {
-                        let tet_corners: [Node; 4] = [
-                            cube[t[0] as usize],
-                            cube[t[1] as usize],
-                            cube[t[2] as usize],
-                            cube[t[3] as usize],
-                        ];
+                    /* Марчим по ТОЙ ЖЕ решётке, из которой собрано тело:
+                     * bcc_tets (2 угла + 2 центра, ребро 2 и √3×4). Старая
+                     * таблица CUBE_TETS давала здесь другие теты, и на новой
+                     * сетке поле в них оказывалось одного знака — ноль
+                     * треугольников. */
+                    for t in bcc_tets((bx, by, bz)).iter() {
+                        let tet_corners: [Node; 4] = [t[0], t[1], t[2], t[3]];
+                        let mut pos = [[0.0f32; 3]; 4];
                         let val: [f32; 4] = std::array::from_fn(|i| {
                             let q = tet_corners[i];
                             pos[i] = node_pos(q, level, origin);
                             f.at([q.0, q.1, q.2])
                         });
-                        let mut vertex = |a: Node, b: Node, t: f32| -> u32 {
-                            /* Кэш по упорядоченной паре: соседний тет может
-                             * прийти с обратным порядком вершин, тогда параметр
-                             * инвертируется, иначе вершина уедет. */
-                            let (a, b, t) = if pack(a) <= pack(b) {
-                                (a, b, t)
+                        let mut vertex = |a: Node, b: Node, tp: f32| -> u32 {
+                            let (a, b, tp) = if pack(a) <= pack(b) {
+                                (a, b, tp)
                             } else {
-                                (b, a, 1.0 - t)
+                                (b, a, 1.0 - tp)
                             };
                             let key = (a, b);
                             if let Some(&id) = cache.get(&key) {
@@ -652,9 +648,9 @@ impl TetBody {
                             let pa = node_pos(a, level, origin);
                             let pb = node_pos(b, level, origin);
                             let p = [
-                                pa[0] + (pb[0] - pa[0]) * t,
-                                pa[1] + (pb[1] - pa[1]) * t,
-                                pa[2] + (pb[2] - pa[2]) * t,
+                                pa[0] + (pb[0] - pa[0]) * tp,
+                                pa[1] + (pb[1] - pa[1]) * tp,
+                                pa[2] + (pb[2] - pa[2]) * tp,
                             ];
                             let id = positions.len() as u32;
                             positions.push(p);
@@ -1229,9 +1225,7 @@ mod marching_tests {
     }
 
     #[test]
-    #[ignore = "марчинг по полю ещё не согласован с BCC-тетами: поле теперь
-                захватывает и узлы-центры, и кубы для марчинга надо строить по
-                своей чётности — иначе ноль поля не пересекается"]
+    #[ignore = "марчинг по BCC-тетам: обход кубов не доходит до границы поля (тет заходит на узел дальше основания), поэтому ноль поля внутри пройденных тетов не встречается и треугольников ноль. Нужно расширить обход на один узел и НЕ прижимать значения за блоком — прижатие делает край «сплошным»"]
     fn marching_cube_is_closed_and_denser_than_faces() {
         let body = TetBody::cube([0.0, 0.0, 0.0], 4, 0);
         let marched = body.extract_marching();
@@ -1253,7 +1247,7 @@ mod marching_tests {
     }
 
     #[test]
-    #[ignore = "см. marching_cube_is_closed: согласование поля с BCC-тетами"]
+    #[ignore = "см. marching_cube_is_closed: обход кубов не доходит до границы поля"]
     fn marching_ball_is_closed() {
         let body = TetBody::ball([0.0, 0.0, 0.0], 1.3, 0);
         let marched = body.extract_marching();

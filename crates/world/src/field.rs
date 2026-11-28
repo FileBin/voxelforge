@@ -29,9 +29,13 @@ pub struct NodeField {
 impl NodeField {
     #[inline]
     pub fn at(&self, p: [i32; 3]) -> f32 {
-        let x = (p[0] - self.lo[0]) as usize;
-        let y = (p[1] - self.lo[1]) as usize;
-        let z = (p[2] - self.lo[2]) as usize;
+        /* Узлы за блоком прижимаем к краю: марчинг по BCC-тетам заходит за
+         * границу куба (тет занимает две ячейки), и без прижатия это выход за
+         * массив. Поверхность всё равно лежит внутри блока. */
+        let cl = |v: i32, lo: i32, n: usize| (v - lo).clamp(0, n as i32 - 1) as usize;
+        let x = cl(p[0], self.lo[0], self.dims[0]);
+        let y = cl(p[1], self.lo[1], self.dims[1]);
+        let z = cl(p[2], self.lo[2], self.dims[2]);
         self.val[(z * self.dims[1] + y) * self.dims[0] + x]
     }
 
