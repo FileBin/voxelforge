@@ -58,6 +58,16 @@ impl LiveBody {
             }
             b
         };
+        {
+            let m = tb.surface();
+            println!(
+                "[body {}] поле SDF: {} · тетов {} · треугольников {}",
+                self.id,
+                if tb.sdf.get().is_some() { "ЕСТЬ" } else { "НЕТ — вывод из тетов" },
+                self.tets.len(),
+                m.triangles()
+            );
+        }
         let c = tb.world_centroid();
         self.local = self
             .tets
