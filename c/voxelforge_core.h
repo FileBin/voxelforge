@@ -25,7 +25,9 @@ typedef struct vf_buffer vf_buffer;
 typedef struct vf_pipeline vf_pipeline;
 
 /* Один dispatch: пайплайн, его storage-буферы по порядку привязки,
- * push-константы и число рабочих групп. */
+ * push-константы и число рабочих групп. `stage` — произвольный номер стадии,
+ * который хост хочет видеть в диагностике производительности (ядро его не
+ * толкует, только возвращает вместе с таймстемпами). */
 typedef struct {
     vf_pipeline *pipeline;
     vf_buffer **buffers;
@@ -33,6 +35,7 @@ typedef struct {
     const void *push;
     uint32_t push_bytes;
     uint32_t groups[3];
+    uint32_t stage;
 } vf_dispatch;
 
 vf_status vf_init(vf_ctx **out);
@@ -93,6 +96,31 @@ vf_status vf_run(vf_ctx *c, vf_dispatch *list, uint32_t count);
  * такта читается следующим — после vf_wait_back(c, 1). */
 vf_status vf_run_async(vf_ctx *c, vf_dispatch *list, uint32_t count);
 vf_status vf_wait_back(vf_ctx *c, uint32_t back);
+
+/* --- диагностика производительности: GPU-таймстемпы по диспатчам такта ---
+ *
+ * Когда сбор включён, в тот же command buffer между диспатчами пишутся
+ * vkCmdWriteTimestamp (count+1 метка: до первого и после каждого), а в конце
+ * они копируются в host-visible буфер. Внутри такта НИЧЕГО не ждётся, поэтому
+ * включение не сериализует пайплайн: результат забирается на следующем такте,
+ * после fence. Выключено по умолчанию — при выключенном сборе в command buffer
+ * не попадает ни одной лишней команды.
+ *
+ * `vf_perf_supported` — 1, если драйвер умеет таймстемпы compute-очереди
+ * (timestampComputeAndGraphics && timestampValidBits > 0 && period > 0).
+ * Попытка включить при неподдерживаемом драйвере возвращает ошибку и печатает
+ * причину в stderr: молча «нулевых» чисел не бывает. */
+int vf_perf_supported(vf_ctx *c);
+vf_status vf_perf_enable(vf_ctx *c, int on);
+int vf_perf_on(vf_ctx *c);
+
+/* Результаты последнего ЗАКРЫТОГО такта (back = 0 — только что отправленный,
+ * 1 — предыдущий). Заполняет ms[k] (мс) и stage[k] (номер стадии из
+ * vf_dispatch.stage) для первых max диспатчей, *tick_ms — время всего такта от
+ * первой метки до последней. Возвращает число диспатчей или -1, если данных
+ * нет (сбор выключен, такт ещё не закрыт или слот уже переиспользован). */
+int vf_perf_read(vf_ctx *c, uint32_t back, float *ms, uint32_t *stage, int max,
+                 float *tick_ms);
 
 #ifdef __cplusplus
 }

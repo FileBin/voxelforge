@@ -20,6 +20,9 @@
  * статистику прошлого такта, пока считаются следующие один-два. */
 #define VF_FRAMES 3
 #define VF_MAX_SETS 8192
+/* Потолок диспатчей на такт для диагностики стадий. Реальный такт сейчас
+ * укладывается в ~700 (куски × подшаги × итерации), 2048 — с запасом. */
+#define VF_PERF_MAX 2048
 
 #define OK ((vf_status){0, "ok"})
 #define ERR(code, text) ((vf_status){(code), (text)})
@@ -54,6 +57,23 @@ struct vf_ctx {
     uint32_t submitted;
     VkDescriptorPool desc_pool;
     VkPhysicalDeviceMemoryProperties memp;
+    /* Диагностика стадий такта (VF_PERF / F3). Пул запросов СВОЙ на слот
+     * кольца: сбрасывать общий пул, пока предыдущий такт ещё пишет в него
+     * метки, — гонка; со своим слот не переиспользуется до fence. */
+    VkQueryPool qpool[VF_FRAMES];
+    vf_buffer *tsbuf[VF_FRAMES];
+    uint32_t perf;        /* сбор включён хостом */
+    uint32_t perf_ok;     /* драйвер умеет таймстемпы на этой очереди */
+    uint32_t perf_warned; /* про переполнение VF_PERF_MAX уже сообщили */
+    float period_ms;      /* timestampPeriod (нс) -> мс на тик */
+    uint32_t ts_bits;     /* timestampValidBits семейства очереди */
+    int timestamp_cg;     /* limits.timestampComputeAndGraphics */
+    /* Что именно отправлено в слот: число диспатчей, их номера стадий и
+     * индекс submit'а. Хост-сторона заполняет при отправке, читает после
+     * fence — данные GPU для этого не нужны. */
+    uint32_t perf_n[VF_FRAMES];
+    uint32_t perf_stage[VF_FRAMES][VF_PERF_MAX];
+    uint64_t perf_id[VF_FRAMES];
     /* Очередь одна и на физику, и на кадр: submit'ы из двух потоков
      * взаимоисключающие. Fence ждём вне замка. */
     pthread_mutex_t lock;
@@ -136,6 +156,7 @@ vf_status vf_init_ext(vf_ctx **out, const char **inst_ext, uint32_t n_ext,
             if ((qf[q].queueFlags & want) == want) {
                 c->phys = devs[i];
                 c->family = q;
+                c->ts_bits = qf[q].timestampValidBits;
                 break;
             }
         }
@@ -195,6 +216,28 @@ vf_status vf_init_ext(vf_ctx **out, const char **inst_ext, uint32_t n_ext,
     VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     for (int i = 0; i < VF_FRAMES; i++) vkCreateFence(c->dev, &fci, NULL, &c->fence[i]);
 
+    /* Диагностика стадий: пул запросов и host-visible буфер на каждый слот.
+     * Всё это — необязательная часть: если драйвер не умеет таймстемпы на
+     * compute-очереди, честно помечаем сбор недоступным и живём дальше. */
+    c->period_ms = props.limits.timestampPeriod * 1e-6f;
+    c->timestamp_cg = props.limits.timestampComputeAndGraphics == VK_TRUE;
+    c->perf_ok = c->timestamp_cg && c->ts_bits > 0 && props.limits.timestampPeriod > 0.0f;
+    if (c->perf_ok) {
+        VkQueryPoolCreateInfo qpci = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qpci.queryCount = VF_PERF_MAX;
+        for (int i = 0; i < VF_FRAMES; i++) {
+            if (vkCreateQueryPool(c->dev, &qpci, NULL, &c->qpool[i]) != VK_SUCCESS ||
+                vf_buffer_new(c, (VF_PERF_MAX + 1) * sizeof(uint64_t), 1, &c->tsbuf[i])
+                        .code != 0) {
+                fprintf(stderr, "[perf] таймстемпы: пул/буфер слота %d не создался\n", i);
+                c->perf_ok = 0;
+                break;
+            }
+            c->perf_id[i] = UINT64_MAX;
+        }
+    }
+
     VkDescriptorPoolSize sz = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VF_MAX_SETS * VF_MAX_BINDINGS};
     VkDescriptorPoolCreateInfo dpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpci.maxSets = VF_MAX_SETS;
@@ -212,6 +255,10 @@ vf_status vf_init_ext(vf_ctx **out, const char **inst_ext, uint32_t n_ext,
 void vf_shutdown(vf_ctx *c) {
     if (!c) return;
     if (c->dev) vkDeviceWaitIdle(c->dev);
+    for (int i = 0; i < VF_FRAMES; i++) {
+        if (c->qpool[i] && c->dev) vkDestroyQueryPool(c->dev, c->qpool[i], NULL);
+        if (c->tsbuf[i]) vf_buffer_free(c, c->tsbuf[i]);
+    }
     if (c->desc_pool) vkDestroyDescriptorPool(c->dev, c->desc_pool, NULL);
     for (int i = 0; i < VF_FRAMES; i++) {
         if (c->fence[i]) vkDestroyFence(c->dev, c->fence[i], NULL);
@@ -446,11 +493,35 @@ static vf_status submit(vf_ctx *c, vf_dispatch *list, uint32_t count, int wait_n
     if (vkBeginCommandBuffer(c->cb[slot], &bi) != VK_SUCCESS)
         return ERR(-2, "vulkan: command buffer не начался");
 
+    /* Таймстемпы стадий: count+1 метка (до первого диспатча и после каждого).
+     * Метка пишется с ALL_COMMANDS — она честно ждёт окончания предыдущей
+     * стадии вместе с барьером, поэтому разность соседних меток и есть время
+     * стадии. Копирование в host-visible буфер идёт последней командой: без
+     * WAIT_BIT оно не останавливает GPU, а к fence результат уже готов. */
+    int perf = c->perf && c->perf_ok;
+    if (perf && count + 1 > VF_PERF_MAX) {
+        if (!c->perf_warned) {
+            fprintf(stderr, "[perf] такт из %u диспатчей > %d: стадии не меряю\n",
+                    count, VF_PERF_MAX);
+            c->perf_warned = 1;
+        }
+        perf = 0;
+    }
+    if (perf) {
+        vkCmdResetQueryPool(c->cb[slot], c->qpool[slot], 0, count + 1);
+        vkCmdWriteTimestamp(c->cb[slot], VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                            c->qpool[slot], 0);
+    }
+
     for (uint32_t d = 0; d < count; d++) {
         vf_dispatch *dp = &list[d];
         if (!dp->pipeline) return ERR(-3, "dispatch без пайплайна");
         if (dp->n_buffers != dp->pipeline->n_buffers)
             return ERR(-4, "число буферов не совпадает с пайплайном");
+        /* Конец предыдущей стадии = начало этой (после её барьера). */
+        if (perf && d > 0)
+            vkCmdWriteTimestamp(c->cb[slot], VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                c->qpool[slot], d);
 
         VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
         ai.descriptorPool = c->desc_pool;
@@ -492,9 +563,26 @@ static vf_status submit(vf_ctx *c, vf_dispatch *list, uint32_t count, int wait_n
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     }
 
+    /* Последняя метка и копирование результатов. Порядок в буфере: count+1
+     * метка, затем по одной на каждый диспатч. */
+    if (perf) {
+        vkCmdWriteTimestamp(c->cb[slot], VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                            c->qpool[slot], count);
+        vkCmdCopyQueryPoolResults(c->cb[slot], c->qpool[slot], 0, count + 1,
+                                  c->tsbuf[slot]->buf, 0, sizeof(uint64_t),
+                                  VK_QUERY_RESULT_64_BIT);
+        c->perf_n[slot] = count;
+        for (uint32_t d = 0; d < count; d++) c->perf_stage[slot][d] = list[d].stage;
+        /* Индекс этого submit'а: по нему vf_perf_read отличает свежие данные
+         * от уже перезаписанных следующим тактом. */
+        c->perf_id[slot] = c->submitted;
+    } else {
+        c->perf_n[slot] = 0;
+        c->perf_id[slot] = UINT64_MAX;
+    }
+
     if (vkEndCommandBuffer(c->cb[slot]) != VK_SUCCESS)
         return ERR(-6, "vulkan: command buffer не закрылся");
-
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &c->cb[slot];
@@ -537,4 +625,61 @@ vf_status vf_wait_back(vf_ctx *c, uint32_t back) {
     if (vkWaitForFences(c->dev, 1, &c->fence[slot], VK_TRUE, UINT64_MAX) != VK_SUCCESS)
         return ERR(-8, "vulkan: fence не дождались");
     return OK;
+}
+
+/* ---------------------------------------------------------------- диагностика */
+
+int vf_perf_supported(vf_ctx *c) { return c && c->perf_ok; }
+
+int vf_perf_on(vf_ctx *c) { return c && c->perf && c->perf_ok; }
+
+vf_status vf_perf_enable(vf_ctx *c, int on) {
+    if (!c) return ERR(-1, "нет контекста");
+    if (!on) {
+        c->perf = 0;
+        fprintf(stderr, "[perf] сбор стадий выключен\n");
+        return OK;
+    }
+    if (!c->perf_ok) {
+        fprintf(stderr,
+                "[perf] GPU-таймстемпы недоступны: timestampComputeAndGraphics=%d, "
+                "timestampValidBits=%u, timestampPeriod=%.3f нс — сбор выключен\n",
+                c->timestamp_cg, c->ts_bits, (double)c->period_ms * 1e6);
+        return ERR(-12, "таймстемпы не поддерживаются на этой очереди");
+    }
+    c->perf = 1;
+    fprintf(stderr,
+            "[perf] GPU-таймстемпы включены: %s · период %.3f нс · validBits %u · такт до %d стадий\n",
+            c->name, (double)c->period_ms * 1e6, c->ts_bits, VF_PERF_MAX);
+    return OK;
+}
+
+int vf_perf_read(vf_ctx *c, uint32_t back, float *ms, uint32_t *stage, int max,
+                 float *tick_ms) {
+    if (!c || !c->perf || !c->perf_ok || !ms || !stage || max <= 0) return -1;
+    if (c->submitted == 0 || back + 1 > c->submitted) return -1;
+    uint64_t id = (uint64_t)c->submitted - 1 - back;
+    uint32_t slot = (uint32_t)(id % VF_FRAMES);
+    /* Слот успел уйти под следующий такт — данные этого уже потеряны. */
+    if (c->perf_id[slot] != id || c->perf_n[slot] == 0) return -1;
+
+    uint32_t n = c->perf_n[slot];
+    uint64_t ts[VF_PERF_MAX + 1];
+    if (vf_buffer_read(c, c->tsbuf[slot], 0, ts, (size_t)(n + 1) * sizeof(uint64_t)).code != 0)
+        return -1;
+
+    uint32_t out = n < (uint32_t)max ? n : (uint32_t)max;
+    uint64_t total = 0;
+    for (uint32_t k = 0; k < out; k++) {
+        /* Обратный ход метки — не «минус время», а мусор: 0 честнее. */
+        uint64_t d = ts[k + 1] >= ts[k] ? ts[k + 1] - ts[k] : 0;
+        total += d;
+        ms[k] = (float)d * c->period_ms;
+        stage[k] = c->perf_stage[slot][k];
+    }
+    /* Время такта — СУММА соседних разностей, а не ts[n] - ts[0]: у драйверов
+     * с 32 значащими битами метка за такт может переполниться, и прямая
+     * разность даёт ноль, а сумма дельт остаётся верной. */
+    if (tick_ms) *tick_ms = (float)total * c->period_ms;
+    return (int)out;
 }

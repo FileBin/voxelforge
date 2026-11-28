@@ -34,6 +34,7 @@ struct VfInput {
     key_r: i32,
     key_t: i32,
     key_f: i32,
+    key_f3: i32,
     key_w: i32,
     key_a: i32,
     key_s: i32,
@@ -242,6 +243,8 @@ struct Shared {
     shards: usize,
     alive: usize,
     lines_on: bool,
+    /// Диагностика стадий включена (F3 / VF_PERF=1): показывать оверлей.
+    perf_on: bool,
     log: String,
 }
 
@@ -249,6 +252,8 @@ enum Cmd {
     Shoot([f64; 3], [f64; 3], f64),
     Reset,
     SetLines(bool),
+    /// F3: включить/выключить диагностику стадий (таблица + оверлей).
+    TogglePerf,
 }
 
 struct SnapOut {
@@ -262,6 +267,7 @@ struct SnapOut {
     shards: usize,
     alive: usize,
     lines_on: bool,
+    perf_on: bool,
     log: String,
     near: f32,
     far: f32,
@@ -360,6 +366,7 @@ impl Sim {
             shards: 0,
             alive: 0,
             lines_on,
+            perf_on: live.gpu.perf_on(),
             log: String::new(),
         }));
         let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
@@ -382,6 +389,10 @@ impl Sim {
                         }
                         Cmd::Reset => live.reset(),
                         Cmd::SetLines(on) => live.lines_on = on,
+                        Cmd::TogglePerf => {
+                            let on = live.gpu.perf_toggle();
+                            sh.lock().unwrap().perf_on = on;
+                        }
                     }
                 }
                 let now = std::time::Instant::now();
@@ -434,6 +445,7 @@ impl Sim {
                         g.shards = live.shards_made;
                         g.alive = live.alive_count();
                         g.lines_on = live.lines_on;
+                        g.perf_on = live.gpu.perf_on();
                         if !live.last_log.is_empty() {
                             g.log = std::mem::take(&mut live.last_log);
                         }
@@ -482,6 +494,18 @@ impl Sim {
         }
     }
 
+    /// F3: включить/выключить диагностику стадий (консольная таблица и оверлей).
+    fn toggle_perf(&mut self) {
+        match self {
+            Sim::Direct(l) => {
+                l.gpu.perf_toggle();
+            }
+            Sim::Thread { tx, .. } => {
+                let _ = tx.send(Cmd::TogglePerf);
+            }
+        }
+    }
+
     fn first_pos(&self) -> [f64; 3] {
         match self {
             Sim::Direct(l) => l.bodies.first().map(|b| b.pos).unwrap_or([0.0; 3]),
@@ -525,6 +549,7 @@ impl Sim {
                     shards: l.shards_made,
                     alive: l.alive_count(),
                     lines_on: l.lines_on,
+                    perf_on: l.gpu.perf_on(),
                     log: String::new(),
                     near: l.near,
                     far: l.far,
@@ -576,6 +601,7 @@ impl Sim {
                     shards: g.shards,
                     alive: g.alive,
                     lines_on: g.lines_on,
+                    perf_on: g.perf_on,
                     log: std::mem::take(&mut g.log),
                     near: 0.0,
                     far: 60.0,
@@ -818,6 +844,9 @@ fn main() {
         if input.key_t != 0 {
             lines_on = !lines_on;
             sim.set_lines(lines_on);
+        }
+        if input.key_f3 != 0 {
+            sim.toggle_perf();
         }
         if input.key_r != 0 {
             sim.reset();

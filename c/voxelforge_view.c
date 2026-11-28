@@ -686,6 +686,11 @@ int vf_view_poll(vf_view *v, vf_input *in) {
             case SDLK_R: in->key_r = 1; break;
             case SDLK_T: in->key_t = 1; break;
             case SDLK_F: in->key_f = 1; break;
+            /* F3 — переключатель диагностики стадий (как в Minecraft). Автоповтор
+             * SDL не считаем: иначе удержание клавиши мигало бы таблицей. */
+            case SDLK_F3:
+                if (!e.key.repeat) in->key_f3 = 1;
+                break;
             case SDLK_ESCAPE: in->alive = 0; break;
             default: break;
             }

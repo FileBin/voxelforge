@@ -18,7 +18,7 @@ typedef struct vf_input {
     float wheel;    // прокрутка за кадр
     int lmb, rmb;   // кнопки сейчас
     int lmb_pressed;    // нажатие в этом кадре
-    int key_space, key_r, key_t, key_f;
+    int key_space, key_r, key_t, key_f, key_f3;
     int key_w, key_a, key_s, key_d, key_q, key_e;
     int shift, ctrl;
 } vf_input;

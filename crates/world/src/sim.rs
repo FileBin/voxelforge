@@ -22,6 +22,8 @@ pub struct VfDispatch {
     pub push: *const c_void,
     pub push_bytes: u32,
     pub groups: [u32; 3],
+    /// Номер стадии для диагностики (ядро возвращает его с таймстемпом).
+    pub stage: u32,
 }
 
 unsafe extern "C" {
@@ -63,6 +65,19 @@ unsafe extern "C" {
     /// Отправить такт и не ждать: результат читается на следующем.
     pub fn vf_run_async(c: *mut c_void, list: *mut VfDispatch, count: u32) -> VfStatus;
     pub fn vf_wait_back(c: *mut c_void, back: u32) -> VfStatus;
+
+    /* Диагностика стадий: таймстемпы по диспатчам такта. Значения читаются
+     * на СЛЕДУЮЩЕМ такте (после fence), поэтому сбор не тормозит пайплайн. */
+    pub fn vf_perf_supported(c: *mut c_void) -> i32;
+    pub fn vf_perf_enable(c: *mut c_void, on: i32) -> VfStatus;
+    pub fn vf_perf_read(
+        c: *mut c_void,
+        back: u32,
+        ms: *mut f32,
+        stage: *mut u32,
+        max: i32,
+        tick_ms: *mut f32,
+    ) -> i32;
 }
 
 pub fn check_status(s: VfStatus, what: &str) {
@@ -189,6 +204,48 @@ const P_SDFFILL: usize = 28;
 const P_SDFCONTACT: usize = 29;
 /// Широкий проход SDF: пары ТЕЛ (не тетов).
 const P_SDFPAIRS: usize = 30;
+
+/// Имена пайплайнов в порядке `pipes` — ТОТ ЖЕ порядок, что у `P_*` выше и у
+/// массива `names` на устройстве. По этому индексу ядро возвращает номер
+/// стадии в диагностике производительности, поэтому список — единственный
+/// источник правды и для загрузки, и для таблицы.
+pub const PIPE_NAMES: [&str; 31] = [
+    "integrate",
+    "clear",
+    "count",
+    "scan",
+    "fill",
+    "static_contacts",
+    "broad",
+    "solve",
+    "sleep",
+    "integrate_pos",
+    "solve_contacts",
+    "solve_apply",
+    "sat",
+    "depenetrate",
+    "contact_select",
+    "tet_key",
+    "tet_scan",
+    "tet_fill",
+    "tet_pairs",
+    "impact",
+    "body_aabb",
+    "snapshot",
+    "stats",
+    "body_init",
+    "tet_blocksum",
+    "tet_blockprefix",
+    "tet_scan_p",
+    "tet_pairs_flat",
+    "sdf_fill",
+    "sdf_contact",
+    "sdf_pairs",
+];
+/// Число storage-буферов у каждого пайплайна — в том же порядке.
+const PIPE_BUFNS: [u32; 31] = [
+    1, 2, 2, 3, 4, 5, 5, 4, 1, 1, 4, 4, 7, 3, 2, 4, 3, 6, 8, 6, 4, 1, 2, 3, 2, 2, 4, 8, 1, 7, 5,
+];
 /// Ячеек на блок в параллельном скане (совпадает с 16 * 64 в шейдере).
 pub const SCAN_BLOCK: usize = 1024;
 /// Потолок изменений тел за одно событие (спавн/деспавн).
@@ -368,6 +425,12 @@ pub struct GpuSim {
     cursor: *mut c_void,
     cbody: *mut c_void,
     pipes: Vec<*mut c_void>,
+    /// Диагностика стадий такта: окно агрегации, строки для оверлея.
+    perf: crate::perf::Perf,
+    /// Переиспользуемые буферы под чтение таймстемпов (не аллоцируем каждый
+    /// такт; размер с запасом над VF_PERF_MAX ядра).
+    perf_ms: Vec<f32>,
+    perf_ids: Vec<u32>,
 }
 
 impl GpuSim {
@@ -497,41 +560,25 @@ impl GpuSim {
             );
         }
 
-        let names: [(&str, u32); 31] = [
-            ("integrate", 1),
-            ("clear", 2),
-            ("count", 2),
-            ("scan", 3),
-            ("fill", 4),
-            ("static_contacts", 5),
-            ("broad", 5),
-            ("solve", 4),
-            ("sleep", 1),
-            ("integrate_pos", 1),
-            ("solve_contacts", 4),
-            ("solve_apply", 4),
-            ("sat", 7),
-            ("depenetrate", 3),
-            ("contact_select", 2),
-            ("tet_key", 4),
-            ("tet_scan", 3),
-            ("tet_fill", 6),
-            ("tet_pairs", 8),
-            ("impact", 6),
-            ("body_aabb", 4),
-            ("snapshot", 1),
-            ("stats", 2),
-            ("body_init", 3),
-            ("tet_blocksum", 2),
-            ("tet_blockprefix", 2),
-            ("tet_scan_p", 4),
-            ("tet_pairs_flat", 8),
-            ("sdf_fill", 1),
-            ("sdf_contact", 7),
-            ("sdf_pairs", 5),
-        ];
+        /* Диагностика стадий: спрашиваем у драйвера, умеет ли он таймстемпы, и
+         * включаем сбор, если попросили VF_PERF=1. По умолчанию выключено:
+         * включённый сбор добавляет в такт count+1 метку и копирование. */
+        let perf_ok = unsafe { vf_perf_supported(ctx) } != 0;
+        let mut perf = crate::perf::Perf::new(perf_ok, false);
+        let want_perf = matches!(std::env::var("VF_PERF").as_deref(), Ok(v) if v != "0");
+        if want_perf {
+            let st = unsafe { vf_perf_enable(ctx, 1) };
+            if st.code == 0 {
+                perf.enabled = true;
+            } else {
+                let msg = unsafe { CStr::from_ptr(st.msg) }.to_string_lossy();
+                eprintln!("[perf] VF_PERF=1 не включился: {msg} — диагностика выключена");
+            }
+        }
+
         let mut pipes = Vec::new();
-        for (nm, nb) in names.iter() {
+        for (i, nm) in PIPE_NAMES.iter().enumerate() {
+            let nb = PIPE_BUFNS[i];
             let path = shader_dir.join(format!("{nm}.spv"));
             let bytes = std::fs::read(&path)
                 .unwrap_or_else(|e| panic!("нет {path:?}: {e} (соберите: glslc)"));
@@ -544,7 +591,7 @@ impl GpuSim {
                         ctx,
                         bytes.as_ptr() as *const u32,
                         bytes.len(),
-                        *nb,
+                        nb,
                         80,
                         cname.as_ptr(),
                         &mut p,
@@ -607,7 +654,68 @@ impl GpuSim {
             cursor,
             cbody,
             pipes,
+            perf,
+            perf_ms: vec![0.0; 4096],
+            perf_ids: vec![0; 4096],
         }
+    }
+
+    /// Включить/выключить сбор стадий (F3 в окне). Возвращает новое состояние.
+    /// При неподдерживаемом драйвере сбор не включается и причина печатается в
+    /// stderr — «нулевая» таблица вместо чисел не выводится.
+    pub fn perf_toggle(&mut self) -> bool {
+        let want = !self.perf.enabled;
+        let st = unsafe { vf_perf_enable(self.ctx, want as i32) };
+        if st.code != 0 {
+            if !st.msg.is_null() {
+                let msg = unsafe { CStr::from_ptr(st.msg) }.to_string_lossy();
+                eprintln!("[perf] включить не удалось: {msg}");
+            }
+            self.perf.enabled = false;
+            return false;
+        }
+        self.perf.enabled = want;
+        self.perf.restart_window();
+        if want {
+            println!("[perf] диагностика стадий включена (F3 выключает)");
+        }
+        want
+    }
+
+    pub fn perf_on(&self) -> bool {
+        self.perf.enabled
+    }
+
+    /// Строки последнего закрытого окна — для оверлея в окне.
+    pub fn perf_rows(&self) -> &[crate::perf::PerfRow] {
+        &self.perf.rows
+    }
+
+    /// Забрать таймстемпы последнего ЗАКРЫТОГО такта и раз в секунду напечатать
+    /// таблицу. Вызывать сразу после ожидания fence и ДО любого нового submit:
+    /// таймстемпы живут в слоте кольца и перезаписываются следующим тактом.
+    pub fn perf_sample(&mut self) {
+        if !self.perf.enabled {
+            return;
+        }
+        let mut tick_ms = 0.0f32;
+        let n = unsafe {
+            vf_perf_read(
+                self.ctx,
+                0,
+                self.perf_ms.as_mut_ptr(),
+                self.perf_ids.as_mut_ptr(),
+                self.perf_ms.len() as i32,
+                &mut tick_ms,
+            )
+        };
+        if n <= 0 {
+            return;
+        }
+        let n = n as usize;
+        self.perf
+            .record(&self.perf_ids[..n], &self.perf_ms[..n], tick_ms);
+        self.perf.maybe_print(std::time::Instant::now());
     }
 
     fn push(&self, h: f32, cell_groups: u32) -> Push {
@@ -911,6 +1019,7 @@ impl GpuSim {
                 push: &push_keep[k] as *const Push as *const c_void,
                 push_bytes: 80,
                 groups: s.groups,
+                stage: s.pipe as u32,
             })
             .collect();
         unsafe {
@@ -1052,6 +1161,7 @@ impl GpuSim {
                 push: &push_keep[i] as *const Push as *const c_void,
                 push_bytes: 80,
                 groups: s.groups,
+                stage: s.pipe as u32,
             })
             .collect();
         unsafe { check_status(vf_run(self.ctx, ds.as_mut_ptr(), ds.len() as u32), "vf_run") };
@@ -1285,6 +1395,7 @@ impl GpuSim {
                 push: &push_keep[k] as *const Push as *const c_void,
                 push_bytes: 80,
                 groups: s.groups,
+                stage: s.pipe as u32,
             })
             .collect();
         unsafe {
@@ -1356,6 +1467,7 @@ impl GpuSim {
                 push: &push_keep[k] as *const Push as *const c_void,
                 push_bytes: 80,
                 groups: s.groups,
+                stage: s.pipe as u32,
             })
             .collect();
         unsafe {
@@ -1390,6 +1502,7 @@ impl GpuSim {
                     push: &push_keep[k] as *const Push as *const c_void,
                     push_bytes: 80,
                     groups: s.groups,
+                    stage: s.pipe as u32,
                 })
                 .collect();
             unsafe {
@@ -1534,6 +1647,7 @@ impl GpuSim {
                 push: &push_keep[k] as *const Push as *const c_void,
                 push_bytes: 80,
                 groups: s.groups,
+                stage: s.pipe as u32,
             })
             .collect();
         unsafe {
@@ -1636,6 +1750,7 @@ impl GpuSim {
                 push: &push_keep[k] as *const Push as *const c_void,
                 push_bytes: std::mem::size_of::<Push>() as u32,
                 groups: s.groups,
+                stage: s.pipe as u32,
             })
             .collect();
         unsafe {
@@ -1801,6 +1916,7 @@ impl GpuSim {
             push: &push as *const Push as *const c_void,
             push_bytes: 80,
             groups: [((n as u32) + 15) / 16, 1, 1],
+            stage: P_BODYINIT as u32,
         };
         unsafe {
             check_status(vf_run(self.ctx, &mut d, 1), "write_slots");
@@ -2020,6 +2136,7 @@ impl GpuSim {
             push: &push as *const SdfPush as *const c_void,
             push_bytes: std::mem::size_of::<SdfPush>() as u32,
             groups: [(n as u32).div_ceil(64), 1, 1],
+            stage: P_SDFFILL as u32,
         }];
         unsafe {
             check_status(vf_run(self.ctx, ds.as_mut_ptr(), 1), "sdf_fill");

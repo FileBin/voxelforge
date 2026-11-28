@@ -229,6 +229,7 @@ impl WaterSim {
                 push: &push_keep[i] as *const WPush as *const c_void,
                 push_bytes: 48,
                 groups: s.groups,
+                stage: s.pipe as u32,
             })
             .collect();
         unsafe {

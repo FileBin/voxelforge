@@ -10,6 +10,7 @@
 
 pub mod bcc;
 pub mod field;
+pub mod perf;
 pub mod sdf_contact;
 pub mod collide;
 pub mod live;
