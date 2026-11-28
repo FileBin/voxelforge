@@ -57,6 +57,9 @@ unsafe extern "C" {
         shader_dir: *const c_char,
     ) -> VfStatus;
     fn vf_view_free(v: *mut c_void);
+    /* Две очереди: кадр ждёт тактовый таймлайн и сигналит свой. */
+    fn vf_view_timelines(v: *mut c_void, tick_sem: *mut c_void, frame_sem: *mut c_void);
+    fn vf_view_tick_ready(v: *mut c_void, value: u64, bank: u32);
     fn vf_view_poll(v: *mut c_void, input: *mut VfInput) -> i32;
     fn vf_view_camera(v: *mut c_void, vp: *const f32, eye: *const f32, near_m: f32, far_m: f32);
     fn vf_view_add_mesh(
@@ -238,6 +241,9 @@ struct Shared {
     /// VkBuffer буфера тел, как число: сброс мира создаёт новый буфер, и окну
     /// нужно перепривязать дескриптор.
     body_buf: u64,
+    /// Две очереди: какой такт опубликован в этот банк (кадр ждёт его значение).
+    pub_tick: u64,
+    pub_bank: u32,
     bodies: Vec<BSnap>,
     pending: Vec<(u64, MeshData)>,
     tick: f32,
@@ -247,6 +253,9 @@ struct Shared {
     /// полёте, позы в буфере меняются, и alpha от опубликованного снимка
     /// уже не соответствует паре prev→cur на устройстве.
     in_tick: bool,
+    /// Две очереди: кадр НЕ ждёт закрытия такта — он читает банк, который
+    /// опубликован прошлым тактом.
+    split: bool,
     /// Измеренный интервал между публикациями (для alpha).
     interval: f32,
     last_pub_at: Option<std::time::Instant>,
@@ -282,6 +291,9 @@ enum Cmd {
 
 struct SnapOut {
     body_buf: u64,
+    /// Две очереди: значение такта и банк, из которого читает кадр.
+    pub_tick: u64,
+    pub_bank: u32,
     bodies: Vec<BSnap>,
     pending: Vec<(u64, MeshData)>,
     tick: f32,
@@ -382,12 +394,15 @@ impl Sim {
     ) -> Result<Self, String> {
         let shared = std::sync::Arc::new(std::sync::Mutex::new(Shared {
             body_buf: 0,
+            pub_tick: 0,
+            pub_bank: 0,
             bodies: Vec::new(),
             pending: Vec::new(),
             tick,
             t_pub: 0.0,
             t_pub_at: std::time::Instant::now(),
             in_tick: false,
+            split: live.gpu.queues().4,
             interval: 0.0,
             last_pub_at: None,
             shots: 0,
@@ -454,7 +469,17 @@ impl Sim {
                         }
                         let bodies = snap_of(&live, &prev);
                         let mut g = sh.lock().unwrap();
-                        g.body_buf = live.gpu.body_buffer() as usize as u64;
+                        /* Две очереди: кадр читает банк, опубликованный
+                         * ПРОШЛЫМ тактом, и ждёт его таймлайн — текущий такт
+                         * в буфере он не смотрит. */
+                        if live.gpu.queues().4 {
+                            let (pt, pb) = live.gpu.published_bank();
+                            g.pub_tick = pt;
+                            g.pub_bank = pb as u32;
+                            g.body_buf = live.gpu.bank_buffer(pb) as usize as u64;
+                        } else {
+                            g.body_buf = live.gpu.body_buffer() as usize as u64;
+                        }
                         g.bodies = bodies;
                         g.pending.append(&mut fresh);
                         g.t_pub = start.elapsed().as_secs_f64();
@@ -597,8 +622,15 @@ impl Sim {
                         l.bodies[i].mesh = 0;
                     }
                 }
+                let (pub_tick, pub_bank) = l.gpu.published_bank();
                 SnapOut {
-                    body_buf: l.gpu.body_buffer() as usize as u64,
+                    body_buf: if l.gpu.queues().4 {
+                        l.gpu.bank_buffer(pub_bank) as usize as u64
+                    } else {
+                        l.gpu.body_buffer() as usize as u64
+                    },
+                    pub_tick,
+                    pub_bank: pub_bank as u32,
                     bodies: snap_of(l, &prev),
                     pending,
                     tick,
@@ -632,11 +664,13 @@ impl Sim {
                  * вперёд и отпрыгивают назад, при этом камера ровная (она от
                  * поз не зависит). GPU одна очередь и так ждал бы такт, так что
                  * ожидание на CPU ничего не добавляет. */
-                for _ in 0..4000 {
-                    if !shared.lock().unwrap().in_tick {
-                        break;
+                if !shared.lock().unwrap().split {
+                    for _ in 0..4000 {
+                        if !shared.lock().unwrap().in_tick {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_micros(200));
                     }
-                    std::thread::sleep(std::time::Duration::from_micros(200));
                 }
                 let mut g = shared.lock().unwrap();
                 let step = if g.interval > 0.0 { g.interval } else { g.tick };
@@ -655,6 +689,8 @@ impl Sim {
                 };
                 SnapOut {
                     body_buf: g.body_buf,
+                    pub_tick: g.pub_tick,
+                    pub_bank: g.pub_bank,
                     bodies: g.bodies.clone(),
                     pending: std::mem::take(&mut g.pending),
                     tick: g.tick,
@@ -753,7 +789,20 @@ fn main() {
     // Окно читает позы прямо из буфера физики: дескриптор привязывается один
     // раз, а после сброса мира (R) — заново, потому что буфер новый.
     unsafe { vf_view_set_bodies(view, body_buf0, voxelforge_world::sim::MAX_BODIES as u32) };
+    /* Две очереди (VF_SPLIT=1): окно ждёт тактовый таймлайн на значении
+     * опубликованного банка и сигналит кадровый — по нему такт понимает,
+     * что банк прочитан и его можно писать снова. */
+    if live.gpu.queues().4 {
+        unsafe {
+            vf_view_timelines(
+                view,
+                live.gpu.stream_semaphore(voxelforge_world::sim::VF_STREAM_TICK),
+                live.gpu.stream_semaphore(voxelforge_world::sim::VF_STREAM_FRAME),
+            )
+        };
+    }
     let mut seen_body_buf = body_buf0 as usize as u64;
+    let mut seen_pub_tick = 0u64;
 
     /* Физика идёт своим тактом (по умолчанию 20 Гц) независимо от частоты
      * кадров: на 240 Гц мониторе кадров четыре на такт, и движение сглаживает
@@ -1001,14 +1050,18 @@ fn main() {
             }
         }
 
-        if out.body_buf != 0 && out.body_buf != seen_body_buf {
+        if out.body_buf != 0
+            && (out.body_buf != seen_body_buf || out.pub_tick != seen_pub_tick)
+        {
             seen_body_buf = out.body_buf;
+            seen_pub_tick = out.pub_tick;
             unsafe {
                 vf_view_set_bodies(
                     view,
                     seen_body_buf as usize as *mut c_void,
                     voxelforge_world::sim::MAX_BODIES as u32,
-                )
+                );
+                vf_view_tick_ready(view, out.pub_tick, out.pub_bank);
             };
         }
 

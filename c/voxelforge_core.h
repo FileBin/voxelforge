@@ -55,7 +55,11 @@ vf_status vf_init_for_window(vf_ctx **out);
 void *vf_ctx_instance(vf_ctx *c);
 void *vf_ctx_phys(vf_ctx *c);
 void *vf_ctx_device(vf_ctx *c);
+/* Очередь КАДРА: graphics, приоритет 1.0. Её берёт окно — present обязан
+ * поддерживаться этим семейством. */
 void *vf_ctx_queue(vf_ctx *c);
+/* Очередь ТАКТА: compute, приоритет 0.0 (на RADV — отдельное семейство). */
+void *vf_ctx_queue_tick(vf_ctx *c);
 uint32_t vf_ctx_family(vf_ctx *c);
 
 /* Очередь одна на всех: submit'ы из разных потоков обязаны быть
@@ -66,6 +70,17 @@ vf_status vf_idle(vf_ctx *c);
 
 void vf_ctx_lock(vf_ctx *c);
 void vf_ctx_unlock(vf_ctx *c);
+
+/* Замок ОЧЕРЕДИ потока: при двух очередях (c->split) кадр и такт берут свои,
+ * при одной — общий. Брать вокруг submit/present СВОЕЙ очереди; ожидание fence
+ * и acquire — вне замка. */
+void vf_queue_lock(vf_ctx *c, uint32_t stream);
+void vf_queue_unlock(vf_ctx *c, uint32_t stream);
+
+/* Стадии последнего submit'а потока, мс: запись команд, ожидание замка,
+ * vkQueueSubmit, ожидание fence. Для таблицы «фазы такта на CPU». */
+void vf_submit_stats(vf_ctx *c, uint32_t stream, float *record_ms, float *lock_ms,
+                     float *submit_ms, float *fence_ms);
 
 void vf_shutdown(vf_ctx *c);
 vf_status vf_device_info(vf_ctx *c, char *name, size_t name_len,
@@ -96,6 +111,44 @@ vf_status vf_run(vf_ctx *c, vf_dispatch *list, uint32_t count);
  * такта читается следующим — после vf_wait_back(c, 1). */
 vf_status vf_run_async(vf_ctx *c, vf_dispatch *list, uint32_t count);
 vf_status vf_wait_back(vf_ctx *c, uint32_t back);
+
+/* --- два потока submit'ов: такт (compute, приоритет 0.0) и кадр (graphics,
+ * приоритет 1.0) ------------------------------------------------------------
+ *
+ * Поток 0 — такт: физика, низкий приоритет, на RADV это ОТДЕЛЬНОЕ семейство
+ * очередей (4 очереди, без графики), то есть своё железное кольцо. Поток 1 —
+ * кадр: графика, приоритет 1.0, её же использует окно.
+ *
+ * Каждый submit сигналит таймлайн-семафор своего потока значением «номер
+ * submit'а + 1». Через waits submit объявляет, каких ЧУЖИХ значений он ждёт до
+ * старта: так кадр ждёт «банк опубликован тактом N», а такт — «кадр дочитал
+ * банк, который сейчас перезапишут». Хост при этом не блокируется. */
+#define VF_STREAM_TICK 0
+#define VF_STREAM_FRAME 1
+
+typedef struct {
+    uint32_t stream; /* VF_STREAM_* */
+    uint64_t value;  /* значение таймлайна этого потока */
+} vf_semwait;
+
+vf_status vf_run_stream(vf_ctx *c, vf_dispatch *list, uint32_t count, uint32_t stream,
+                        const vf_semwait *waits, uint32_t n_waits, int wait_now);
+vf_status vf_wait_stream(vf_ctx *c, uint32_t stream, uint32_t back);
+/* Сколько submit'ов отправлено в поток (= значение его таймлайна). */
+uint64_t vf_stream_value(vf_ctx *c, uint32_t stream);
+/* Дождаться на хосте значения таймлайна: 0 — дождались, -1 — таймаут. */
+int vf_wait_timeline(vf_ctx *c, uint32_t stream, uint64_t value, uint64_t timeout_ns);
+/* 1 — две очереди, 0 — одна (драйвер не дал второго семейства/очереди). */
+int vf_split(vf_ctx *c);
+/* Таймлайн-семафор потока (окно сигналит кадровый, ждёт тактовый). */
+void *vf_ctx_semaphore(vf_ctx *c, uint32_t stream);
+/* Банки состояния тел: кадр сообщает, какой банк и на каком своём кадре он
+ * прочитал; такт перед перезаписью банка ждёт это значение. */
+#define VF_BANKS 2
+void vf_note_bank_read(vf_ctx *c, uint32_t bank, uint64_t frame_value);
+uint64_t vf_bank_read_value(vf_ctx *c, uint32_t bank);
+void vf_queue_info(vf_ctx *c, uint32_t *gfx_family, uint32_t *tick_family, float *prio_gfx,
+                   float *prio_tick);
 
 /* --- диагностика производительности: GPU-таймстемпы по диспатчам такта ---
  *

@@ -17,3 +17,9 @@ cpu-solver = []
 name = "voxelforge-live"
 path = "src/bin/voxelforge_live.rs"
 required-features = ["live"]
+
+# Замер двух очередей: такт на compute (приоритет 0.0), кадр на graphics (1.0).
+[[bin]]
+name = "vf-two-queues"
+path = "src/bin/vf_two_queues.rs"
+required-features = ["live"]

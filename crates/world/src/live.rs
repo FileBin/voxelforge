@@ -218,6 +218,8 @@ pub struct Live {
     /// Пары тетов строит устройство (VF_PAIRS=gpu): тогда из кадра уходит и
     /// заливка пар, и чтение позиций тел.
     pub gpu_pairs: bool,
+    /// Пары отдельным submit'ом с ожиданием (старый путь, VF_PAIRS_OLD=1).
+    pub pairs_old: bool,
     /// Геометрия изменилась (спавн/раскол/сброс) — нужно перезалить пул.
     geom_dirty: bool,
     /// Пробуждение по контакту на CPU — только для пути, где коллизию
@@ -353,6 +355,13 @@ impl Live {
         /* Режим контактов задаётся здесь один раз: у мира и у устройства он
          * обязан совпадать, иначе такт соберёт проходы одного режима. */
         gpu.set_sdf_collide(matches!(std::env::var("VF_COLLIDE").as_deref(), Ok("sdf")));
+        /* Пары тетов строятся ВНУТРИ такта одним submit'ом: отдельный submit с
+         * ожиданием fence держал поток физики до GPU на каждом такте. */
+        let gpu_pairs = std::env::var("VF_PAIRS").map(|v| v == "gpu").unwrap_or(false);
+        /* VF_PAIRS_OLD=1 — прежний путь: пары отдельным submit'ом с ожиданием
+         * fence. Оставлен для сравнения «до/после» на одном бинаре. */
+        let pairs_old = std::env::var("VF_PAIRS_OLD").is_ok();
+        gpu.set_inline_pairs(gpu_pairs && !pairs_old);
 
         Live {
             next_id: 1 + (MAX_BODIES as u64),
@@ -363,7 +372,8 @@ impl Live {
                 Ok("gpu") | Ok("sdf")
             ),
             sdf_collide: matches!(std::env::var("VF_COLLIDE").as_deref(), Ok("sdf")),
-            gpu_pairs: std::env::var("VF_PAIRS").map(|v| v == "gpu").unwrap_or(false),
+            gpu_pairs,
+            pairs_old,
             geom_dirty: true,
             wake_on_contact: true,
             fracture_enabled: true,
@@ -749,13 +759,23 @@ impl Live {
     /// Такт полностью на GPU: CPU один раз строит пары и заливает их, дальше
     /// всё считает устройство, а тела читаются один раз в конце.
     fn step_gpu(&mut self, dt: f32, substeps: u32, iterations: u32) {
+        use std::time::Instant;
+        let t_tick = Instant::now();
+        let mut t_reads = 0.0f32;
         /* Такт N-1 отправлен и давно закрыт: ждём его (это ноль), забираем
          * статистику и события ПРОШЛОГО такта. Раскол пишет тела с CPU, поэтому
          * до него GPU обязан быть свободен — иначе пишем по считающемуся буферу. */
-        self.gpu.wait_idle();
+        let t_wait = {
+            let t = Instant::now();
+            self.gpu.wait_idle();
+            t.elapsed().as_secs_f32() * 1000.0
+        };
         /* Статистика прошлого такта (8 Б из `stat`) — ДО сэмпла перфа: строка
          * тел в таблице берёт бодрствующих оттуда, отдельного чтения нет. */
+        let t = Instant::now();
         let (vmax_now, awake_now) = self.gpu.read_stats();
+        t_reads += t.elapsed().as_secs_f32() * 1000.0;
+
         /* Таймстемпы стадий прошлого такта: он уже закрыт, а новый submit ещё
          * не отправлен — данные в слоте кольца целы. Включено только по F3 или
          * VF_PERF=1; иначе вызов пустой. */
@@ -772,12 +792,16 @@ impl Live {
                 /* События удара с устройства: 32 байта на тело вместо списка
                  * контактов, и энергия посчитана ДО солвера. Кольцо + счётчик:
                  * в спокойном такте из GPU уходит 4 байта. */
+            let t = Instant::now();
                 let ev = self.gpu.read_impact_events();
+                t_reads += t.elapsed().as_secs_f32() * 1000.0;
                 if !ev.is_empty() {
                     self.fracture_from_events(&ev);
                 }
             } else {
+                let t = Instant::now();
                 let contacts = self.gpu.read_contacts();
+                t_reads += t.elapsed().as_secs_f32() * 1000.0;
                 self.fracture(&contacts);
             }
         }
@@ -822,10 +846,16 @@ impl Live {
         }
 
         if self.gpu_pairs {
-            /* Пары рождаются на устройстве: сетка тетов + испускание пар.
-             * На CPU приходит только их число (4 байта) — позиции тел в кадре
-             * больше не читаются. */
-            self.gpu.run_tet_pairs(dt);
+            /* Пары рождаются на устройстве ВНУТРИ такта (см.
+             * `tet_pair_steps`/`set_inline_pairs`): отдельных submit'ов и
+             * ожиданий fence здесь больше нет, на CPU приходит только их
+             * число — и то не в такте. VF_PAIRS_OLD=1 возвращает старый путь
+             * (отдельный submit + fence) для сравнения. */
+            if self.pairs_old {
+                let t = Instant::now();
+                self.gpu.run_tet_pairs(dt);
+                t_reads += t.elapsed().as_secs_f32() * 1000.0;
+            }
         } else if self.sdf_collide {
             /* SDF-контактам пары ТЕТОВ не нужны вовсе: широкий проход по AABB
              * тел делает сам такт. CPU-путь ниже строил бы миллионы тет-пар
@@ -890,7 +920,11 @@ impl Live {
         /* Такт отправляем БЕЗ ожидания: к моменту следующего такта (50 мс) GPU
          * давно свободен, и CPU не стоит ни миллисекунды. Результат прошлого
          * такта читаем здесь же — он уже закрыт. */
-        self.gpu.frame_gpu_contacts_async(dt, chunks, substeps, iterations);
+        let t_submit = {
+            let t = Instant::now();
+            self.gpu.frame_gpu_contacts_async(dt, chunks, substeps, iterations);
+            t.elapsed().as_secs_f32() * 1000.0
+        };
         // Контакты нужны и геймплею: раскол и пробуждение по контакту решаются
         // на CPU, поэтому читаем их один раз за такт (73 КБ при 64 телах).
         /* Контакты нужны CPU ТОЛЬКО для раскола: пробуждение делает SAT на
@@ -903,6 +937,14 @@ impl Live {
         if self.lines_on {
             self.sync_all();
         }
+        /* Фазы такта на CPU — в диагностику: без них «такт долгий» не отличить
+         * от «GPU занят», а «кадр дёргается» — от «поток физики держал замок». */
+        self.gpu.note_tick_cpu(
+            t_wait,
+            t_reads,
+            t_submit,
+            t_tick.elapsed().as_secs_f32() * 1000.0,
+        );
         self.frames += 1;
     }
 

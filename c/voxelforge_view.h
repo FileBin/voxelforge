@@ -90,6 +90,13 @@ int32_t vf_view_add_lines(vf_view *v, const float *pts, uint32_t n_lines);
 // Буфер тел физики: поза читается шейдером прямо оттуда (тот же девайс).
 void vf_view_set_bodies(vf_view *v, void *buffer, uint32_t count);
 
+/* Две очереди (VF_SPLIT=1). tick_sem — таймлайн такта: кадр ждёт его значение
+ * перед рисованием; frame_sem — таймлайн кадров: кадр сигналит его сам, чтобы
+ * такт знал, когда банк прочитан. NULL/NULL — прежний путь (одна очередь). */
+void vf_view_timelines(vf_view *v, void *tick_sem, void *frame_sem);
+/* Перед vf_view_begin: банк `bank` опубликован тактом `value` — ждать его. */
+void vf_view_tick_ready(vf_view *v, uint64_t value, uint32_t bank);
+
 // Кадр. Поза не передаётся: body — номер тела в буфере, alpha — сглаживание
 // между прошлым тактом и текущим.
 void vf_view_begin(vf_view *v, float r, float g, float b);

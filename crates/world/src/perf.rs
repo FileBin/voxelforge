@@ -347,6 +347,50 @@ impl Default for Rates {
     }
 }
 
+/// Фазы такта на CPU (мс): что видит поток физики. GPU-стадии меряются
+/// таймстемпами, а это — цена CPU: ожидание прошлого такта, чтения обратно,
+/// запись команд, замок очереди и сам submit. Без этих чисел «такт долгий»
+/// не отличить от «GPU занят».
+#[derive(Clone, Copy, Default)]
+pub struct CpuPhases {
+    /// Ожидание fence прошлого такта (он нужен перед любым чтением/записью).
+    pub wait: f32,
+    /// Чтения обратно (stat, события удара, контакты).
+    pub reads: f32,
+    /// Весь вызов submit'а такта: запись команд + замок + vkQueueSubmit.
+    pub submit: f32,
+    /// Из него — ожидание замка очереди (если занят другой поток).
+    pub lock: f32,
+    /// Из него — запись command buffer'а и дескрипторов.
+    pub record: f32,
+    /// Из него — сам vkQueueSubmit.
+    pub queue_submit: f32,
+    /// Ожидание fence сразу после submit (режим синхронного такта).
+    pub fence: f32,
+    /// Такт целиком на потоке физики.
+    pub total: f32,
+}
+
+/// Одна строка блока «фазы такта на CPU».
+#[derive(Clone, Copy)]
+pub struct CpuRow {
+    pub name: &'static str,
+    pub min: f32,
+    pub mean: f32,
+    pub max: f32,
+}
+
+/// Пары «имя фазы — как её взять из записи»: порядок и есть порядок печати.
+const CPU_FIELDS: [(&str, fn(&CpuPhases) -> f32); 7] = [
+    ("ожидание fence", |p| p.wait),
+    ("чтения обратно", |p| p.reads),
+    ("запись команд", |p| p.record),
+    ("замок очереди", |p| p.lock),
+    ("vkQueueSubmit", |p| p.queue_submit),
+    ("submit всего", |p| p.submit),
+    ("такт, всего", |p| p.total),
+];
+
 pub struct Perf {
     /// Драйвер умеет таймстемпы на этой очереди.
     pub supported: bool,
@@ -360,6 +404,11 @@ pub struct Perf {
     ticks_total: u64,
     /// Счётчики сцены (тела, контакты) — берутся из готовых буферов ядра.
     scene: VfSceneCounts,
+    /// Фазы такта на CPU за окно (по такту на запись).
+    cpu: Vec<CpuPhases>,
+    /// Итог последнего окна по фазам такта: мин/среднее/макс.
+    pub cpu_rows: Vec<CpuRow>,
+
     acc: [StageAcc; MAX_STAGES],
     /// Сколько тактов попало в окно.
     ticks: u32,
@@ -391,6 +440,8 @@ impl Perf {
             ticks_total: 0,
             scene: VfSceneCounts::default(),
             acc: [StageAcc::default(); MAX_STAGES],
+            cpu: Vec::new(),
+            cpu_rows: Vec::new(),
             ticks: 0,
             tick_sum_ms: 0.0,
             tick_min_ms: f32::INFINITY,
@@ -462,6 +513,20 @@ impl Perf {
         }
         if tick_ms > self.tick_max_ms {
             self.tick_max_ms = tick_ms;
+        }
+    }
+
+    /// Записать фазы такта на CPU. Копится по такту; окно — то же, что у
+    /// стадий, поэтому блок «фазы такта» печатается вместе с таблицей.
+    pub fn record_cpu(&mut self, p: CpuPhases) {
+        if !self.enabled {
+            return;
+        }
+        if self.skip > 0 {
+            return;
+        }
+        if self.cpu.len() < 512 {
+            self.cpu.push(p);
         }
     }
 
@@ -537,6 +602,33 @@ impl Perf {
             .collect();
         rows.sort_by(|a, b| b.mean_ms.total_cmp(&a.mean_ms));
         self.rows = rows;
+        /* Фазы такта на CPU: мин/среднее/макс по тактам окна. */
+        self.cpu_rows.clear();
+        if !self.cpu.is_empty() {
+            for (name, get) in CPU_FIELDS.iter() {
+                let mut mn = f32::INFINITY;
+                let mut mx = 0.0f32;
+                let mut sum = 0.0f64;
+                for p in &self.cpu {
+                    let v = get(p).max(0.0);
+                    if v < mn {
+                        mn = v;
+                    }
+                    if v > mx {
+                        mx = v;
+                    }
+                    sum += v as f64;
+                }
+                let mean = (sum / self.cpu.len() as f64) as f32;
+                self.cpu_rows.push(CpuRow {
+                    name,
+                    min: if mn.is_finite() { mn } else { mean },
+                    mean,
+                    max: mx,
+                });
+            }
+        }
+        self.cpu.clear();
         self.tick_min_window_ms = if self.tick_min_ms.is_finite() {
             self.tick_min_ms
         } else {
@@ -601,6 +693,15 @@ impl Perf {
             self.scene.total.saturating_sub(self.scene.awake),
             self.scene.contacts
         );
+        /* Фазы такта на CPU. Отдельным блоком: это цена потока физики, а не
+         * GPU. «замок очереди» больше нуля — submit ждал другой поток;
+         * «ожидание fence» — CPU стоял на закрытии прошлого такта. */
+        if !self.cpu_rows.is_empty() {
+            println!("[perf] такт на CPU: мин / среднее / макс, мс");
+            for r in &self.cpu_rows {
+                println!("  {:<16} {:>7.3} {:>9.3} {:>7.3}", r.name, r.min, r.mean, r.max);
+            }
+        }
     }
 
     /// Начать окно заново (включение сбора с чистого листа).
@@ -616,6 +717,8 @@ impl Perf {
         self.tick_max_window_ms = 0.0;
         self.scene = VfSceneCounts::default();
         self.rows.clear();
+        self.cpu.clear();
+        self.cpu_rows.clear();
         self.skip = 1;
     }
 
