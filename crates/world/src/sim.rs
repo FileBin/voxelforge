@@ -162,8 +162,9 @@ const P_BROAD: usize = 6;
 const P_SOLVE: usize = 7;
 const P_SLEEP: usize = 8;
 const P_POS: usize = 9;
-/// Потолок тетраэдров в пуле: 64 тела по 768.
-pub const MAX_POOL_TETS: usize = 64 * 768;
+/// Потолок тетраэдров в пуле. Плотный шар (шаг radius/12) занимает несколько
+/// тысяч тетов, поэтому на тело держим 4096: 64 тела × 4096 × 64 Б ≈ 16 МБ.
+pub const MAX_POOL_TETS: usize = 64 * 4096;
 const P_SOLVE_CONTACTS: usize = 10;
 const P_SOLVE_APPLY: usize = 11;
 const P_SAT: usize = 12;

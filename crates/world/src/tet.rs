@@ -429,7 +429,9 @@ impl TetBody {
         }
         let step = node_step(lv);
         let rn = radius / step;
-        let n = (rn.ceil() as i32) + 3;
+        /* +5 слоёв: марчинг идёт ячейками и внешний слой тетов ему нужен с
+         * каждой стороны — иначе с дальней стороны строить не из чего. */
+        let n = (rn.ceil() as i32) + 5;
         let dim = (2 * n + 1) as usize;
         let idx = |x: i32, y: i32, z: i32| -> usize {
             (((z + n) as usize) * dim + ((y + n) as usize)) * dim + ((x + n) as usize)
@@ -445,39 +447,6 @@ impl TetBody {
                     /* без сдвига: у запечённого SDF ноль и есть поверхность,
                      * а |значение| — настоящее расстояние до неё */
                     val[i] = d;
-                }
-            }
-        }
-        /* Чистка одиночных узлов: шип на поверхности — это узел, попавший
-         * внутрь, когда все шесть его соседей снаружи. Такие узлы убираем
-         * (морфологическое открытие), тогда марчинг не строит пирамидку. */
-        {
-            let mut fixed = solid.clone();
-            for z in 1..=dim - 2 {
-                for y in 1..=dim - 2 {
-                    for x in 1..=dim - 2 {
-                        let i = (z * dim + y) * dim + x;
-                        if !solid[i] {
-                            continue;
-                        }
-                        let nb = [i - 1, i + 1, i - dim, i + dim, i - dim * dim, i + dim * dim];
-                        let n_in = nb.iter().filter(|j| solid[**j]).count();
-                        if n_in < 3 {
-                            fixed[i] = false;
-                        }
-                    }
-                }
-            }
-            solid = fixed;
-            /* и пересобрать поле: знак берём из очищенной маски, величину —
-             * из аналитического расстояния */
-            for z in -n..=n {
-                for y in -n..=n {
-                    for x in -n..=n {
-                        let d = ((x * x + y * y + z * z) as f32).sqrt() - rn;
-                        let i = idx(x, y, z);
-                        val[i] = if solid[i] { -d.abs() } else { d.abs() };
-                    }
                 }
             }
         }
