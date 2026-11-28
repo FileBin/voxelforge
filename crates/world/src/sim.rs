@@ -1633,6 +1633,7 @@ impl GpuSim {
         unsafe {
             check_status(vf_run(self.ctx, &mut d, 1), "shard_scan");
         }
+        let t_scan = std::time::Instant::now();
         let mut braw = vec![0i32; nj * 8];
         unsafe {
             check_status(
@@ -1641,6 +1642,9 @@ impl GpuSim {
             );
         }
         self.bytes_down += (braw.len() * 4) as u64;
+        if std::env::var("VF_BAKE_TIME").is_ok() {
+            eprintln!("[bake] скан {:?} ({nj} работ, {} групп)", t_scan.elapsed(), scan_groups);
+        }
 
         /* --- проход 1: запекание в найденный бокс --------------------------- */
         let mut out: Vec<Option<BakedShard>> = Vec::with_capacity(nj);
@@ -1751,6 +1755,7 @@ impl GpuSim {
                 }
             }
         }
+        let t_bake0 = std::time::Instant::now();
         let mut bufs2 = [self.sdf_desc, self.sdf_vals, jb, pb, bb];
         let mut push2 = self.push(0.0, 0);
         push2.prm1[3] = 0.0;  /* режим «запекание» */
@@ -1767,6 +1772,9 @@ impl GpuSim {
             check_status(vf_run(self.ctx, &mut d2, 1), "shard_bake");
         }
         self.bytes_up += (jbuf2.len() * 16 + pbuf2.len() * 16 + keep.len() * 64) as u64;
+        if std::env::var("VF_BAKE_TIME").is_ok() {
+            eprintln!("[bake] запекание {:?} ({} работ, {} групп)", t_bake0.elapsed(), keep.len(), bake_groups);
+        }
 
         if read_back {
             for (k, w) in keep.iter().enumerate() {

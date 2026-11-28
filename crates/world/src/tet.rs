@@ -56,6 +56,18 @@ pub fn node_pos(n: Node, level: u8, origin: [f32; 3]) -> [f32; 3] {
 /// выключаются (см. `GpuSim::upload_sdf`). Берём с запасом.
 const FIELD_NODE_BUDGET: usize = 60000;
 
+/// Сколько плоскостей Вороного на осколок держит запекание (буфер шейдера).
+const SHARD_PLANE_CAP: usize = 64;
+
+/// Квадрат расстояния между затравками `i` и `k` (по какому срезу ближе).
+fn seed_dist(pts: &[[f32; 3]], i: usize, k: usize) -> f32 {
+    if k == i {
+        return f32::MAX;
+    }
+    let (a, b) = (pts[i], pts[k]);
+    (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)
+}
+
 /// Бокс поля осколка: тот же кусок мира, но, если влезает в слот SDF, на
 /// более мелкой сетке (см. `shatter_fields`). Возвращает `(шаг, lo, dims)`.
 pub(crate) fn shard_field_box(step: f32, lo: &[i32; 3], dims: &[usize; 3]) -> (f32, [i32; 3], [usize; 3]) {
@@ -1081,8 +1093,27 @@ impl TetBody {
                 (hi[2] - lo[2] + 1) as usize,
             ];
             let (fstep, flo, fdims) = shard_field_box(step, &lo, &dims);
-            let pl: Vec<([f32; 3], f32)> =
-                planes[i].iter().map(|(n, d)| (*n, d * step)).collect();
+            /* Плоскостей у Вороного n−1, а буфер шейдера держит 64 на
+             * осколок: лишние (самые далёкие затравки) отбрасываем — их
+             * плоскость заведомо не режет этот осколок. В движке тел не
+             * больше 64, так что отбрасывать нечего. */
+            let mut order: Vec<usize> = (0..planes[i].len()).collect();
+            if order.len() > SHARD_PLANE_CAP {
+                order.sort_by(|&a, &b| {
+                    let da = seed_dist(pts, i, a);
+                    let db = seed_dist(pts, i, b);
+                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                order.truncate(SHARD_PLANE_CAP);
+                order.sort();
+            }
+            let pl: Vec<([f32; 3], f32)> = order
+                .iter()
+                .map(|&k| {
+                    let (n, d) = planes[i][k];
+                    (n, d * step)
+                })
+                .collect();
             /* объём и центроид — от тетов, а не от поля: масса обязана
              * сохраняться точно, поле её только «рисует». */
             let mut vol = 0.0f32;

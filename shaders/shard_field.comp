@@ -93,7 +93,7 @@ void main() {
     uint oslot = uint(j0.y);
     float pstep = float(j2.x);
     float ostep = float(j2.y);
-    uint nplanes = uint(j2.z);
+    uint nplanes = min(uint(j2.z), MAX_PLANES);
 
     /* --- родитель -------------------------------------------------------- */
     /* Узел осколка — в СВОЁМ узле сетки, у родителя другой шаг: переводим в
