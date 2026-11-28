@@ -463,6 +463,9 @@ pub struct GpuSim {
     /// такт; размер с запасом над VF_PERF_MAX ядра).
     perf_ms: Vec<f32>,
     perf_ids: Vec<u32>,
+    /// Точек контакта в последнем такте окна. Читается из счётчиков списков
+    /// только на границе окна печати, а не каждый такт.
+    perf_contacts: u32,
 }
 
 impl GpuSim {
@@ -704,6 +707,7 @@ impl GpuSim {
             perf,
             perf_ms: vec![0.0; 4096],
             perf_ids: vec![0; 4096],
+            perf_contacts: 0,
         }
     }
 
@@ -748,13 +752,38 @@ impl GpuSim {
         self.perf.tick_ms()
     }
 
+    /// Минимум/среднее/максимум такта последнего окна, мс (строка ИТОГО).
+    pub fn perf_tick_range(&self) -> (f32, f32, f32) {
+        self.perf.tick_range_ms()
+    }
+
+    /// Счётчики сцены для строки тел в оверлее (всего/бодр/контактов).
+    pub fn perf_scene(&self) -> crate::perf::VfSceneCounts {
+        self.perf.scene_counts()
+    }
+
     /// Забрать таймстемпы последнего ЗАКРЫТОГО такта и раз в секунду напечатать
     /// таблицу. Вызывать сразу после ожидания fence и ДО любого нового submit:
     /// таймстемпы живут в слоте кольца и перезаписываются следующим тактом.
-    pub fn perf_sample(&mut self) {
+    /// `awake` — число бодрствующих тел из `stat`, `alive` — сколько тел в сцене
+    /// вообще (оба уже известны вызывающему): отдельных чтений ради строки тел
+    /// не нужно. Внимание: `self.n` — ёмкость буфера, а не число тел, поэтому
+    /// в сцене живут и «мёртвые» слоты — их за тело считать нельзя.
+    pub fn perf_sample(&mut self, awake: u32, alive: usize) {
         if !self.perf.enabled {
             return;
         }
+        let now = std::time::Instant::now();
+        /* Счётчики сцены. Тела — бесплатно: `n` на CPU, бодрствующие — из тех
+         * же 8 Б `stat`, что такт читает и так. Контакты — сумма счётчиков
+         * списков (`lc`), и читаем мы их ТОЛЬКО на границе окна печати: раз в
+         * секунду 4·n Б вместо новой синхронизации в каждом такте. */
+        if self.perf.window_due(now) {
+            let c = self.contact_count();
+            self.perf_contacts = c.min(u32::MAX as u64) as u32;
+        }
+        self.perf
+            .set_scene(alive as u32, awake, self.perf_contacts);
         let mut tick_ms = 0.0f32;
         let n = unsafe {
             vf_perf_read(

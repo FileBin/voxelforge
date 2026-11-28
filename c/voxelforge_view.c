@@ -66,7 +66,11 @@ struct vf_view {
     uint32_t ui_cap;    /* вершин максимум */
     vf_perf_row perf_rows[VF_PERF_MAX_ROWS];
     uint32_t perf_n;
-    float perf_tick_ms;
+    /* ИТОГО такта за то же окно: мин/сред/макс, мс. */
+    float perf_tick_min_ms, perf_tick_mean_ms, perf_tick_max_ms;
+    /* Строка тел/контактов под таблицей; scene_ok == 0 — не рисовать. */
+    vf_scene_counts perf_scene;
+    int perf_scene_ok;
     /* Оверлей запрошен этим кадром (F3 / VF_PERF), даже если данных ещё нет:
      * тогда панель показывает «ждём такт», а не исчезает молча. */
     int perf_show;
@@ -1083,6 +1087,16 @@ static void ui_text(vf_view *v, float x, float y, float scale, const float *c, c
     }
 }
 
+/* Три числа стадии одной строкой: «мин / сред / макс». При крупных значениях
+ * переходим на одну цифру после точки — иначе триплет налезает на долю. */
+static void fmt_triplet(char *buf, size_t n, float mn, float me, float mx) {
+    if (mx < 10.0f) {
+        snprintf(buf, n, "%.2f / %.2f / %.2f", (double)mn, (double)me, (double)mx);
+    } else {
+        snprintf(buf, n, "%.1f / %.1f / %.1f", (double)mn, (double)me, (double)mx);
+    }
+}
+
 static void draw_perf_overlay(vf_view *v) {
     if (!v->pipe_ui || !v->ui_ptr || !v->perf_show || !v->recording) return;
     v->ui_n = 0;
@@ -1098,15 +1112,27 @@ static void draw_perf_overlay(vf_view *v) {
     };
 
     const float sc = 2.0f, lh = 18.0f;
-    const float x0 = 10.0f, y0 = 10.0f, w = 550.0f;
+    /* Панель шире прежней: «мин / сред / макс» идут одной группой — три числа
+     * рядом читаются как разброс стадии, а не как три несвязанных колонки. */
+    const float x0 = 10.0f, y0 = 10.0f, w = 620.0f;
     uint32_t nrows = v->perf_n;
-    float h = 30.0f + lh * (float)(nrows ? nrows + 1 : 1) + 8.0f;
+    /* Шапка + строки стадий + строка ИТОГО такта (+ строка тел, если есть). */
+    float h = 30.0f + lh * (float)(nrows ? nrows + 2 + (v->perf_scene_ok ? 1 : 0) : 1) + 8.0f;
     ui_quad(v, x0, y0, w, h, bg);
 
     char line[96];
-    if (v->perf_tick_ms > 0.0f) {
-        snprintf(line, sizeof line, "GPU STAGES   tick %.2f ms   F3 toggle",
-                 (double)v->perf_tick_ms);
+    if (v->perf_tick_max_ms > 0.0f) {
+        char tri[48];
+        if (v->perf_tick_max_ms < 10.0f) {
+            snprintf(tri, sizeof tri, "%.2f/%.2f/%.2f",
+                     (double)v->perf_tick_min_ms, (double)v->perf_tick_mean_ms,
+                     (double)v->perf_tick_max_ms);
+        } else {
+            snprintf(tri, sizeof tri, "%.1f/%.1f/%.1f",
+                     (double)v->perf_tick_min_ms, (double)v->perf_tick_mean_ms,
+                     (double)v->perf_tick_max_ms);
+        }
+        snprintf(line, sizeof line, "GPU STAGES  tick %s ms  F3 toggle", tri);
     } else {
         snprintf(line, sizeof line, "GPU STAGES   no tick yet   F3 toggle");
     }
@@ -1125,9 +1151,8 @@ static void draw_perf_overlay(vf_view *v) {
         return;
     }
     ui_text(v, x0 + 12, yhead, sc, head, "stage");
-    ui_text(v, x0 + 260, yhead, sc, head, "mean");
-    ui_text(v, x0 + 355, yhead, sc, head, "max");
-    ui_text(v, x0 + 460, yhead, sc, head, "share");
+    ui_text(v, x0 + 210, yhead, sc, head, "min / mean / max");
+    ui_text(v, x0 + 470, yhead, sc, head, "share");
 
     for (uint32_t i = 0; i < v->perf_n; i++) {
         const vf_perf_row *r = &v->perf_rows[i];
@@ -1146,12 +1171,34 @@ static void draw_perf_overlay(vf_view *v) {
         char name[24];
         snprintf(name, sizeof name, "%.18s", r->name);
         ui_text(v, x0 + 12, y + 4, sc, text, name);
-        snprintf(line, sizeof line, "%7.2f", (double)r->mean_ms);
-        ui_text(v, x0 + 260, y + 4, sc, text, line);
-        snprintf(line, sizeof line, "%7.2f", (double)r->max_ms);
-        ui_text(v, x0 + 355, y + 4, sc, text, line);
+        fmt_triplet(line, sizeof line, r->min_ms, r->mean_ms, r->max_ms);
+        ui_text(v, x0 + 210, y + 4, sc, text, line);
         snprintf(line, sizeof line, "%5.1f%%", (double)share);
-        ui_text(v, x0 + 460, y + 4, sc, text, line);
+        ui_text(v, x0 + 470, y + 4, sc, text, line);
+    }
+
+    /* ИТОГО такта: та же тройка чисел, что в консоли. По ней видно, сколько
+     * такт стоит целиком и насколько он неровный — стадии её не заменяют. */
+    {
+        float y = yhead + lh * (float)(nrows + 1);
+        ui_text(v, x0 + 12, y + 4, sc, title, "total tick");
+        fmt_triplet(line, sizeof line, v->perf_tick_min_ms, v->perf_tick_mean_ms,
+                    v->perf_tick_max_ms);
+        ui_text(v, x0 + 210, y + 4, sc, title, line);
+        ui_text(v, x0 + 470, y + 4, sc, head, "100.0%");
+    }
+
+    /* Объём работы: просадка стадии без числа тел ничего не объясняет —
+     * 30 мс на 13 телах и на 60 телах это разные вещи. Спящие считаются как
+     * всего минус бодрствующие (отдельного счётчика для них нет). */
+    if (v->perf_scene_ok) {
+        float y = yhead + lh * (float)(nrows + 2);
+        uint32_t tot = v->perf_scene.total;
+        uint32_t aw = v->perf_scene.awake > tot ? tot : v->perf_scene.awake;
+        snprintf(line, sizeof line, "bodies %u  awake %u  asleep %u  contacts %u",
+                 (unsigned)tot, (unsigned)aw, (unsigned)(tot - aw),
+                 (unsigned)v->perf_scene.contacts);
+        ui_text(v, x0 + 12, y + 4, sc, head, line);
     }
 
     vkCmdBindPipeline(v->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v->pipe_ui);
@@ -1161,13 +1208,19 @@ static void draw_perf_overlay(vf_view *v) {
     v->ui_n = 0;
 }
 
-void vf_view_perf(vf_view *v, const vf_perf_row *rows, uint32_t n, float tick_ms) {
+void vf_view_perf(vf_view *v, const vf_perf_row *rows, uint32_t n,
+                  float tick_min_ms, float tick_mean_ms, float tick_max_ms,
+                  const vf_scene_counts *scene) {
     if (!v) return;
     /* rows == NULL — оверлей выключен; непустой указатель при n == 0 — включён,
      * но такта ещё не было (панель так и скажет). */
     v->perf_show = rows != NULL;
     v->perf_n = 0;
-    v->perf_tick_ms = tick_ms;
+    v->perf_tick_min_ms = tick_min_ms;
+    v->perf_tick_mean_ms = tick_mean_ms;
+    v->perf_tick_max_ms = tick_max_ms;
+    v->perf_scene_ok = scene != NULL;
+    if (scene) v->perf_scene = *scene;
     if (!rows || n == 0) return;
     if (n > VF_PERF_MAX_ROWS) n = VF_PERF_MAX_ROWS;
     memcpy(v->perf_rows, rows, (size_t)n * sizeof(*rows));

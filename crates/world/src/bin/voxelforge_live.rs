@@ -7,7 +7,7 @@
 use std::ffi::{c_char, c_void, CString};
 
 use voxelforge_world::live::{model_matrix, Live};
-use voxelforge_world::perf::VfPerfRow;
+use voxelforge_world::perf::{VfPerfRow, VfSceneCounts};
 use voxelforge_world::sim::find_shaders;
 
 #[repr(C)]
@@ -76,7 +76,15 @@ unsafe extern "C" {
     fn vf_view_draw_lines(v: *mut c_void, lines: i32, model: *const f32, tint: *const f32);
     fn vf_view_end(v: *mut c_void);
     /// Оверлей стадий (F3 / VF_PERF=1): строки копируются внутрь окна.
-    fn vf_view_perf(v: *mut c_void, rows: *const VfPerfRow, n: u32, tick_ms: f32);
+    fn vf_view_perf(
+        v: *mut c_void,
+        rows: *const VfPerfRow,
+        n: u32,
+        tick_min_ms: f32,
+        tick_mean_ms: f32,
+        tick_max_ms: f32,
+        scene: *const VfSceneCounts,
+    );
 }
 
 // ---------------------------------------------------------------- матрицы
@@ -248,9 +256,11 @@ struct Shared {
     lines_on: bool,
     /// Диагностика стадий включена (F3 / VF_PERF=1): показывать оверлей.
     perf_on: bool,
-    /// Строки последнего окна диагностики и среднее время такта.
+    /// Строки последнего окна диагностики и мин/сред/макс такта.
     perf_rows: Vec<VfPerfRow>,
-    perf_tick_ms: f32,
+    perf_tick: (f32, f32, f32),
+    /// Счётчики сцены: всего тел, бодрствующих, точек контакта.
+    perf_scene: VfSceneCounts,
     log: String,
 }
 
@@ -275,7 +285,8 @@ struct SnapOut {
     lines_on: bool,
     perf_on: bool,
     perf_rows: Vec<VfPerfRow>,
-    perf_tick_ms: f32,
+    perf_tick: (f32, f32, f32),
+    perf_scene: VfSceneCounts,
     log: String,
     near: f32,
     far: f32,
@@ -376,7 +387,8 @@ impl Sim {
             lines_on,
             perf_on: live.gpu.perf_on(),
             perf_rows: Vec::new(),
-            perf_tick_ms: 0.0,
+            perf_tick: (0.0, 0.0, 0.0),
+            perf_scene: VfSceneCounts::default(),
             log: String::new(),
         }));
         let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
@@ -458,9 +470,11 @@ impl Sim {
                         g.perf_on = live.gpu.perf_on();
                         if g.perf_on {
                             g.perf_rows = live.gpu.perf_overlay();
-                            g.perf_tick_ms = live.gpu.perf_tick_ms();
+                            g.perf_tick = live.gpu.perf_tick_range();
+                            g.perf_scene = live.gpu.perf_scene();
                         } else {
                             g.perf_rows.clear();
+                            g.perf_scene = VfSceneCounts::default();
                         }
                         if !live.last_log.is_empty() {
                             g.log = std::mem::take(&mut live.last_log);
@@ -567,7 +581,8 @@ impl Sim {
                     lines_on: l.lines_on,
                     perf_on: l.gpu.perf_on(),
                     perf_rows: if l.gpu.perf_on() { l.gpu.perf_overlay() } else { Vec::new() },
-                    perf_tick_ms: l.gpu.perf_tick_ms(),
+                    perf_tick: l.gpu.perf_tick_range(),
+                    perf_scene: l.gpu.perf_scene(),
                     log: String::new(),
                     near: l.near,
                     far: l.far,
@@ -621,7 +636,8 @@ impl Sim {
                     lines_on: g.lines_on,
                     perf_on: g.perf_on,
                     perf_rows: g.perf_rows.clone(),
-                    perf_tick_ms: g.perf_tick_ms,
+                    perf_tick: g.perf_tick,
+                    perf_scene: g.perf_scene,
                     log: std::mem::take(&mut g.log),
                     near: 0.0,
                     far: 60.0,
@@ -1040,7 +1056,15 @@ fn main() {
             } else {
                 std::ptr::null()
             };
-            vf_view_perf(view, ptr, prow.len() as u32, out.perf_tick_ms);
+            vf_view_perf(
+                view,
+                ptr,
+                prow.len() as u32,
+                out.perf_tick.0,
+                out.perf_tick.1,
+                out.perf_tick.2,
+                &out.perf_scene,
+            );
             vf_view_end(view);
         }
 
