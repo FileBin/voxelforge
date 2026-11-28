@@ -1,0 +1,267 @@
+#version 450
+/* Связные компоненты поля занятости — целиком на устройстве.
+ *
+ * Вход: поле (f32, внутри минус) на регулярной сетке узлов. Выход: номер
+ * компоненты на каждый узел, габариты и размеры компонент, плоский список
+ * узлов по компонентам.
+ *
+ * Алгоритм тот же, что у CPU-оракула `crates/world/src/parts.rs`, и обязан
+ * давать РОВНО ту же разметку:
+ *
+ *   0. ЯДРО — занятые узлы, у которых все 6 соседей тоже заняты (эрозия на
+ *      `par.y` слоёв; поддерживаются 0 и 1). Угловой контакт и нитка в один
+ *      узел в ядро не входят, поэтому перемычка тоньше шага решётки
+ *      компоненты не склеивает.
+ *   1. Распространение МИНИМАЛЬНОЙ метки по 6 соседям (atomicMin) внутри ядра
+ *      до стабилизации. Кроме соседей берётся и `label[label[i]]` (pointer
+ *      jumping): за один проход метка уезжает вдвое дальше, и проходов нужно
+ *      O(log диаметра), а не O(диаметра).
+ *   2. Остаток без ядра (тонкие пластины) помечается своим индексом и
+ *      размечается отдельно — иначе он исчез бы совсем.
+ *   3. «Кожа» (эродированные узлы) получает метку ближайшего ядра; в метки
+ *      ядра писать нельзя, иначе один кусок «съел» бы метку другого.
+ *   4. Сбор корней: atomicAdd на каждый новый корень.
+ *   5. Сжатие: номер компоненты = позиция корня в отсортированном хостом
+ *      списке (двоичный поиск), там же габарит и счётчик узлов.
+ *   6. Плоский список узлов по компонентам: курсор на компоненту (atomicAdd),
+ *      начало блока — префиксная сумма счётчиков с хоста.
+ *
+ * ПАМЯТЬ. Горячие буферы (поле, метки, маска, габариты со счётчиками, курсор,
+ * список узлов) лежат в DEVICE-LOCAL: atomicMin по host-visible памяти у
+ * дискретной карты идёт через PCIe и делает проход в десятки раз дороже.
+ * Хост обменивается с устройством только через два staging-буфера (`stage` —
+ * узлы, `meta` — мелочь на компоненту), копирование делает сам же шейдер
+ * (режимы 8..13).
+ */
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) buffer Val { float val[]; };      // поле (минус внутри), device-local
+layout(std430, binding = 1) buffer Lab { uint label[]; };     // метки: EMPTY — пусто, device-local
+layout(std430, binding = 2) buffer Msk { uint mask[]; };      // 0 пусто, 1 ядро, 2 кожа, 3 остаток
+layout(std430, binding = 3) buffer Cnt { uint cnt[]; };       // [0] changed, [1] корней, [2] компонент
+layout(std430, binding = 4) buffer Mdev { uint mdev[]; };     // bnd 6*cap, затем counts cap
+layout(std430, binding = 5) buffer Roots { uint roots[]; };   // индекс корня (отсортирован хостом)
+layout(std430, binding = 6) buffer Offs { uint offs[]; };     // начало блока узлов в списке
+layout(std430, binding = 7) buffer Cur { uint cursor[]; };    // курсор на компоненту
+layout(std430, binding = 8) buffer Nodes { uint nodes[]; };   // плоский список узлов
+layout(std430, binding = 9) buffer Meta { uint meta[]; };     // staging: bnd/counts
+layout(std430, binding = 10) buffer Stage { uint stage[]; };  // staging: поле/метки/список
+layout(std430, binding = 11) buffer Act { uint act[]; };      // список ЗАНЯТЫХ узлов
+
+layout(push_constant) uniform PC {
+    uvec4 grid; // nx, ny, nz, всего узлов
+    uvec4 par;  // режим, слоёв эрозии, ёмкость компонент, номер прохода
+} pc;
+
+const uint EMPTY = 0xFFFFFFFFu;
+
+uint nx() { return pc.grid.x; }
+uint ny() { return pc.grid.y; }
+uint nz() { return pc.grid.z; }
+uint total() { return pc.grid.w; }
+uint cap() { return pc.par.z; }
+
+/* Ядро: занятый узел, у которого все шесть соседей заняты (вне сетки — пусто). */
+bool core_at(uint i, uint x, uint y, uint z) {
+    if (val[i] >= 0.0) {
+        return false;
+    }
+    uint a = nx(), b = ny(), c = nz();
+    bool ok = true;
+    ok = ok && (x > 0u && val[i - 1u] < 0.0);
+    ok = ok && (x + 1u < a && val[i + 1u] < 0.0);
+    ok = ok && (y > 0u && val[i - a] < 0.0);
+    ok = ok && (y + 1u < b && val[i + a] < 0.0);
+    ok = ok && (z > 0u && val[i - a * b] < 0.0);
+    ok = ok && (z + 1u < c && val[i + a * b] < 0.0);
+    return ok;
+}
+
+/* Минимум метки по 6 соседям с маской `want` (0 — любая ненулевая). */
+uint min_label(uint i, uint x, uint y, uint z, uint want) {
+    uint a = nx(), b = ny();
+    uint l = EMPTY;
+    uint m, j;
+    if (x > 0u) { j = i - 1u; m = mask[j]; if ((want == 0u) ? (m != 0u) : (m == want)) { l = min(l, label[j]); } }
+    if (x + 1u < a) { j = i + 1u; m = mask[j]; if ((want == 0u) ? (m != 0u) : (m == want)) { l = min(l, label[j]); } }
+    if (y > 0u) { j = i - a; m = mask[j]; if ((want == 0u) ? (m != 0u) : (m == want)) { l = min(l, label[j]); } }
+    if (y + 1u < b) { j = i + a; m = mask[j]; if ((want == 0u) ? (m != 0u) : (m == want)) { l = min(l, label[j]); } }
+    if (z > 0u) { j = i - a * b; m = mask[j]; if ((want == 0u) ? (m != 0u) : (m == want)) { l = min(l, label[j]); } }
+    if (z + 1u < nz()) { j = i + a * b; m = mask[j]; if ((want == 0u) ? (m != 0u) : (m == want)) { l = min(l, label[j]); } }
+    return l;
+}
+
+/* Pointer jumping: метка указывает на узел той же компоненты, его метка тоже
+ * годна — за проход фронт уезжает дальше. Цепочка локальная (без синхронизации
+ * между потоками): метки только убывают и всегда указывают внутрь своей
+ * компоненты, поэтому `label[label[...]]` — это «тот же кусок», а не чужой. */
+uint jump_label(uint i, uint l) {
+    for (uint k = 0u; k < pc.par.w && k < 64u; k++) {
+        uint self_l = label[i];
+        if (self_l >= total()) {
+            break;
+        }
+        uint up = label[self_l];
+        if (up >= l) {
+            break;
+        }
+        l = up;
+    }
+    return l;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint mode = pc.par.x;
+
+    /* Режимы копирования обслуживают `cap` элементов, остальные — узлы. */
+    if (mode == 11u) {
+        if (i >= cap()) {
+            return;
+        }
+        cursor[i] = 0u;
+        return;
+    }
+    if (mode == 12u) {
+        if (i >= 7u * cap()) {
+            return;
+        }
+        meta[i] = mdev[i];
+        return;
+    }
+    if (mode == 13u) {
+        if (i >= 7u * cap()) {
+            return;
+        }
+        mdev[i] = meta[i];
+        return;
+    }
+    /* Режимы по УЗЛАМ идут по списку занятых: в блоке поля заняты единицы
+     * процентов узлов, и полный обход платил бы за пустоту в десятки раз. */
+    uint mode_nodes = (mode == 1u || mode == 2u || mode == 3u || mode == 4u || mode == 5u ||
+                       mode == 6u || mode == 7u)
+                          ? 1u
+                          : 0u;
+    if (mode_nodes == 1u) {
+        if (i >= cnt[3]) {
+            return;
+        }
+        i = act[i];
+    } else if (i >= total()) {
+        return;
+    }
+    uint x = i % nx();
+    uint y = (i / nx()) % ny();
+    uint z = i / (nx() * ny());
+
+    if (mode == 0u) {
+        /* Инициализация: ядро получает свой индекс, кожа и пустота — EMPTY.
+         * Здесь же собирается список занятых узлов (cnt[3]): дальше все
+         * проходы идут ТОЛЬКО по нему — в блоке поля занято единицы процентов,
+         * и считать пустоту значит платить в десятки раз больше. */
+        bool solid = val[i] < 0.0;
+        bool core = (pc.par.y == 0u) ? solid : core_at(i, x, y, z);
+        mask[i] = core ? 1u : (solid ? 2u : 0u);
+        label[i] = core ? i : EMPTY;
+        if (solid) {
+            uint slot = atomicAdd(cnt[3], 1u);
+            if (slot < total()) {
+                act[slot] = i;
+            }
+        }
+    } else if (mode == 1u) {
+        /* Распространение по ядру. */
+        if (mask[i] != 1u) {
+            return;
+        }
+        uint l = jump_label(i, min_label(i, x, y, z, 1u));
+        if (l < label[i]) {
+            atomicMin(label[i], l);
+            atomicMax(cnt[0], 1u);
+        }
+    } else if (mode == 2u) {
+        /* Кожа: пишем только в mask == 2, читаем любые помеченные соседи. */
+        if (mask[i] != 2u) {
+            return;
+        }
+        uint l = jump_label(i, min_label(i, x, y, z, 0u));
+        if (l < label[i]) {
+            atomicMin(label[i], l);
+            atomicMax(cnt[0], 1u);
+        }
+    } else if (mode == 3u) {
+        /* Остаток без ядра: своим индексом, отдельная маска. */
+        if (mask[i] == 2u && label[i] == EMPTY) {
+            mask[i] = 3u;
+            label[i] = i;
+        }
+    } else if (mode == 4u) {
+        /* Распространение по остатку: только внутри mask == 3. */
+        if (mask[i] != 3u) {
+            return;
+        }
+        uint l = jump_label(i, min_label(i, x, y, z, 3u));
+        if (l < label[i]) {
+            atomicMin(label[i], l);
+            atomicMax(cnt[0], 1u);
+        }
+    } else if (mode == 5u) {
+        /* Корни: узел, чья метка равна ему самому. */
+        if (label[i] == EMPTY || label[i] != i) {
+            return;
+        }
+        uint id = atomicAdd(cnt[1], 1u);
+        if (id >= cap()) {
+            return; // ёмкость кончилась: лишние компоненты не попадут в список
+        }
+        roots[id] = i;
+    } else if (mode == 6u) {
+        /* Сжатие: индекс корня -> номер компоненты (двоичный поиск по
+         * отсортированному хостом списку), там же габарит и счётчик узлов. */
+        uint r = label[i];
+        if (r == EMPTY) {
+            return;
+        }
+        uint lo = 0u, hi = cnt[2];
+        while (lo < hi) {
+            uint mid = (lo + hi) >> 1u;
+            if (roots[mid] < r) {
+                lo = mid + 1u;
+            } else {
+                hi = mid;
+            }
+        }
+        if (lo < cnt[2] && roots[lo] == r) {
+            uint k = lo;
+            atomicAdd(mdev[6u * cap() + k], 1u);
+            atomicMin(mdev[6u * k + 0u], x);
+            atomicMin(mdev[6u * k + 1u], y);
+            atomicMin(mdev[6u * k + 2u], z);
+            atomicMax(mdev[6u * k + 3u], x);
+            atomicMax(mdev[6u * k + 4u], y);
+            atomicMax(mdev[6u * k + 5u], z);
+            label[i] = k;
+        } else {
+            label[i] = EMPTY;
+        }
+    } else if (mode == 7u) {
+        /* Плоский список узлов по компонентам. */
+        uint c = label[i];
+        if (c == EMPTY || c >= cap()) {
+            return;
+        }
+        uint pos = offs[c] + atomicAdd(cursor[c], 1u);
+        if (pos < total()) {
+            nodes[pos] = i;
+        }
+    } else if (mode == 8u) {
+        /* label -> staging (хост читает метки). */
+        stage[i] = label[i];
+    } else if (mode == 9u) {
+        /* staging -> поле (хост залил значения). */
+        val[i] = uintBitsToFloat(stage[i]);
+    } else if (mode == 10u) {
+        /* nodes -> staging (хост читает список). */
+        stage[i] = nodes[i];
+    }
+}

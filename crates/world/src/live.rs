@@ -354,6 +354,26 @@ pub fn model_matrix(pos: [f64; 3], quat: [f64; 4]) -> [f32; 16] {
  * окно на том же девайсе ходит в ядро через собственные объекты. */
 unsafe impl Send for Live {}
 
+/// Разложить тела на СВЯЗНЫЕ части ЧИСТО НА CPU: эталон для тестов (в кадре
+/// метки считает устройство — `Live::split_fragments_gpu`). Теты делятся по
+/// центроиду, поэтому сумма объёмов частей равна объёму родителя.
+#[cfg(test)]
+fn split_into_parts(frags: Vec<TetBody>, log_id: Option<u64>) -> Vec<TetBody> {
+    let mut out = Vec::with_capacity(frags.len());
+    for fr in frags {
+        match fr.split_disconnected(crate::parts::DEFAULT_ERODE, crate::parts::DEFAULT_PAD) {
+            Some(parts) => {
+                if let Some(id) = log_id {
+                    println!("тело {id} распалось на {} компонент", parts.len());
+                }
+                out.extend(parts);
+            }
+            None => out.push(fr),
+        }
+    }
+    out
+}
+
 pub struct Live {
     pub bodies: Vec<LiveBody>,
     pub gpu: GpuSim,
@@ -373,6 +393,10 @@ pub struct Live {
     /// Контакты считает `sdf_contact` по запечённым полям (VF_COLLIDE=sdf):
     /// tет-пары и SAT из такта уходят, широкий проход — по AABB тел.
     pub sdf_collide: bool,
+    /// Разбивать тела, поле которых распалось на НЕСВЯЗНЫЕ куски (в одном
+    /// теле два раздельных куска). По умолчанию включено, `VF_SPLIT=0`
+    /// выключает.
+    pub split_parts: bool,
     /// Пары тетов строит устройство (VF_PAIRS=gpu): тогда из кадра уходит и
     /// заливка пар, и чтение позиций тел.
     pub gpu_pairs: bool,
@@ -530,7 +554,7 @@ impl Live {
         let pairs_old = std::env::var("VF_PAIRS_OLD").is_ok();
         gpu.set_inline_pairs(gpu_pairs && !pairs_old);
 
-        Live {
+        let mut live = Live {
             next_id: 1 + (MAX_BODIES as u64),
             frames: 0,
             bullets: std::collections::VecDeque::new(),
@@ -539,6 +563,10 @@ impl Live {
                 Ok("gpu") | Ok("sdf")
             ),
             sdf_collide: matches!(std::env::var("VF_COLLIDE").as_deref(), Ok("sdf")),
+            /* Разбиение несвязных тел: включено, `VF_SPLIT=0` выключает.
+             * Нужно потому, что поле родителя рвётся там, где детали тоньше
+             * шага сетки, и в ОДНОМ теле оказываются два раздельных куска. */
+            split_parts: std::env::var("VF_SPLIT").map(|v| v != "0").unwrap_or(true),
             gpu_pairs,
             pairs_old,
             geom_dirty: true,
@@ -566,7 +594,17 @@ impl Live {
             ccd_stat: CcdStat::new(ccd_prof),
             ccd_prof,
             ccd_impacts: Vec::new(),
+        };
+        /* Инициализация/загрузка: тело из сейва или сцены может состоять из
+         * несвязных кусков. Разбиваем флагом, а не всегда: на обычной плите
+         * это лишний проход по всему полю. */
+        if std::env::var("VF_SPLIT_INIT").is_ok() {
+            let n = live.split_disconnected_bodies();
+            if n > 0 {
+                println!("VF_SPLIT_INIT: разложено {n} новых тел");
+            }
         }
+        live
     }
 
     /// Расталкивает только что созданные осколки ЧИСТО ПОЗИЦИОННО.
@@ -1817,6 +1855,153 @@ impl Live {
         }
     }
 
+    /// Разложить осколки на связные части, МЕТКИ — С УСТРОЙСТВА.
+    ///
+    /// Тяжёлое (разметка связности по узлам поля) считает GPU
+    /// (`components.comp`); если поле на устройстве посчитать не удалось,
+    /// берётся CPU-оракул. Создание тел, боксы и вырезка полей — на CPU: это
+    /// управление, а не счёт по узлам.
+    fn split_fragments_gpu(&mut self, frags: Vec<TetBody>, log_id: Option<u64>) -> Vec<TetBody> {
+        let mut out: Vec<TetBody> = Vec::with_capacity(frags.len());
+        for fr in frags {
+            let lab = {
+                let f = fr.sdf();
+                match self.gpu.run_components(f, crate::parts::DEFAULT_ERODE) {
+                    Some(g) => g.labels,
+                    None => crate::parts::label_field(f, crate::parts::DEFAULT_ERODE),
+                }
+            };
+            let seeds = crate::parts::split_with_labels(&fr, &lab, crate::parts::DEFAULT_PAD);
+            if seeds.len() < 2 {
+                out.push(fr);
+                continue;
+            }
+            if let Some(id) = log_id {
+                println!("тело {id} распалось на {} компонент", seeds.len());
+            }
+            for s in seeds {
+                let b = TetBody {
+                    tets: s.tets,
+                    level_cap: fr.level_cap,
+                    origin: fr.origin,
+                    sdf: Default::default(),
+                };
+                let _ = b.sdf.set(s.sdf);
+                out.push(b);
+            }
+        }
+        out
+    }
+
+    /// Разложить ВСЕ живые тела на связные части: инициализация, загрузка и
+    /// ручной вызов. Возвращает число созданных новых тел.
+    ///
+    /// Тело, чьё поле распалось на K несвязных кусков, заменяется K телами того
+    /// же материала: теты делятся по центроиду, поэтому масса и момент
+    /// сохраняются; скорость, поворот и признак берутся у родителя.
+    pub fn split_disconnected_bodies(&mut self) -> usize {
+        if !self.split_parts {
+            return 0;
+        }
+        /* Снимок списка: `free_slot()` дописывает тела в конец, и обход по
+         * живому vec сбился бы на них. */
+        let slots: Vec<usize> = (0..self.bodies.len())
+            .filter(|&i| self.bodies[i].alive && !matches!(self.bodies[i].kind, Kind::Bullet))
+            .collect();
+        let mut made = 0usize;
+        let mut touched: Vec<usize> = Vec::new();
+        for ti in slots {
+            let (id, tq, tpos, tvel, kind) = {
+                let b = &self.bodies[ti];
+                (b.id, b.quat, b.pos, b.vel, b.kind)
+            };
+            let tb = {
+                let tb = TetBody {
+                    tets: self.bodies[ti].tets.clone(),
+                    level_cap: self.bodies[ti].level_cap,
+                    origin: self.bodies[ti].origin,
+                    sdf: Default::default(),
+                };
+                if let Some(f) = &self.bodies[ti].sdf {
+                    let _ = tb.sdf.set(f.clone());
+                }
+                tb
+            };
+            let parts = self.split_fragments_gpu(vec![tb.clone()], Some(id));
+            if parts.len() < 2 {
+                continue;
+            }
+            let c = tb.world_centroid();
+            for (k, fr) in parts.iter().enumerate() {
+                let slot = if k == 0 {
+                    ti
+                } else {
+                    match self.free_slot() {
+                        Some(s) => s,
+                        None => {
+                            eprintln!("DIAG split_disconnected: нет свободных слотов");
+                            break;
+                        }
+                    }
+                };
+                /* Центр части — в координатах решётки; разница с центроидом
+                 * родителя даёт смещение в системе тела. */
+                let lc = fr.world_centroid();
+                let off = rot(
+                    tq,
+                    [
+                        (lc[0] - c[0]) as f64,
+                        (lc[1] - c[1]) as f64,
+                        (lc[2] - c[2]) as f64,
+                    ],
+                );
+                let mut body = LiveBody {
+                    id: self.new_id(),
+                    crack_after: self.frames + 30,
+                    pos: [off[0] + tpos[0], off[1] + tpos[1], off[2] + tpos[2]],
+                    quat: tq,
+                    vel: tvel,
+                    mass: DENSITY * fr.volume(),
+                    radius: 0.2,
+                    tets: fr.tets.clone(),
+                    origin: fr.origin,
+                    sdf: fr.sdf.get().cloned(),
+                    sdf_shift: [0.0; 3],
+                    level_cap: fr.level_cap,
+                    local: Vec::new(),
+                    mesh: -1,
+                    lines: -1,
+                    kind,
+                    alive: true,
+                };
+                body.rebuild();
+                body.radius = body.radius_of();
+                if !self.gpu_collide {
+                    self.mirror[slot] = gpu_body(&body);
+                }
+                if slot < self.bodies.len() {
+                    self.bodies[slot] = body;
+                } else {
+                    self.bodies.push(body);
+                }
+                touched.push(slot);
+                made += 1;
+            }
+        }
+        if made > 0 {
+            /* Слоты уезжают на устройство сразу: иначе снимок вернёт в слот
+             * старое тело (см. `split`). */
+            let items: Vec<(usize, GpuBody)> = touched
+                .iter()
+                .map(|&sl| (sl, gpu_body(&self.bodies[sl])))
+                .collect();
+            self.gpu.write_slots(&items);
+            self.refresh_vmax();
+            self.geom_dirty = true;
+        }
+        made
+    }
+
     pub fn split(&mut self, ti: usize, point: [f32; 3], energy: f32, max_new: usize) {
         /* Поза цели нужна для точки удара и начального положения осколков:
          * берём одно тело с устройства, а не весь буфер. */
@@ -1864,7 +2049,25 @@ impl Live {
             want.clamp(3.0, hi) as usize
         };
         let mut frags = tb.shatter_biased(n, 0x51ED_2A17 ^ (self.cracks as u64 + 1), focus);
+        /* Осколок сам может быть НЕСВЯЗНЫМ: поле родителя рвётся там, где
+         * детали тоньше шага сетки, и в одном теле оказываются два раздельных
+         * куска. Такие тела раскладываем на отдельные — теты уходят по
+         * центроиду, поэтому сумма объёмов (а значит и масса) сохраняется. */
+        if self.split_parts {
+            let parent_id = self.bodies[ti].id;
+            frags = self.split_fragments_gpu(frags, Some(parent_id));
+        }
+        /* Нехватка слотов не должна молча съедать массу: считаем объём до и
+         * после обрезки и печатаем потерю, если она есть. */
+        let vol_before: f64 = frags.iter().map(|f| f.volume()).sum();
         frags.truncate(max_new);
+        let vol_after: f64 = frags.iter().map(|f| f.volume()).sum();
+        if vol_after < vol_before * 0.999 {
+            eprintln!(
+                "DIAG split: не хватило слотов — потеряно {:.1}% объёма осколков",
+                (1.0 - vol_after / vol_before.max(1e-12)) * 100.0
+            );
+        }
         if frags.len() < 2 {
             return;
         }
@@ -2273,4 +2476,73 @@ fn gpu_body(b: &LiveBody) -> GpuBody {
     };
     g.half_shape = [half[0], half[1], half[2], 1.0];
     g
+}
+
+#[cfg(test)]
+mod parts_tests {
+    //! Разложение тел на связные части на уровне логики (без GPU и окна):
+    //! осколок из двух раздельных кусков обязан стать двумя телами, а связное
+    //! тело — остаться одним.
+    use super::*;
+    use crate::field;
+    use crate::tet::{bcc_tets_at_dedup, node_step};
+
+    fn ball_nodes(c: (i32, i32, i32), r: i32) -> Vec<(i32, i32, i32)> {
+        let mut out = Vec::new();
+        for z in c.2 - r..=c.2 + r {
+            for y in c.1 - r..=c.1 + r {
+                for x in c.0 - r..=c.0 + r {
+                    let (dx, dy, dz) = (x - c.0, y - c.1, z - c.2);
+                    if dx * dx + dy * dy + dz * dz <= r * r {
+                        out.push((x, y, z));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn tets_of(nodes: &[(i32, i32, i32)]) -> Vec<Tet> {
+        let mut out = Vec::new();
+        for &n in nodes {
+            for t in bcc_tets_at_dedup(n) {
+                out.push(Tet { level: 0, v: t });
+            }
+        }
+        out
+    }
+
+    /// Осколок из ДВУХ раздельных кусков (перемычка тоньше шага поля) даёт два
+    /// тела, а объём частей равен объёму осколка — масса сохраняется.
+    #[test]
+    fn two_piece_fragment_becomes_two_bodies() {
+        let mut nodes = ball_nodes((8, 12, 12), 5);
+        nodes.extend(ball_nodes((28, 12, 12), 5));
+        let mut f = field::from_occupied(nodes.iter().copied(), 4);
+        f.step = node_step(0);
+        let body = TetBody {
+            tets: tets_of(&nodes),
+            level_cap: 0,
+            origin: [0.0; 3],
+            sdf: Default::default(),
+        };
+        let _ = body.sdf.set(f);
+        let v0 = body.volume();
+        let parts = split_into_parts(vec![body], Some(7));
+        assert_eq!(parts.len(), 2, "два куска в осколке — два тела");
+        let v: f64 = parts.iter().map(|p| p.volume()).sum();
+        assert!(
+            (v - v0).abs() <= v0 * 0.01,
+            "объём потерян: {v} против {v0} ({:.2}%)",
+            (v - v0).abs() / v0 * 100.0
+        );
+    }
+
+    /// Связный осколок проходит через разложение без изменений.
+    #[test]
+    fn connected_fragment_stays_one() {
+        let body = TetBody::cube([0.0, 0.0, 0.0], 4, 1);
+        let parts = split_into_parts(vec![body], None);
+        assert_eq!(parts.len(), 1, "цельное тело делить не надо");
+    }
 }

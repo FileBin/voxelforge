@@ -950,6 +950,34 @@ impl TetBody {
         }).collect()
     }
 
+    /// Разбить тело на СВЯЗНЫЕ части по занятости его поля (`parts`).
+    ///
+    /// `None` — тело связное; `Some(parts)` — поле распалось, частей ≥ 2.
+    /// `erode` — слоёв эрозии до разметки (1: нитка в узел не держит),
+    /// `pad` — узлов пустоты вокруг части. Теты делятся по центроиду, поэтому
+    /// сумма объёмов частей равна объёму родителя.
+    pub fn split_disconnected(&self, erode: u32, pad: i32) -> Option<Vec<TetBody>> {
+        let seeds = crate::parts::split_disconnected_with(self, erode, pad);
+        if seeds.len() < 2 {
+            return None;
+        }
+        Some(
+            seeds
+                .into_iter()
+                .map(|s| {
+                    let b = TetBody {
+                        tets: s.tets,
+                        level_cap: self.level_cap,
+                        origin: self.origin,
+                        sdf: Default::default(),
+                    };
+                    let _ = b.sdf.set(s.sdf);
+                    b
+                })
+                .collect(),
+        )
+    }
+
     /// Тетраэдры в локальных координатах (относительно центроида) — для
     /// столкновений и для показа самих тетраэдров во вьюере.
     pub fn local_tets(&self) -> Vec<[[f32; 3]; 4]> {
