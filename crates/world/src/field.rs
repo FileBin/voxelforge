@@ -41,6 +41,36 @@ impl NodeField {
         self.val[i] = v;
     }
 
+    /// Сгладить поле расстояний: тетраэдры задают СТУПЕНЧАТУЮ границу, и её
+    /// ноль повторяет клетки. Усреднение по шести соседям убирает эти ступеньки,
+    /// оставляя общую форму (сглаживается только величина, знак не трогаем —
+    /// иначе тонкие тела исчезают).
+    pub fn smooth(&mut self, iterations: usize, lambda: f32) {
+        let dims = self.dims;
+        for _ in 0..iterations {
+            let src = self.val.clone();
+            for z in 1..dims[2].saturating_sub(1) {
+                for y in 1..dims[1].saturating_sub(1) {
+                    for x in 1..dims[0].saturating_sub(1) {
+                        let i = (z * dims[1] + y) * dims[0] + x;
+                        let sx = dims[0];
+                        let sy = dims[0] * dims[1];
+                        let avg = (src[i - 1] + src[i + 1] + src[i - sx] + src[i + sx]
+                            + src[i - sy] + src[i + sy])
+                            / 6.0;
+                        let v = src[i] + lambda * (avg - src[i]);
+                        let keep_sign = if src[i] < 0.0 {
+                            -v.abs().max(1e-6)
+                        } else {
+                            v.abs().max(1e-6)
+                        };
+                        self.val[i] = keep_sign;
+                    }
+                }
+            }
+        }
+    }
+
     /// Трилинейная выборка поля в произвольной точке (в координатах узлов).
     pub fn sample(&self, p: [f32; 3]) -> f32 {
         let x0 = p[0].floor();

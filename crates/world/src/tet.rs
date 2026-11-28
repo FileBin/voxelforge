@@ -275,7 +275,12 @@ impl TetBody {
     pub fn sdf(&self) -> &field::NodeField {
         self.sdf.get_or_init(|| {
             let flat: Vec<[Node; 4]> = self.tets.iter().map(|t| t.v).collect();
-            field::from_tets_exact(&flat, 6)
+            let mut f = field::from_tets_exact(&flat, 6);
+            /* Тело — объединение тетов, его граница ступенчатая. Несколько
+             * проходов по полю снимают ступеньки тетраэдров, и изоповерхность
+             * выходит гладкой оболочкой, а не гранёной. */
+            f.smooth(3, 0.6);
+            f
         })
     }
 
@@ -855,6 +860,29 @@ impl TetBody {
             indices,
             level,
         };
+        /* Проекция вершин на изоповерхность поля: линейная интерполяция вдоль
+         * ребра тета смещает точку на кривой изоповерхности. Два шага Ньютона по
+         * градиенту ставят вершину туда, где поле РАВНО нулю, поэтому между
+         * треугольниками не остаётся «ступенек» интерполяции. */
+        {
+            let step = node_step(level);
+            let origin = self.origin;
+            for p in mesh.positions.iter_mut() {
+                for _ in 0..2 {
+                    let local = [
+                        (p[0] - origin[0]) / step,
+                        (p[1] - origin[1]) / step,
+                        (p[2] - origin[2]) / step,
+                    ];
+                    let v = f.sample(local);
+                    let g = f.gradient(local);
+                    let d = v * step;
+                    p[0] -= g[0] * d;
+                    p[1] -= g[1] * d;
+                    p[2] -= g[2] * d;
+                }
+            }
+        }
         recompute_normals(&mut mesh);
         mesh
     }
