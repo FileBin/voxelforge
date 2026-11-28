@@ -700,7 +700,10 @@ impl GpuSim {
             /* Параллельный скан — по умолчанию. Сверка probe_scan на одних
              * данных: расхождений 0 и по start, и по ячейкам. VF_SCAN=serial
              * возвращает старый однопоточный проход (для сверки). */
-            flat_pairs: !matches!(std::env::var("VF_PAIRGEN").as_deref(), Ok("cell")),
+            /* Старое крыло — VF_PAIRGEN=cell (наше имя) или VF_PAIRS_OLD=1
+             * (как звали в задаче): оба включают проход по ячейкам. */
+            flat_pairs: !matches!(std::env::var("VF_PAIRGEN").as_deref(), Ok("cell"))
+                && std::env::var("VF_PAIRS_OLD").is_err(),
             par_scan: !matches!(std::env::var("VF_SCAN").as_deref(), Ok("serial")),
             pair_stats: matches!(std::env::var("VF_PAIR_STATS").as_deref(), Ok(v) if v != "0"),
             baabb,
