@@ -78,6 +78,9 @@ unsafe extern "C" {
     fn vf_view_present_mode(v: *mut c_void) -> i32;
     fn vf_view_draw_lines(v: *mut c_void, lines: i32, model: *const f32, tint: *const f32);
     fn vf_view_end(v: *mut c_void);
+    /// Реальная работа последнего кадра, мс: запись команд + submit, без
+    /// ожидания fence/acquire и без паузы развёртки в present.
+    fn vf_view_frame_work_ms(v: *const c_void) -> f32;
     /// Оверлей стадий (F3 / VF_PERF=1): строки копируются внутрь окна.
     fn vf_view_perf(
         v: *mut c_void,
@@ -271,6 +274,9 @@ struct Shared {
     /// Строки последнего окна диагностики и мин/сред/макс такта.
     perf_rows: Vec<VfPerfRow>,
     perf_tick: (f32, f32, f32),
+    /// Работа последнего завершённого такта, мс («ИТОГО такт») — для графика
+    /// работы такта: интервал 50 мс при 20 Гц о нагрузке не говорит.
+    last_tick_ms: f32,
     /// Счётчики сцены: всего тел, бодрствующих, точек контакта.
     perf_scene: VfSceneCounts,
     /// Итог окна частот (кадры/такты) от главного потока: кадры видит только
@@ -310,6 +316,7 @@ struct SnapOut {
     perf_on: bool,
     perf_rows: Vec<VfPerfRow>,
     perf_tick: (f32, f32, f32),
+    last_tick_ms: f32,
     perf_scene: VfSceneCounts,
     /// Сколько тактов физики завершилось к этому кадру (для TPS).
     tick_no: u64,
@@ -418,6 +425,7 @@ impl Sim {
             perf_on: live.gpu.perf_on(),
             perf_rows: Vec::new(),
             perf_tick: (0.0, 0.0, 0.0),
+            last_tick_ms: 0.0,
             perf_scene: VfSceneCounts::default(),
             rates: RatesOut::default(),
             tick_no: live.gpu.perf_ticks(),
@@ -514,10 +522,12 @@ impl Sim {
                         if g.perf_on {
                             g.perf_rows = live.gpu.perf_overlay();
                             g.perf_tick = live.gpu.perf_tick_range();
+                            g.last_tick_ms = live.gpu.perf_last_tick_ms();
                             g.perf_scene = live.gpu.perf_scene();
                             g.ccd_line = live.ccd_stat.line.clone();
                         } else {
                             g.perf_rows.clear();
+                            g.last_tick_ms = 0.0;
                             g.perf_scene = VfSceneCounts::default();
                             g.ccd_line.clear();
                         }
@@ -651,6 +661,7 @@ impl Sim {
                     perf_on: l.gpu.perf_on(),
                     perf_rows: if l.gpu.perf_on() { l.gpu.perf_overlay() } else { Vec::new() },
                     perf_tick: l.gpu.perf_tick_range(),
+                    last_tick_ms: l.gpu.perf_last_tick_ms(),
                     perf_scene: l.gpu.perf_scene(),
                     tick_no: l.gpu.perf_ticks(),
                     ccd_line: if l.gpu.perf_on() { l.ccd_stat.line.clone() } else { String::new() },
@@ -712,6 +723,7 @@ impl Sim {
                     perf_on: g.perf_on,
                     perf_rows: g.perf_rows.clone(),
                     perf_tick: g.perf_tick,
+                    last_tick_ms: g.last_tick_ms,
                     perf_scene: g.perf_scene,
                     tick_no: g.tick_no,
                     ccd_line: g.ccd_line.clone(),
@@ -1018,11 +1030,6 @@ fn main() {
             sim.set_rates(ro);
         }
         let out = sim.frame(tick, max_frames > 0, substeps_arg, iterations_arg);
-        /* Один кадр окна частот: время кадра — настоящее, такты — дельта
-         * счётчика завершённых (номинальные 20 Гц тут ничего не говорят). */
-        let dticks = out.tick_no.saturating_sub(last_tick_no).min(u32::MAX as u64) as u32;
-        last_tick_no = out.tick_no;
-        rates.sample(std::time::Instant::now(), frame_ms, dticks);
 
         if dbg_steps && matches!(sim, Sim::Thread { .. }) {
             /* Позиция, которую видит шейдер = mix(prev, cur, alpha) по
@@ -1200,6 +1207,17 @@ fn main() {
             );
             vf_view_end(view);
         }
+
+        /* Один кадр окна: период кадра (для крайних fps), РАБОТА кадра из C
+         * (запись команд + submit, без ожидания fence/acquire и без паузы
+         * развёртки), работа последнего такта (ИТОГО такт) и дельта счётчика
+         * завершённых тактов. Раньше здесь в график шёл период кадра
+         * (1000/frame_ms) — при 60 fps он всегда 16.7 мс, и график показывал
+         * развёртку, а не нагрузку. */
+        let dticks = out.tick_no.saturating_sub(last_tick_no).min(u32::MAX as u64) as u32;
+        last_tick_no = out.tick_no;
+        let work_ms = unsafe { vf_view_frame_work_ms(view) };
+        rates.sample(std::time::Instant::now(), frame_ms, work_ms, out.last_tick_ms, dticks);
 
         /* Ограничитель нужен только когда показ не привязан к развёртке
          * (MAILBOX/IMMEDIATE): иначе цикл молотит сотни кадров, GPU забит и

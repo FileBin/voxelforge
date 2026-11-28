@@ -152,6 +152,8 @@
 чтения обратно, запись команд, замок очереди, `vkQueueSubmit`, итого. «кадр»:
 `wait fence · acquire · record · lock sub · submit · lock pres · present ·
 interval · gpu idle` (min/mean/max/p99 за 1 с); те же строки в оверлее.
+Два графика под строкой частот — работа кадра (record+lock+submit, сумма фаз) и
+работа такта («ИТОГО такт»), линии бюджета 16.7 / 50 мс; fps/tps остаются числом.
 
 Замер (живое окно, RADV NAVI23, «плита + выстрелы», `VF_CHUNKS=4`):
 
