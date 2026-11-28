@@ -11,6 +11,43 @@ pub const DENSITY: f64 = 420.0;
 pub const MIN_TETS: usize = 20;
 /// Сколько снарядов живёт одновременно; дальше самый старый уходит из мира.
 pub const MAX_BULLETS: usize = 12;
+/// Дешёвый порог CCD: если самое быстрое тело за такт смещается меньше этого,
+/// читать буфер тел ради continuous не нужно вовсе (метры).
+const CCD_MIN_MOVE: f64 = 0.05;
+
+/// Длина вектора скорости из `GpuBody` (w — обратная масса, не участвует).
+fn len3(v: [f32; 4]) -> f32 {
+    (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+}
+
+/// Разность скоростей пары.
+fn sub3(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2], 0.0]
+}
+
+/// Полуразмер габарита ПОЛЯ тела (максимум по осям, метры). Именно он задаёт
+/// «свой размер» для порога continuous: радиус тетов у шара занижен вдвое.
+fn field_half(f: Option<&crate::field::NodeField>) -> f32 {
+    let Some(f) = f else { return 0.0 };
+    (0..3)
+        .map(|k| (f.dims[k] as f32 - 1.0) * f.step * 0.5)
+        .fold(0.0f32, f32::max)
+}
+
+/// Расстояние от точки `q` до отрезка `p .. p + v*dt` — грубое отсечение пар
+/// перед бисекцией.
+fn segment_point_dist(p: [f32; 4], v: [f32; 4], dt: f32, q: [f32; 4]) -> f32 {
+    let d = [v[0] * dt, v[1] * dt, v[2] * dt];
+    let w = [q[0] - p[0], q[1] - p[1], q[2] - p[2]];
+    let dd = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+    let t = if dd > 1e-12 {
+        ((w[0] * d[0] + w[1] * d[1] + w[2] * d[2]) / dd).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let c = [w[0] - d[0] * t, w[1] - d[1] * t, w[2] - d[2] * t];
+    (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt()
+}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Kind {
@@ -207,6 +244,18 @@ pub struct Live {
     /// Скорость, которую CPU узнал от события (выстрел, осколки). Статистика
     /// прошлого такта её не знает — на один такт берём максимум из двух.
     pending_vmax: f32,
+    /// Пробные точки CCD на тело (ключ — устойчивый `id`). Поле печётся один
+    /// раз на тело, поэтому и точки переиспользуются; слот с новым id их не
+    /// наследует.
+    ccd_probes: Vec<(u64, Vec<crate::ccd::ProbePoint>)>,
+    /// Сколько раз за такт включился continuous-режим (для VF_PERF/диагностики).
+    pub last_ccd: u32,
+    /// Сколько миллисекунд занял CCD-проход (CPU: чтение тел + бисекция).
+    pub last_ccd_ms: f32,
+    /// Удары, найденные CCD и ждущие раскола: (тело, партнёр, точка, энергия).
+    /// Обрабатываются в НАЧАЛЕ следующего такта — там же, где события с
+    /// устройства, и ДО заливки геометрии: осколки обязаны попасть в пул.
+    ccd_impacts: Vec<(usize, usize, [f32; 3], f32)>,
 }
 
 /// Исходная сцена мира: ПЛИТА на полу, шар-снаряд при выстреле и пул спящих
@@ -333,6 +382,10 @@ impl Live {
             last_vmax: 0.0,
             last_awake: 64,
             pending_vmax: 0.0,
+            ccd_probes: Vec::new(),
+            last_ccd: 0,
+            last_ccd_ms: 0.0,
+            ccd_impacts: Vec::new(),
         }
     }
 
@@ -420,6 +473,279 @@ impl Live {
         }
     }
 
+    /// Пробные точки CCD для тела `i` (кэш по устойчивому id: поле печётся
+    /// один раз, поэтому точки тоже).
+    fn ccd_probe(&mut self, i: usize) -> Vec<crate::ccd::ProbePoint> {
+        if i >= self.bodies.len() {
+            return Vec::new();
+        }
+        let id = self.bodies[i].id;
+        if let Some((_, pts)) = self.ccd_probes.iter().find(|(cid, _)| *cid == id) {
+            return pts.clone();
+        }
+        let Some(f) = self.bodies[i].sdf.as_ref() else {
+            return Vec::new();
+        };
+        let pts = crate::ccd::probe_points(f, self.bodies[i].sdf_shift, crate::ccd::PROBE_POINTS);
+        self.ccd_probes.push((id, pts.clone()));
+        if self.ccd_probes.len() > 4 * MAX_BODIES {
+            self.ccd_probes.remove(0);
+        }
+        pts
+    }
+
+    /// Continuous-режим для быстрых тел (CCD бисекцией по SDF).
+    ///
+    /// Включается ТОЛЬКО когда относительное смещение за такт больше размера
+    /// меньшего тела: медленные тела идут прежним путём и ничего не платят.
+    /// Для такой пары ищем первый момент касания вдоль перемещения, ставим
+    /// туда быстрое тело и гасим нормальную скорость в точке касания — иначе
+    /// тело оказывается по другую сторону партнёра между подшагами
+    /// (туннелирование), а на малой скорости ведёт себя нормально.
+    fn ccd_pass(&mut self, dt: f32) {
+        self.last_ccd = 0;
+        self.last_ccd_ms = 0.0;
+        if matches!(std::env::var("VF_CCD").as_deref(), Ok("0")) {
+            return;
+        }
+        let t_ccd = std::time::Instant::now();
+        let iters = std::env::var("VF_CCD_ITERS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(12)
+            .clamp(1, 24);
+        /* Дешёвый порог: без быстрых тел буфер тел не читаем вовсе. */
+        let vmax = (self.pending_vmax as f64).max(self.last_vmax as f64);
+        if vmax <= 0.0 || vmax * dt as f64 <= CCD_MIN_MOVE {
+            return;
+        }
+        let snap = self.gpu.read_bodies();
+        let n = self.bodies.len().min(snap.len());
+        if n < 2 {
+            return;
+        }
+        let mut state: Vec<GpuBody> = snap.clone();
+        let mut changed: Vec<usize> = Vec::new();
+        let mut done: Vec<(usize, usize)> = Vec::new();
+        for i in 0..n {
+            if !self.bodies[i].alive || self.bodies[i].sdf.is_none() {
+                continue;
+            }
+            let gi = state[i];
+            if gi.misc[1] > 0.5 {
+                continue; /* спит — continuous не нужен */
+            }
+            let speed = len3(gi.vel_m);
+            /* размер тела — по ГАБАРИТУ ПОЛЯ, а не по радиусу тетов: у шара
+             * r=0.14 теты дают 0.2, и порог срабатывал раньше времени */
+            let half = field_half(self.bodies[i].sdf.as_ref());
+            if !crate::ccd::needs_continuous(speed, dt, half) {
+                continue;
+            }
+            let pts = self.ccd_probe(i);
+            if pts.is_empty() {
+                continue;
+            }
+            /* Самый ранний контакт по всем партнёрам. */
+            let mut best: Option<(usize, crate::ccd::SweepHit)> = None;
+            for j in 0..n {
+                if j == i || !self.bodies[j].alive || self.bodies[j].sdf.is_none() {
+                    continue;
+                }
+                if done.contains(&(i.min(j), i.max(j))) {
+                    continue;
+                }
+                let li = self.bodies[i].sdf.as_ref().map(|f| f.val.len()).unwrap_or(0);
+                let lj = self.bodies[j].sdf.as_ref().map(|f| f.val.len()).unwrap_or(0);
+                /* пробу берём с МЕНЬШЕГО тела: у него точки плотнее, и именно
+                 * его поверхность пересекает партнёра первой */
+                let (probe_i, other_i) = if li <= lj { (i, j) } else { (j, i) };
+                let pts_here = if probe_i == i { pts.clone() } else { self.ccd_probe(probe_i) };
+                if pts_here.is_empty() {
+                    continue;
+                }
+                let (fi, fj) = (
+                    self.bodies[i].sdf.as_ref().unwrap(),
+                    self.bodies[j].sdf.as_ref().unwrap(),
+                );
+                let (pk, ok) = if probe_i == i { (gi, state[j]) } else { (state[j], gi) };
+                if pk.misc[1] > 0.5 && ok.misc[1] > 0.5 {
+                    continue;
+                }
+                let pr = field_half(if probe_i == i {
+                    self.bodies[i].sdf.as_ref()
+                } else {
+                    self.bodies[j].sdf.as_ref()
+                });
+                let or_ = field_half(if probe_i == i {
+                    self.bodies[j].sdf.as_ref()
+                } else {
+                    self.bodies[i].sdf.as_ref()
+                });
+                let rel = sub3(ok.vel_m, pk.vel_m);
+                if !crate::ccd::needs_continuous(len3(rel), dt, pr.min(or_)) {
+                    continue;
+                }
+                /* отсечение по сфере, заметающей путь: иначе бисекция гоняет
+                 * точки по всему миру */
+                let move_len = len3(pk.vel_m) * dt;
+                if segment_point_dist(pk.pos_r, pk.vel_m, dt, ok.pos_r) > (pr + or_) * 1.5 + move_len * 0.0 + 0.05 {
+                    continue;
+                }
+                let probe_field = if probe_i == i { fi } else { fj };
+                let other_field = if probe_i == i { fj } else { fi };
+                let probe_shift = self.bodies[probe_i].sdf_shift;
+                let other_shift = self.bodies[other_i].sdf_shift;
+                let im_of = |g: &GpuBody| if g.misc[1] > 0.5 { g.misc[2] } else { g.vel_m[3] };
+                let ii_of = |g: &GpuBody| if g.misc[1] > 0.5 { g.misc[3] } else { g.ang_i[3] };
+                let pv = crate::ccd::BodyView {
+                    field: probe_field,
+                    shift: probe_shift,
+                    pos: [pk.pos_r[0], pk.pos_r[1], pk.pos_r[2]],
+                    quat: pk.quat,
+                    vel: [pk.vel_m[0], pk.vel_m[1], pk.vel_m[2]],
+                    ang: [pk.ang_i[0], pk.ang_i[1], pk.ang_i[2]],
+                    inv_mass: im_of(&pk),
+                    inv_inertia: ii_of(&pk),
+                    radius: pr,
+                    asleep: pk.misc[1] > 0.5,
+                };
+                let ov = crate::ccd::BodyView {
+                    field: other_field,
+                    shift: other_shift,
+                    pos: [ok.pos_r[0], ok.pos_r[1], ok.pos_r[2]],
+                    quat: ok.quat,
+                    vel: [ok.vel_m[0], ok.vel_m[1], ok.vel_m[2]],
+                    ang: [ok.ang_i[0], ok.ang_i[1], ok.ang_i[2]],
+                    inv_mass: im_of(&ok),
+                    inv_inertia: ii_of(&ok),
+                    radius: or_,
+                    asleep: ok.misc[1] > 0.5,
+                };
+                if let Some(hit) = crate::ccd::first_contact(&pts_here, &pv, &ov, dt, iters) {
+                    let better = best.map(|(_, h)| hit.t < h.t).unwrap_or(true);
+                    if better {
+                        best = Some((j, hit));
+                    }
+                }
+            }
+            let Some((j, hit)) = best else { continue };
+            /* применяем: поза в момент касания + импульс там же */
+            let (fi, fj) = (
+                self.bodies[i].sdf.as_ref().unwrap(),
+                self.bodies[j].sdf.as_ref().unwrap(),
+            );
+            let (probe_i, other_i) = if fi.val.len() <= fj.val.len() { (i, j) } else { (j, i) };
+            let (pi, oi) = (probe_i, other_i);
+            let pk = if pi == i { gi } else { state[j] };
+            let ok = if pi == i { state[j] } else { gi };
+            let im_of = |g: &GpuBody| if g.misc[1] > 0.5 { g.misc[2] } else { g.vel_m[3] };
+            let ii_of = |g: &GpuBody| if g.misc[1] > 0.5 { g.misc[3] } else { g.ang_i[3] };
+            let pv = crate::ccd::BodyView {
+                field: if pi == i { fi } else { fj },
+                shift: self.bodies[pi].sdf_shift,
+                pos: [pk.pos_r[0], pk.pos_r[1], pk.pos_r[2]],
+                quat: pk.quat,
+                vel: [pk.vel_m[0], pk.vel_m[1], pk.vel_m[2]],
+                ang: [pk.ang_i[0], pk.ang_i[1], pk.ang_i[2]],
+                inv_mass: im_of(&pk),
+                inv_inertia: ii_of(&pk),
+                radius: pk.prev_pos_r[3].max(1e-3),
+                asleep: pk.misc[1] > 0.5,
+            };
+            let ov = crate::ccd::BodyView {
+                field: if pi == i { fj } else { fi },
+                shift: self.bodies[oi].sdf_shift,
+                pos: [ok.pos_r[0], ok.pos_r[1], ok.pos_r[2]],
+                quat: ok.quat,
+                vel: [ok.vel_m[0], ok.vel_m[1], ok.vel_m[2]],
+                ang: [ok.ang_i[0], ok.ang_i[1], ok.ang_i[2]],
+                inv_mass: im_of(&ok),
+                inv_inertia: ii_of(&ok),
+                radius: ok.prev_pos_r[3].max(1e-3),
+                asleep: ok.misc[1] > 0.5,
+            };
+            let imp = crate::ccd::contact_impulse(&pv, &ov, &hit);
+            /* Энергию удара считаем ДО импульса (как impact.comp): по ней
+             * решается раскол. Событие уедет в очередь и обработается в начале
+             * следующего такта — до заливки геометрии осколков. */
+            let energy = {
+                let inv = pv.inv_mass + ov.inv_mass;
+                if self.fracture_enabled && imp.vn < 0.0 && inv > 0.0 {
+                    Some(0.5 * (1.0 / inv) * imp.vn * imp.vn)
+                } else {
+                    None
+                }
+            };
+            /* поза пробного тела — в момент касания (t доля шага) */
+            let mut gp = state[pi];
+            gp.pos_r[0] += pk.vel_m[0] * dt * hit.t;
+            gp.pos_r[1] += pk.vel_m[1] * dt * hit.t;
+            gp.pos_r[2] += pk.vel_m[2] * dt * hit.t;
+            gp.vel_m[0] += imp.dv_a[0];
+            gp.vel_m[1] += imp.dv_a[1];
+            gp.vel_m[2] += imp.dv_a[2];
+            gp.ang_i[0] += imp.dw_a[0];
+            gp.ang_i[1] += imp.dw_a[1];
+            gp.ang_i[2] += imp.dw_a[2];
+            gp.prev_pos_r[0] = gp.pos_r[0];
+            gp.prev_pos_r[1] = gp.pos_r[1];
+            gp.prev_pos_r[2] = gp.pos_r[2];
+            let mut go = state[oi];
+            if go.misc[1] > 0.5 {
+                /* спящего будим: иначе обратная масса нулевая и импульс не
+                 * передаётся (контактный шейдер делает то же самое) */
+                go.misc[1] = 0.0;
+                go.misc[0] = 0.0;
+                go.vel_m[3] = go.misc[2];
+                go.ang_i[3] = go.misc[3];
+                go.anchor = [go.pos_r[0], go.pos_r[1], go.pos_r[2], 0.0];
+            }
+            go.vel_m[0] += imp.dv_b[0];
+            go.vel_m[1] += imp.dv_b[1];
+            go.vel_m[2] += imp.dv_b[2];
+            go.ang_i[0] += imp.dw_b[0];
+            go.ang_i[1] += imp.dw_b[1];
+            go.ang_i[2] += imp.dw_b[2];
+            state[pi] = gp;
+            state[oi] = go;
+            done.push((i.min(j), i.max(j)));
+            if !changed.contains(&pi) {
+                changed.push(pi);
+            }
+            if !changed.contains(&oi) {
+                changed.push(oi);
+            }
+            if let Some(e) = energy {
+                if e >= crate::sim::FRACTURE_ENERGY {
+                    self.ccd_impacts.push((pi, oi, hit.p, e));
+                }
+            }
+            self.last_ccd += 1;
+        }
+        if changed.is_empty() {
+            self.last_ccd_ms = t_ccd.elapsed().as_secs_f64() as f32 * 1e3;
+            return;
+        }
+        let items: Vec<(usize, GpuBody)> = changed.iter().map(|&k| (k, state[k])).collect();
+        self.gpu.write_slots(&items);
+        /* CPU-зеркало этих тел: иначе следующее событие (раскол) зальёт
+         * устаревшие позы и вернёт тело назад. */
+        for k in changed {
+            self.bodies[k].pos = [
+                state[k].pos_r[0] as f64,
+                state[k].pos_r[1] as f64,
+                state[k].pos_r[2] as f64,
+            ];
+            self.bodies[k].vel = [
+                state[k].vel_m[0] as f64,
+                state[k].vel_m[1] as f64,
+                state[k].vel_m[2] as f64,
+            ];
+        }
+        self.last_ccd_ms = t_ccd.elapsed().as_secs_f64() as f32 * 1e3;
+    }
+
     /// Такт полностью на GPU: CPU один раз строит пары и заливает их, дальше
     /// всё считает устройство, а тела читаются один раз в конце.
     fn step_gpu(&mut self, dt: f32, substeps: u32, iterations: u32) {
@@ -452,6 +778,21 @@ impl Live {
                 let contacts = self.gpu.read_contacts();
                 self.fracture(&contacts);
             }
+        }
+        /* Удары, найденные CCD на прошлом такте: быстрый снаряд останавливается
+         * ДО прохода контактов, поэтому в списке контактов его нет и событие
+         * с устройства не придёт — энергию удара приносим сюда сами. */
+        if self.fracture_enabled && !self.ccd_impacts.is_empty() {
+            let hits = std::mem::take(&mut self.ccd_impacts);
+            let ev: Vec<[f32; 12]> = hits
+                .iter()
+                .map(|(i, j, p, e)| {
+                    [
+                        *e, *i as f32, *j as f32, 0.0, 0.0, 0.0, 0.0, 0.0, p[0], p[1], p[2], 0.0,
+                    ]
+                })
+                .collect();
+            self.fracture_from_events(&ev);
         }
 
         /* Геометрию заливаем ДО пары: иначе на такте спавна снаряда пул
@@ -538,6 +879,12 @@ impl Live {
                 chunks = chunks.min(n.clamp(1, 12));
             }
         }
+        /* Continuous-режим для быстрых тел: бисекция вдоль перемещения за такт
+         * ДО отправки такта. Тело, которое за такт смещается дальше своего
+         * размера, ставится в позу первого касания с импульсом там же — иначе
+         * оно оказывается по другую сторону партнёра между подшагами
+         * (туннелирование). Медленные тела этим путём не идут. */
+        self.ccd_pass(dt);
         /* Такт отправляем БЕЗ ожидания: к моменту следующего такта (50 мс) GPU
          * давно свободен, и CPU не стоит ни миллисекунды. Результат прошлого
          * такта читаем здесь же — он уже закрыт. */

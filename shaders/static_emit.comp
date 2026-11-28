@@ -1,0 +1,119 @@
+#version 450
+#include "common.glsl"
+
+/* Контакты со статикой, проход 3 из 4: выброс контактов, одна invocation на
+ * тело (64 потока на сцену — здесь это нормально: на тело приходится не
+ * больше 8 контактов, работы на поток единицы вершин).
+ *
+ * Что делает: по каждому из 8 каналов берёт победивший тет (static_tie),
+ * пересчитывает его 4 вершины и выбирает ту же вершину, что выбрал бы
+ * последовательный цикл (первый максимум при обходе k = 0..3), применяет
+ * порог m = pc.prm1.z и кладёт контакт через push() — в ТОМ ЖЕ порядке, что
+ * раньше: сначала пол (4 диагонали), потом стенки left/right/back/front.
+ * Порядок важен: солвер идёт по списку, а contact_select при n > KEEP уже
+ * ничего не переставляет, только отбрасывает.
+ */
+
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) readonly buffer Bodies { Body b[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Pool { vec4 tets[]; };
+layout(std430, set = 0, binding = 2) readonly buffer Span { uvec2 span[]; };
+layout(std430, set = 0, binding = 3) readonly buffer Win { uint win[]; };
+layout(std430, set = 0, binding = 4) buffer Lists { C list[]; };
+layout(std430, set = 0, binding = 5) buffer ListCount { uint lc[]; };
+
+const uint NONE = 0xFFFFFFFFu;
+
+vec3 qrot(vec4 q, vec3 v) {
+    /* кватернион в common.glsl лежит как (w, x, y, z) */
+    vec3 u = q.yzw;
+    float w = q.x;
+    vec3 t = 2.0 * cross(u, v);
+    return v + w * t + cross(u, t);
+}
+
+void push(uint self, vec3 n, float pen, vec3 at) {
+    uint slot = atomicAdd(lc[self], 1u);
+    if (int(slot) >= CAP) return;
+    C c;
+    c.meta = ivec4(GROUND, 0, 0, 0);
+    c.n_pen = vec4(n, pen);
+    c.point = vec4(at, 1.0);
+    list[self * CAP + slot] = c;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.grid.w)) return;
+
+    Body x = b[i];
+    if (x.misc.y > 0.5) return; /* спящее тело контакты не трогает */
+    uint cnt = span[i].y;
+    if (cnt == 0u) return;
+    uint base = span[i].x;
+
+    float m = pc.prm1.z;
+    float floor_y = 0.0;
+    uint slot = i * 8u;
+
+    for (int c = 0; c < 8; c++) {
+        uint g = win[slot + uint(c)];
+        if (g == NONE) continue; /* канал пуст: нет вершины/нет победителя */
+        uint t = g - base;
+        if (t >= cnt) continue;
+
+        vec3 v[4];
+        for (int k = 0; k < 4; k++) {
+            v[k] = qrot(x.quat, tets[(base + t) * 4u + uint(k)].xyz) + x.pos_r.xyz;
+        }
+
+        vec3 at = x.pos_r.xyz;
+        vec3 n;
+        float pen;
+        if (c < 4) {
+            vec2 dir = vec2((c & 1) == 0 ? 1.0 : -1.0, (c & 2) == 0 ? 1.0 : -1.0);
+            float best_d = -1e30;
+            bool found = false;
+            for (int k = 0; k < 4; k++) {
+                float p = floor_y - v[k].y;
+                if (p <= -m) continue;
+                float d = dot(v[k].xz, dir);
+                if (!found || d > best_d) {
+                    found = true;
+                    best_d = d;
+                    at = v[k];
+                    pen = p;
+                }
+            }
+            if (!found) continue;
+            n = vec3(0.0, 1.0, 0.0);
+        } else {
+            float best_d = -1e30;
+            bool found = false;
+            for (int k = 0; k < 4; k++) {
+                vec3 p = v[k];
+                float d;
+                if (c == 4)      d = pc.lo.x - p.x;
+                else if (c == 5) d = p.x - pc.hi.x;
+                else if (c == 6) d = pc.lo.z - p.z;
+                else             d = p.z - pc.hi.z;
+                if (!found || d > best_d) {
+                    found = true;
+                    best_d = d;
+                    at = p;
+                }
+            }
+            if (!found) continue;
+            pen = best_d;
+            if (c == 4)      n = vec3(1.0, 0.0, 0.0);
+            else if (c == 5) n = vec3(-1.0, 0.0, 0.0);
+            else if (c == 6) n = vec3(0.0, 0.0, 1.0);
+            else             n = vec3(0.0, 0.0, -1.0);
+            /* Порог — как в исходном коде: контакт со стенкой только если
+             * вершина действительно выступила (иначе получалась фантомная
+             * стена с нулевой глубиной и снаряд терял скорость). */
+            if (!(pen > -m)) continue;
+        }
+        push(i, n, pen, at);
+    }
+}

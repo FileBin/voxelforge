@@ -1,0 +1,135 @@
+#version 450
+#include "common.glsl"
+
+/* Контакты со статикой, проход 1 из 4: свёртка по тетам.
+ *
+ * ПОЧЕМУ ТАК. Раньше проход был ОДНОЙ invocation на тело: внутри — цикл по
+ * всем тетам тела (у плиты тысячи) и по 4 вершинам на тет, то есть один поток
+ * обходил десятки тысяч вершин. При 64 потоках в группе и десятках тел это
+ * была серия: одна рабочая группа на всю сцену, GPU (и lavapipe) простаивал —
+ * 80 % такта уходило в одну стадию.
+ *
+ * Теперь работа нарезана по ТЕТАМ: список (тело, локальный тет) строит CPU при
+ * заливке геометрии (sim::upload_geometry) и шлёт одним буфером; одна
+ * invocation — один тет. Число инвокейшен = сумма тетов по телам, а не число
+ * тел.
+ *
+ * Проходы (все идут под номером стадии static_contacts, чтобы таблица
+ * F3/VF_PERF=1 показывала их ОДНОЙ суммой, как раньше):
+ *   static_contacts — проход 0: обнулить свёртки (8 слотов на тело);
+ *   static_work  — этот шейдер: тет считает локальные максимумы по 8 каналам;
+ *   static_tie   — выбор победителя: минимальный индекс тета среди тех, у кого
+ *                  счёт совпал с глобальным максимумом (так же, как в
+ *                  последовательном цикле «первый максимум по (тет, вершина)»);
+ *   static_emit  — на тело: точка победившего тета и push в том же порядке.
+ *
+ * ФИЗИКА НЕ МЕНЯЕТСЯ. Каналов по-прежнему 8 и они те же: 4 диагонали опорной
+ * площадки пола (±x±z — иначе куб балансирует на одной точке и крутится юлой)
+ * и 4 стенки по одной точке. Порог m = pc.prm1.z, pen пола = -v.y, pen стенки
+ * = выступ за границу. Максимум берётся по тому же множеству вершин, что и в
+ * последовательном цикле, поэтому результат — те же контакты в том же порядке.
+ */
+
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) readonly buffer Bodies { Body b[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Pool { vec4 tets[]; };
+layout(std430, set = 0, binding = 2) readonly buffer Span { uvec2 span[]; };
+layout(std430, set = 0, binding = 3) readonly buffer Work { uint work[]; };
+layout(std430, set = 0, binding = 4) writeonly buffer Cand { uint cand[]; };
+layout(std430, set = 0, binding = 5) buffer Score { uint score[]; };
+
+/* Квант работы — 0xFFFFFFFF: хвост списка добит до кратности 64, такие
+ * элементы просто выходят (счётчик работы в push-константах не нужен). */
+const uint TAIL = 0xFFFFFFFFu;
+
+vec3 qrot(vec4 q, vec3 v) {
+    /* кватернион в common.glsl лежит как (w, x, y, z) */
+    vec3 u = q.yzw;
+    float w = q.x;
+    vec3 t = 2.0 * cross(u, v);
+    return v + w * t + cross(u, t);
+}
+
+/* Монотонное кодирование float в uint: порядок битов совпадает с порядком
+ * чисел, поэтому «максимум» считается atomicMax по uint на любом драйвере.
+ * 0 — «кандидата нет» (его даёт только NaN, а координаты у нас конечные). */
+uint fkey(float f) {
+    uint u = floatBitsToUint(f);
+    if ((u & 0x7FFFFFFFu) == 0x7FFFFFFFu) return 0u; /* NaN — мимо */
+    return (u & 0x80000000u) != 0u ? ~u : (u | 0x80000000u);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint w = work[i];
+    if (w == TAIL) return;
+
+    uint bi = w >> 16;
+    uint t = w & 0xFFFFu;
+    Body x = b[bi];
+    if (x.misc.y > 0.5) return; /* спящее тело контакты не трогает */
+    uint base = span[bi].x;
+    if (t >= span[bi].y) return;
+
+    vec3 v[4];
+    for (int k = 0; k < 4; k++) {
+        v[k] = qrot(x.quat, tets[(base + t) * 4u + uint(k)].xyz) + x.pos_r.xyz;
+    }
+
+    float m = pc.prm1.z;
+    float floor_y = 0.0;
+    uint o = i * 8u;
+    uint slot = bi * 8u; /* 8 каналов на тело; размер буфера задаёт CPU по числу тел */
+
+    /* Пол: четыре диагонали опорной площадки. Глубина должна быть больше -m,
+     * иначе вершина «висит над полом» и опорой не считается. */
+    for (int c = 0; c < 4; c++) {
+        vec2 dir = vec2((c & 1) == 0 ? 1.0 : -1.0, (c & 2) == 0 ? 1.0 : -1.0);
+        float best_d = -1e30;
+        bool found = false;
+        for (int k = 0; k < 4; k++) {
+            float pen = floor_y - v[k].y;
+            if (pen <= -m) continue;
+            float d = dot(v[k].xz, dir);
+            if (!found || d > best_d) {
+                found = true;
+                best_d = d;
+            }
+        }
+        uint key = found ? fkey(best_d) : 0u;
+        cand[o + uint(c)] = key;
+        /* Фильтр перед атомиком: у плиты тысячи тетов бьют в ОДНИ И ТЕ ЖЕ 8
+         * слотов тела. atomicMax там сериализуется (на lavapipe — CAS-циклом),
+         * и без фильтра это заметная часть времени прохода. Читаем текущий
+         * максимум и лезем в атомик только если он улучшается; корректность
+         * держит сам atomicMax, чтение здесь — только отсев. */
+        if (key != 0u && key > score[slot + uint(c)]) atomicMax(score[slot + uint(c)], key);
+    }
+
+    /* Стенки: самая выступившая вершина. Порог (> -m) применяется на выбросе,
+     * здесь — только максимум: так же, как в исходном цикле. */
+    for (int c = 4; c < 8; c++) {
+        float best_d = -1e30;
+        bool found = false;
+        for (int k = 0; k < 4; k++) {
+            vec3 p = v[k];
+            float d;
+            if (c == 4)      d = pc.lo.x - p.x;
+            else if (c == 5) d = p.x - pc.hi.x;
+            else if (c == 6) d = pc.lo.z - p.z;
+            else             d = p.z - pc.hi.z;
+            if (!found || d > best_d) {
+                found = true;
+                best_d = d;
+            }
+        }
+        uint key = found ? fkey(best_d) : 0u;
+        cand[o + uint(c)] = key;
+        /* Фильтр перед атомиком: у плиты тысячи тетов бьют в ОДНИ И ТЕ ЖЕ 8
+         * слотов тела. atomicMax там сериализуется (на lavapipe — CAS-циклом),
+         * и без фильтра это заметная часть времени прохода. Читаем текущий
+         * максимум и лезем в атомик только если он улучшается; корректность
+         * держит сам atomicMax, чтение здесь — только отсев. */
+        if (key != 0u && key > score[slot + uint(c)]) atomicMax(score[slot + uint(c)], key);
+    }
+}

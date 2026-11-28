@@ -255,8 +255,8 @@ pub const PIPE_NAMES: [&str; 34] = [
 ];
 /// Число storage-буферов у каждого пайплайна — в том же порядке.
 const PIPE_BUFNS: [u32; 34] = [
-    1, 2, 2, 3, 4, 1, 5, 4, 1, 1, 4, 4, 7, 3, 2, 4, 3, 6, 8, 6, 4, 1, 2, 3, 2, 2, 4, 8, 1, 7, 5, 6,
-    4, 6,
+    1, 2, 2, 3, 4, 2, 5, 4, 1, 1, 4, 4, 7, 3, 2, 4, 3, 6, 8, 6, 4, 1, 2, 3, 2, 2, 4, 8, 1, 7, 5, 6,
+    5, 6,
 ];
 /// Ячеек на блок в параллельном скане (совпадает с 16 * 64 в шейдере).
 pub const SCAN_BLOCK: usize = 1024;
@@ -272,11 +272,8 @@ pub const MAX_BODIES: usize = 64;
 /// Потолок событий раскола в кольце за такт (совпадает с MAX_EVENTS в common.glsl).
 pub const MAX_EVENTS: usize = 128;
 /// Каналов контакта со статикой на тело: 4 диагонали опорной площадки пола и
-/// 4 стенки. В common.glsl это же число зашито в `SLOTS`.
+/// 4 стенки. По этому числу считаются слоты свёрток (тело × канал).
 pub const STATIC_CH: usize = 8;
-/// Слотов свёртки контактов со статикой: тело × канал. Должно совпадать с
-/// `SLOTS` в common.glsl — по этому числу аллоцируется буфер свёрток.
-pub const STATIC_SLOTS: usize = MAX_BODIES * STATIC_CH;
 /// Пустой элемент списка работы (хвост, добитый до кратности группы).
 const WORK_TAIL: u32 = 0xFFFF_FFFF;
 /// Порог энергии раскола, Дж. Финальное слово — у шейдера (pc.lo.w), CPU
@@ -401,9 +398,12 @@ pub struct GpuSim {
     /// Свёртки по каналам: на (тет, канал) — максимум в монотонных битах float
     /// (0 — кандидата нет). Пишется `static_work`, читается `static_tie`.
     cand: *mut c_void,
-    /// Победитель по каналу: тела × каналы. x — максимум (биты float), y —
-    /// индекс тета в пуле (0xFFFFFFFF — пусто).
-    pick: *mut c_void,
+    /// Победитель по каналу (тела × каналы): максимум в монотонных битах float.
+    static_score: *mut c_void,
+    /// Победитель по каналу: индекс тета в пуле (0xFFFFFFFF — пусто).
+    static_win: *mut c_void,
+    /// Слотов свёртки в буферах (тело × канал, кратно рабочей группе).
+    static_slots: usize,
     /// Сколько рабочих групп шлёт static_work/static_tie (0 — работы нет).
     work_groups: u32,
     /// Счётчики сетки тетов (host-visible, для раскладки и сверки).
@@ -536,11 +536,14 @@ impl GpuSim {
         let tets = mk(MAX_POOL_TETS * 64, true);
         let span = mk(n * 8, true);
         /* Работа контактов со статикой: список (тело, тет) + свёртки по
-         * каналам. Две uint на слот свёртки (максимум и индекс тета) —
-         * 4 КБ; кандидатов — 8 u32 на элемент работы. */
+         * каналам. Свёртки — по 8 слотов НА ТЕЛО, поэтому размер считается от
+         * числа тел сцены, а не от MAX_BODIES: в тестах куча — 1000 и 5000 тел.
+         * Кандидатов — 8 u32 на элемент работы. */
+        let static_slots = ((n * STATIC_CH) + WG as usize - 1) / WG as usize * WG as usize;
         let work = mk((MAX_POOL_TETS + WG as usize) * 4, true);
         let cand = mk((MAX_POOL_TETS + WG as usize) * STATIC_CH * 4, false);
-        let pick = mk(STATIC_SLOTS * 2 * 4, false);
+        let static_score = mk(static_slots * 4, false);
+        let static_win = mk(static_slots * 4, false);
         let pairs = mk(MAX_PAIRS * 8, true);
         let tetcnt = mk(ncells as usize * 4, true);
         let tetstart = mk((ncells as usize + 1) * 4, true);
@@ -657,7 +660,9 @@ impl GpuSim {
             span,
             work,
             cand,
-            pick,
+            static_score,
+            static_win,
+            static_slots,
             work_groups: 0,
             tetcnt,
             tetstart,
@@ -781,9 +786,9 @@ impl GpuSim {
     fn push_static(&self, steps: &mut Vec<Step>, a: *mut c_void, push: Push, g_body: u32) {
         steps.push(Step {
             pipe: P_STATIC, /* проход 0 — сброс свёрток (см. static_contacts.comp) */
-            bufs: vec![self.pick],
+            bufs: vec![self.static_score, self.static_win],
             push,
-            groups: [(STATIC_SLOTS as u32 + WG - 1) / WG, 1, 1],
+            groups: [(self.static_slots as u32) / WG, 1, 1],
         });
         let g_work = self.work_groups;
         if g_work == 0 {
@@ -791,19 +796,19 @@ impl GpuSim {
         }
         steps.push(Step {
             pipe: P_STATWORK,
-            bufs: vec![a, self.tets, self.span, self.work, self.cand, self.pick],
+            bufs: vec![a, self.tets, self.span, self.work, self.cand, self.static_score],
             push,
             groups: [g_work, 1, 1],
         });
         steps.push(Step {
             pipe: P_STATTIE,
-            bufs: vec![self.span, self.work, self.cand, self.pick],
+            bufs: vec![self.span, self.work, self.cand, self.static_score, self.static_win],
             push,
             groups: [g_work, 1, 1],
         });
         steps.push(Step {
             pipe: P_STATEMIT,
-            bufs: vec![a, self.tets, self.span, self.pick, self.list, self.lcount],
+            bufs: vec![a, self.tets, self.span, self.static_win, self.list, self.lcount],
             push,
             groups: [g_body, 1, 1],
         });
@@ -1289,7 +1294,7 @@ impl GpuSim {
          * push-константах, он просто выходит на WORK_TAIL. */
         let wg = WG as usize;
         let mut work: Vec<u32> = Vec::with_capacity((flat.len() / 4).min(MAX_POOL_TETS) + wg);
-        for (bi, s) in spans.iter().enumerate().take(MAX_BODIES) {
+        for (bi, s) in spans.iter().enumerate() {
             let start = s[0] as usize;
             let cnt = (s[1] as usize).min(0xFFFF);
             for t in 0..cnt {

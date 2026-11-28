@@ -51,7 +51,7 @@ struct Outcome {
     spread: f32,
 }
 
-/// Тетраэдры тела для статических контактов: `static_contacts.comp` ищет опору
+/// Тетраэдры тела для статических контактов: проходы `static_*` ищут опору
 /// по ВЕРШИНАМ тетов, а не по полуразмерам, поэтому харнесс обязан их залить —
 /// иначе пола для тела не существует и оно падает сквозь мир.
 /// Коробка — разбиение на 5 тетов (участвуют все 8 углов), сфера — октаэдр из
@@ -377,3 +377,237 @@ fn gpu_pile_of_5000_settles() {
 }
 
 
+
+/* ─────────────────────────── контакты со статикой ─────────────────────── */
+
+/// Густая сетка тетов в коробке: n×n×n кубиков по 5 тетов. Плита в живом
+/// мире — это тысячи тетов на одно тело, и именно на них старая схема «одна
+/// invocation на тело» обходила десятки тысяч вершин одним потоком.
+fn plate_tets(half: [f32; 4], n: usize) -> Vec<[[f32; 3]; 4]> {
+    let (hx, hy, hz) = (half[0], half[1], half[2]);
+    let mut tets = Vec::new();
+    for i in 0..n {
+        for j in 0..n {
+            for k in 0..n {
+                let x0 = -hx + 2.0 * hx * i as f32 / n as f32;
+                let x1 = -hx + 2.0 * hx * (i + 1) as f32 / n as f32;
+                let y0 = -hy + 2.0 * hy * j as f32 / n as f32;
+                let y1 = -hy + 2.0 * hy * (j + 1) as f32 / n as f32;
+                let z0 = -hz + 2.0 * hz * k as f32 / n as f32;
+                let z1 = -hz + 2.0 * hz * (k + 1) as f32 / n as f32;
+                let c = [
+                    [x0, y0, z0],
+                    [x1, y0, z0],
+                    [x1, y1, z0],
+                    [x0, y1, z0],
+                    [x0, y0, z1],
+                    [x1, y0, z1],
+                    [x1, y1, z1],
+                    [x0, y1, z1],
+                ];
+                for t in [
+                    [c[0], c[1], c[2], c[6]],
+                    [c[0], c[2], c[3], c[6]],
+                    [c[0], c[3], c[7], c[6]],
+                    [c[0], c[7], c[4], c[6]],
+                    [c[0], c[4], c[5], c[6]],
+                ] {
+                    tets.push(t);
+                }
+            }
+        }
+    }
+    tets
+}
+
+type StaticContact = ([f32; 3], f32, [f32; 3]); /* точка, глубина, нормаль */
+
+/// ОРАКУЛ: прежний последовательный `static_contacts.comp`, перенесённый в
+/// Rust один-в-один — тот же обход (теты по порядку, внутри вершины k = 0..3),
+/// те же 8 каналов, те же пороги `m = margin`. Сравнение с ним доказывает, что
+/// распараллеливание по тетам не изменило физику контактов.
+fn static_contacts_sequential(
+    b: &GpuBody,
+    tets: &[[[f32; 3]; 4]],
+    m: f32,
+    lo: [f32; 3],
+    hi: [f32; 3],
+) -> Vec<StaticContact> {
+    let q = b.quat;
+    let pos = [b.pos_r[0], b.pos_r[1], b.pos_r[2]];
+    let qrot = |v: [f32; 3]| -> [f32; 3] {
+        let u = [q[1], q[2], q[3]];
+        let t = [
+            2.0 * (u[1] * v[2] - u[2] * v[1]),
+            2.0 * (u[2] * v[0] - u[0] * v[2]),
+            2.0 * (u[0] * v[1] - u[1] * v[0]),
+        ];
+        let c = [
+            u[1] * t[2] - u[2] * t[1],
+            u[2] * t[0] - u[0] * t[2],
+            u[0] * t[1] - u[1] * t[0],
+        ];
+        [
+            v[0] + q[0] * t[0] + c[0],
+            v[1] + q[0] * t[1] + c[1],
+            v[2] + q[0] * t[2] + c[2],
+        ]
+    };
+    let vert = |t: usize, k: usize| -> [f32; 3] {
+        let l = qrot(tets[t][k]);
+        [l[0] + pos[0], l[1] + pos[1], l[2] + pos[2]]
+    };
+
+    let mut out: Vec<StaticContact> = Vec::new();
+    /* Пол: четыре угла опорной площадки (±x ±z). */
+    for c in 0..4 {
+        let (dx, dz) = (
+            if c & 1 == 0 { 1.0f32 } else { -1.0 },
+            if c & 2 == 0 { 1.0f32 } else { -1.0 },
+        );
+        let mut found = false;
+        let mut best_d = -1e30f32;
+        let mut best_v = [0.0f32; 3];
+        let mut best_pen = 0.0f32;
+        for t in 0..tets.len() {
+            for k in 0..4 {
+                let v = vert(t, k);
+                let pen = -v[1];
+                if pen <= -m {
+                    continue;
+                }
+                let d = v[0] * dx + v[2] * dz;
+                if !found || d > best_d {
+                    found = true;
+                    best_d = d;
+                    best_v = v;
+                    best_pen = pen;
+                }
+            }
+        }
+        if found {
+            out.push((best_v, best_pen, [0.0, 1.0, 0.0]));
+        }
+    }
+    /* Стенки: по одной самой выступившей вершине. */
+    let (mut left, mut right, mut back, mut front) = (-1e9f32, -1e9f32, -1e9f32, -1e9f32);
+    let (mut at_l, mut at_r, mut at_b, mut at_f) = (pos, pos, pos, pos);
+    for t in 0..tets.len() {
+        for k in 0..4 {
+            let v = vert(t, k);
+            let d = lo[0] - v[0];
+            if d > left {
+                left = d;
+                at_l = v;
+            }
+            let d = v[0] - hi[0];
+            if d > right {
+                right = d;
+                at_r = v;
+            }
+            let d = lo[2] - v[2];
+            if d > back {
+                back = d;
+                at_b = v;
+            }
+            let d = v[2] - hi[2];
+            if d > front {
+                front = d;
+                at_f = v;
+            }
+        }
+    }
+    if left > -m {
+        out.push((at_l, left, [1.0, 0.0, 0.0]));
+    }
+    if right > -m {
+        out.push((at_r, right, [-1.0, 0.0, 0.0]));
+    }
+    if back > -m {
+        out.push((at_b, back, [0.0, 0.0, 1.0]));
+    }
+    if front > -m {
+        out.push((at_f, front, [0.0, 0.0, -1.0]));
+    }
+    out
+}
+
+/// Контакты со статикой на GPU совпадают с последовательным оракулом
+/// ОДИН-К-ОДНОМУ: то же число, тот же порядок, те же точки/нормали/глубины.
+/// Позы подобраны по краевым случаям: плита плашмя с проникновением, наклон,
+/// поворот на 45° (там две вершины имеют одинаковую проекцию на диагональ —
+/// именно тот случай, где важен детерминированный выбор победителя), прижатие
+/// к двум стенкам и полёт в середине ящика без контактов вообще.
+#[test]
+fn gpu_static_contacts_match_sequential_oracle() {
+    let Some((shaders, _)) = setup() else {
+        eprintln!("пропуск: нет SPIR-V или Vulkan-устройства");
+        return;
+    };
+    let sc = scene_drop();
+    let base = sc.bodies[0];
+    let mut params = sc.params;
+    params.gravity = 0.0; /* поза за такт не меняется — контакты по одной позе */
+    let half = base.half_shape;
+    let tets = plate_tets(half, 4); /* 320 тетов: как «плита» в живом мире */
+    let mut gpu = GpuSim::new(vec![base], &shaders, params);
+    gpu.upload_geometry(&[tets.clone()]);
+
+    let yaw45 = std::f32::consts::FRAC_PI_8.sin_cos(); /* (sin, cos) для 45°/2 */
+    let tilt = (10.0f32.to_radians() * 0.5).sin_cos();
+    let (lo, hi) = (params.lo, params.hi);
+    let poses: [( &str, [f32; 3], [f32; 4]); 5] = [
+        ("плашмя с проникновением 5 мм", [1.0, half[1] - 0.005, 1.0], [1.0, 0.0, 0.0, 0.0]),
+        ("наклон 10° вокруг x", [1.0, half[1] + 0.01, 1.0], [tilt.1, tilt.0, 0.0, 0.0]),
+        ("поворот 45° вокруг y", [1.0, half[1], 1.0], [yaw45.1, 0.0, yaw45.0, 0.0]),
+        ("прижат к стенкам x- и z-", [lo[0] + half[0] - 0.01, half[1], lo[2] + half[2] - 0.01], [1.0, 0.0, 0.0, 0.0]),
+        ("в середине ящика", [2.0, 1.5, 2.0], [1.0, 0.0, 0.0, 0.0]),
+    ];
+
+    let mut total = 0usize;
+    for (name, pos, quat) in poses {
+        let mut b = base;
+        b.pos_r = [pos[0], pos[1], pos[2], base.pos_r[3]];
+        b.quat = quat;
+        b.vel_m = [0.0, 0.0, 0.0, base.vel_m[3]];
+        b.ang_i = [0.0, 0.0, 0.0, base.ang_i[3]];
+        b.misc = [0.0, 0.0, base.misc[2], base.misc[3]];
+        gpu.write_bodies(&[b]);
+        gpu.frame(1.0 / 60.0, 1, 1);
+        /* Партнёр GROUND = -1: это и есть контакты со статикой. */
+        let got: Vec<StaticContact> = gpu.read_contacts()[0]
+            .iter()
+            .filter(|c| c.other == -1)
+            .map(|c| (c.p, c.pen, c.n))
+            .collect();
+        let want = static_contacts_sequential(&b, &tets, params.margin, lo, hi);
+        assert_eq!(
+            got.len(),
+            want.len(),
+            "{name}: {} контактов на GPU против {} у оракула",
+            got.len(),
+            want.len()
+        );
+        for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            for k in 0..3 {
+                assert!(
+                    (g.0[k] - w.0[k]).abs() < 1e-5 && (g.2[k] - w.2[k]).abs() < 1e-5,
+                    "{name}: контакт {i} разошёлся: точка {:?} против {:?}, нормаль {:?} против {:?}",
+                    g.0,
+                    w.0,
+                    g.2,
+                    w.2
+                );
+            }
+            assert!(
+                (g.1 - w.1).abs() < 1e-5,
+                "{name}: контакт {i} глубина {} против {}",
+                g.1,
+                w.1
+            );
+        }
+        eprintln!("{name}: {} контактов, совпали с оракулом", got.len());
+        total += got.len();
+    }
+    assert!(total > 0, "ни одного контакта со статикой за все позы");
+}
