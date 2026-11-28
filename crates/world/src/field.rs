@@ -728,3 +728,39 @@ pub fn intersect_plane(f: &NodeField, n: [f32; 3], d: f32) -> NodeField {
     }
     out
 }
+
+/// Добавить `layers` узлов ПУСТОТЫ вокруг блока.
+///
+/// Нужно для мелких осколков: у них занятая область почти вплотную подходит к
+/// границе блока, и марчингу не хватает внешних узлов для интерполяции — срез
+/// получается «впуклым». Лишние слои дают ему с чем работать.
+pub fn expand(f: &NodeField, layers: i32) -> NodeField {
+    if layers <= 0 {
+        return f.clone();
+    }
+    let dims = [
+        f.dims[0] + 2 * layers as usize,
+        f.dims[1] + 2 * layers as usize,
+        f.dims[2] + 2 * layers as usize,
+    ];
+    let far = (f.dims[0].max(f.dims[1]).max(f.dims[2])) as f32 * f.step * 2.0;
+    let mut out = NodeField {
+        lo: [f.lo[0] - layers, f.lo[1] - layers, f.lo[2] - layers],
+        dims,
+        val: vec![far; dims[0] * dims[1] * dims[2]],
+        step: f.step,
+    };
+    for z in 0..f.dims[2] {
+        for y in 0..f.dims[1] {
+            for x in 0..f.dims[0] {
+                let src = (z * f.dims[1] + y) * f.dims[0] + x;
+                let dz = z + layers as usize;
+                let dy = y + layers as usize;
+                let dx = x + layers as usize;
+                let dst = (dz * dims[1] + dy) * dims[0] + dx;
+                out.val[dst] = f.val[src];
+            }
+        }
+    }
+    out
+}

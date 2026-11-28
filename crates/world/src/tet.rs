@@ -630,7 +630,9 @@ impl TetBody {
     /// плоскостями Вороного его затравки. Плоскость среза проходит где угодно
     /// (не по границам тетов), поэтому сколы выходят плавными и точными.
     pub fn shatter_fields(&self, pts: &[[f32; 3]]) -> Vec<TetBody> {
-        let parent = self.sdf().clone();
+        /* Каждому осколку даём лишние слои пустоты по краям: иначе у мелких
+         * кусков марчингу не хватает внешних узлов и срез выходит «впуклым». */
+        let parent = field::expand(self.sdf(), 4);
         let step = parent.step;
         let n_nodes = [
             parent.lo[0], parent.lo[1], parent.lo[2],
