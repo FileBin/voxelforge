@@ -7,7 +7,7 @@
 use std::ffi::{c_char, c_void, CString};
 
 use voxelforge_world::live::{model_matrix, Live};
-use voxelforge_world::perf::{VfPerfRow, VfSceneCounts};
+use voxelforge_world::perf::{Rates, RatesOut, VfPerfRow, VfRatesView, VfSceneCounts};
 use voxelforge_world::sim::find_shaders;
 
 #[repr(C)]
@@ -84,6 +84,7 @@ unsafe extern "C" {
         tick_mean_ms: f32,
         tick_max_ms: f32,
         scene: *const VfSceneCounts,
+        rates: *const VfRatesView,
     );
 }
 
@@ -261,6 +262,13 @@ struct Shared {
     perf_tick: (f32, f32, f32),
     /// Счётчики сцены: всего тел, бодрствующих, точек контакта.
     perf_scene: VfSceneCounts,
+    /// Итог окна частот (кадры/такты) от главного потока: кадры видит только
+    /// он, а печатает таблицу такт — строка fps/tps передаётся сюда и уходит в
+    /// `Perf`, чтобы печать осталась одним заходом, а не из двух потоков.
+    rates: RatesOut,
+    /// Сколько тактов завершилось с включения сбора (монотонно): по дельте
+    /// главный поток считает настоящий TPS.
+    tick_no: u64,
     log: String,
 }
 
@@ -287,6 +295,8 @@ struct SnapOut {
     perf_rows: Vec<VfPerfRow>,
     perf_tick: (f32, f32, f32),
     perf_scene: VfSceneCounts,
+    /// Сколько тактов физики завершилось к этому кадру (для TPS).
+    tick_no: u64,
     log: String,
     near: f32,
     far: f32,
@@ -389,6 +399,8 @@ impl Sim {
             perf_rows: Vec::new(),
             perf_tick: (0.0, 0.0, 0.0),
             perf_scene: VfSceneCounts::default(),
+            rates: RatesOut::default(),
+            tick_no: live.gpu.perf_ticks(),
             log: String::new(),
         }));
         let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
@@ -476,6 +488,11 @@ impl Sim {
                             g.perf_rows.clear();
                             g.perf_scene = VfSceneCounts::default();
                         }
+                        /* Такт завершился — отдаём его счётчик кадру (TPS) и
+                         * строку частот обратно в такт: печатает таблицу такт,
+                         * ему и нужны fps/tps, чтобы строка шла перед стадиями. */
+                        g.tick_no = live.gpu.perf_ticks();
+                        live.gpu.perf_set_rates(g.rates);
                         if !live.last_log.is_empty() {
                             g.log = std::mem::take(&mut live.last_log);
                         }
@@ -520,6 +537,18 @@ impl Sim {
             Sim::Direct(l) => l.lines_on = on,
             Sim::Thread { tx, .. } => {
                 let _ = tx.send(Cmd::SetLines(on));
+            }
+        }
+    }
+
+    /// Итог окна частот — в такт: в потоковом режиме через `Shared` (такт
+    /// читает его при публикации и печатает строку перед стадиями), в
+    /// скриптовом — прямо в счётчик, такт считается здесь же.
+    fn set_rates(&mut self, r: RatesOut) {
+        match self {
+            Sim::Direct(l) => l.gpu.perf_set_rates(r),
+            Sim::Thread { shared, .. } => {
+                shared.lock().unwrap().rates = r;
             }
         }
     }
@@ -583,6 +612,7 @@ impl Sim {
                     perf_rows: if l.gpu.perf_on() { l.gpu.perf_overlay() } else { Vec::new() },
                     perf_tick: l.gpu.perf_tick_range(),
                     perf_scene: l.gpu.perf_scene(),
+                    tick_no: l.gpu.perf_ticks(),
                     log: String::new(),
                     near: l.near,
                     far: l.far,
@@ -638,6 +668,7 @@ impl Sim {
                     perf_rows: g.perf_rows.clone(),
                     perf_tick: g.perf_tick,
                     perf_scene: g.perf_scene,
+                    tick_no: g.tick_no,
                     log: std::mem::take(&mut g.log),
                     near: 0.0,
                     far: 60.0,
@@ -788,6 +819,14 @@ fn main() {
     let mut last_step: [f32; 3] = [0.0; 3];
     let (mut moves, mut flips, mut max_step) = (0u32, 0u32, 0.0f32);
     let mut frame_t0 = std::time::Instant::now();
+    /* Частоты кадра и физики: кадры считаем здесь, такты — по счётчику
+     * завершённых тактов. Отдельно от `frames` (тот счётчик печатает раз в
+     * 120 кадров и нужен сводке в конце). */
+    let mut rates = Rates::new();
+    let mut last_tick_no = 0u64;
+    // Последний отправленный в такт итог частот: шлём только на смене окна.
+    let mut sent_rates = RatesOut::default();
+    let mut frame_ms: f32;
     /* Прогрев (по умолчанию ВЫКЛЮЧЕН: включается VF_WARMUP=мс). Если
      * стартовые лаги лечатся тем, что игрок успевает пострелять, дело в
      * подъёме частот GPU, и тогда прогрев их снимает. На дискретных
@@ -810,9 +849,12 @@ fn main() {
         // фиксированному 1/60 — иначе на просевшем FPS она двигается медленнее.
         let frame_dt = {
             let now = std::time::Instant::now();
-            let d = now.duration_since(last_frame).as_secs_f32();
+            let d = now.duration_since(last_frame);
             last_frame = now;
-            d.clamp(0.0005, 0.1)
+            /* Время кадра для статистики — настоящее: камере нужен кламп,
+             * а диагностике — правда, включая кадр в 200 мс. */
+            frame_ms = d.as_secs_f32() * 1000.0;
+            d.as_secs_f32().clamp(0.0005, 0.1)
         };
         let mut input = VfInput::default();
         let alive = unsafe { vf_view_poll(view, &mut input) };
@@ -907,7 +949,21 @@ fn main() {
 
         // Кадр: физика к этому моменту уже посчитана в своём потоке
         // (или шагнула здесь, если режим скриптовый).
+        /* Итог прошлого окна — в такт, ДО шага: таблица печатается из такта,
+         * и строка fps/tps должна попасть в ту же секунду, что и стадии.
+         * Шлём только когда окно правда закрылось: иначе это был бы лишний
+         * замок `Shared` в каждом кадре. */
+        let ro = rates.out();
+        if ro != sent_rates {
+            sent_rates = ro;
+            sim.set_rates(ro);
+        }
         let out = sim.frame(tick, max_frames > 0, substeps_arg, iterations_arg);
+        /* Один кадр окна частот: время кадра — настоящее, такты — дельта
+         * счётчика завершённых (номинальные 20 Гц тут ничего не говорят). */
+        let dticks = out.tick_no.saturating_sub(last_tick_no).min(u32::MAX as u64) as u32;
+        last_tick_no = out.tick_no;
+        rates.sample(std::time::Instant::now(), frame_ms, dticks);
 
         if dbg_steps && matches!(sim, Sim::Thread { .. }) {
             /* Позиция, которую видит шейдер = mix(prev, cur, alpha) по
@@ -1056,6 +1112,9 @@ fn main() {
             } else {
                 std::ptr::null()
             };
+            /* Графики частот: история живёт на CPU и перерисовывается каждый
+             * кадр — новых синхронизаций с GPU нет, данные уже здесь. */
+            let rates_view: VfRatesView = rates.c_view();
             vf_view_perf(
                 view,
                 ptr,
@@ -1064,6 +1123,7 @@ fn main() {
                 out.perf_tick.1,
                 out.perf_tick.2,
                 &out.perf_scene,
+                &rates_view,
             );
             vf_view_end(view);
         }
