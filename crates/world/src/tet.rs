@@ -655,41 +655,32 @@ impl TetBody {
                 let d = n[0] * mid[0] / step + n[1] * mid[1] / step + n[2] * mid[2] / step;
                 f = field::intersect_plane(&f, n, d);
             }
-            /* теты — по занятости нового поля (они разметка узлов) */
-            let (nx, ny, nz) = (n_nodes[3] as usize, n_nodes[4] as usize, n_nodes[5] as usize);
-            let (nx_i, ny_i, nz_i) = (nx as i32, ny as i32, nz as i32);
-            let inside = |nd: Node| -> bool {
-                let x = nd.0 - n_nodes[0];
-                let y = nd.1 - n_nodes[1];
-                let z = nd.2 - n_nodes[2];
-                if x < 0 || y < 0 || z < 0 || x >= nx_i || y >= ny_i || z >= nz_i {
-                    return false;
-                }
-                f.val[(z as usize * ny + y as usize) * nx + x as usize] < 0.0
-            };
+            /* Теты БЕРЁМ ИЗ РОДИТЕЛЯ, а не выводим из нового поля: каждый
+             * родительский тет отдаём ровно одному осколку (по его центроиду
+             * внутри поля). Тогда сумма объёмов осколков равна объёму родителя —
+             * квантование по решётке больше не «съедает» массу на срезах.
+             * Форму даёт поле (гладкий срез), массу — теты (точный баланс). */
             let mut tets = Vec::new();
-            let mut seen: std::collections::HashSet<[Node; 4]> = std::collections::HashSet::new();
-            let mut bz = n_nodes[2];
-            while bz <= n_nodes[2] + nz_i - 3 {
-                let mut by = n_nodes[1];
-                while by <= n_nodes[1] + ny_i - 3 {
-                    let mut bx = n_nodes[0];
-                    while bx <= n_nodes[0] + nx_i - 3 {
-                        for dir in 0..3 {
-                            for t in bcc_tets_around_edge((bx, by, bz), dir) {
-                                if !t.iter().all(|nd| inside(*nd)) {
-                                    continue;
-                                }
-                                if seen.insert(tet_key(&t)) {
-                                    tets.push(Tet { level: self.tets[0].level, v: t });
-                                }
-                            }
-                        }
-                        bx += 2;
+            for t in &self.tets {
+                let c = t.v;
+                let cx = (c[0].0 + c[1].0 + c[2].0 + c[3].0) as f32 / 4.0;
+                let cy = (c[0].1 + c[1].1 + c[2].1 + c[3].1) as f32 / 4.0;
+                let cz = (c[0].2 + c[1].2 + c[2].2 + c[3].2) as f32 / 4.0;
+                let mut best = f32::MAX;
+                let mut best_i = usize::MAX;
+                for (k, sk) in pts.iter().enumerate() {
+                    let dx = cx - sk[0] / step;
+                    let dy = cy - sk[1] / step;
+                    let dz = cz - sk[2] / step;
+                    let d2 = dx * dx + dy * dy + dz * dz;
+                    if d2 < best {
+                        best = d2;
+                        best_i = k;
                     }
-                    by += 2;
                 }
-                bz += 2;
+                if best_i == i {
+                    tets.push(*t);
+                }
             }
             if tets.is_empty() {
                 continue;
