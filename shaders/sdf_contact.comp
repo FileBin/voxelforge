@@ -1,0 +1,139 @@
+#version 450
+/* Контакты SDF↔SDF (перенос CPU-оракула crates/world/src/sdf_contact.rs).
+ *
+ * Логика ровно та же, что проверена тестами на CPU:
+ *   1. затравки — узлы сетки тела B внутри пересечения AABB и объёмов
+ *      (f_a < 0 и f_b < 0) — топологически нейтрально (тор, зацепления);
+ *   2. 4 итерации спуска p -= 0.5*(f_a*n_a + f_b*n_b), n = gradient;
+ *   3. валидность по обоим полям, глубина = (-f_a) + (-f_b),
+ *      нормаль = normalize(n_a - n_b);
+ *   4. дедуп по шагу и кэп контактов на пару.
+ *
+ * Раскладка (пока не подключена в такт, но фиксирована):
+ *   binding 0 — SDF-поля на тело: uvec4{ lo.xyz, dims.x } ... см. sdf_desc
+ *   binding 1 — значения полей подряд (f32)
+ *   binding 2 — пары тел: uvec2{ body_a, body_b }
+ *   binding 3 — контакты: vec4{ xyz точки, глубина } и vec4{ нормаль, 0 }
+ */
+layout(local_size_x = 64) in;
+
+struct sdf_desc {
+    ivec4 lo_dims;   /* lo.xyz, dims.x */
+    ivec4 dims2;     /* dims.yz, 0, 0 */
+    vec4  step_pad;  /* step, 0, 0, 0 */
+    vec4  origin;    /* мировой центр тела */
+};
+
+layout(std430, binding = 0) readonly buffer Descs { sdf_desc descs[]; };
+layout(std430, binding = 1) readonly buffer Values { float vals[]; };
+layout(std430, binding = 2) readonly buffer Pairs { uvec2 pairs[]; };
+/* Один массив: блок SSBO может иметь только один массив без размера.
+ * Раскладка: [2*i] = точка.xyz + глубина, [2*i+1] = нормаль.xyz + 0. */
+layout(std430, binding = 3) writeonly buffer Out { vec4 c[]; };
+layout(std430, binding = 4) buffer Counters { uint counts[]; };
+
+layout(push_constant) uniform PC {
+    uint n_pairs;
+    uint max_contacts;
+    uint stride;
+    uint _pad;
+} pc;
+
+ivec3 dims_of(sdf_desc d) { return ivec3(d.lo_dims.w, d.dims2.x, d.dims2.y); }
+
+vec3 node_to_world(sdf_desc d, vec3 n) { return d.origin.xyz + n * d.step_pad.x; }
+vec3 world_to_node(sdf_desc d, vec3 w) { return (w - d.origin.xyz) / d.step_pad.x; }
+
+float at_node(sdf_desc d, uint base, ivec3 n) {
+    ivec3 dm = dims_of(d);
+    ivec3 c = clamp(n, ivec3(0), dm - 1);
+    uint i = uint(c.z) * uint(dm.y * dm.x) + uint(c.y) * uint(dm.x) + uint(c.x);
+    return vals[base + i];
+}
+
+/* трилинейная выборка в координатах узлов */
+float sample_node(sdf_desc d, uint base, vec3 p) {
+    vec3 f = floor(p);
+    vec3 t = p - f;
+    ivec3 i = ivec3(f);
+    float v000 = at_node(d, base, i + ivec3(0, 0, 0));
+    float v100 = at_node(d, base, i + ivec3(1, 0, 0));
+    float v010 = at_node(d, base, i + ivec3(0, 1, 0));
+    float v110 = at_node(d, base, i + ivec3(1, 1, 0));
+    float v001 = at_node(d, base, i + ivec3(0, 0, 1));
+    float v101 = at_node(d, base, i + ivec3(1, 0, 1));
+    float v011 = at_node(d, base, i + ivec3(0, 1, 1));
+    float v111 = at_node(d, base, i + ivec3(1, 1, 1));
+    float a = mix(mix(v000, v100, t.x), mix(v010, v110, t.x), t.y);
+    float b = mix(mix(v001, v101, t.x), mix(v011, v111, t.x), t.y);
+    return mix(a, b, t.z);
+}
+
+vec3 gradient_node(sdf_desc d, uint base, vec3 p) {
+    const float h = 0.5;
+    float gx = sample_node(d, base, p + vec3(h, 0, 0)) - sample_node(d, base, p - vec3(h, 0, 0));
+    float gy = sample_node(d, base, p + vec3(0, h, 0)) - sample_node(d, base, p - vec3(0, h, 0));
+    float gz = sample_node(d, base, p + vec3(0, 0, h)) - sample_node(d, base, p - vec3(0, 0, h));
+    return normalize(vec3(gx, gy, gz) + vec3(1e-9));
+}
+
+void main() {
+    uint pair = gl_GlobalInvocationID.x / 64u;
+    uint lane = gl_GlobalInvocationID.x % 64u;
+    if (pair >= pc.n_pairs) {
+        return;
+    }
+    uvec2 pr = pairs[pair];
+    sdf_desc da = descs[pr.x];
+    sdf_desc db = descs[pr.y];
+    uint base_a = pr.x * pc.stride;
+    uint base_b = pr.y * pc.stride;
+
+    /* перебираем узлы B: каждая invocation смотрит свою долю узлов */
+    ivec3 dm = dims_of(db);
+    uint total = uint(dm.x) * uint(dm.y) * uint(dm.z);
+    uint found = 0u;
+    for (uint k = lane; k < total; k += 64u) {
+        uint z = k / (uint(dm.x) * uint(dm.y));
+        uint r = k % (uint(dm.x) * uint(dm.y));
+        ivec3 n = ivec3(int(r % uint(dm.x)), int(r / uint(dm.x)), int(z));
+        n += ivec3(db.lo_dims.xyz);
+        vec3 w = node_to_world(db, vec3(n));
+        float fb = at_node(db, base_b, n - ivec3(db.lo_dims.xyz));
+        float fa = sample_node(da, base_a, world_to_node(da, w));
+        if (fa >= 0.0 || fb >= 0.0) {
+            continue;
+        }
+        vec3 p = w;
+        for (int it = 0; it < 4; ++it) {
+            vec3 pa = world_to_node(da, p);
+            vec3 pb = world_to_node(db, p);
+            vec3 ga = gradient_node(da, base_a, pa);
+            vec3 gb = gradient_node(db, base_b, pb);
+            float va = sample_node(da, base_a, pa) * da.step_pad.x;
+            float vb = sample_node(db, base_b, pb) * db.step_pad.x;
+            p -= 0.5 * (va * ga + vb * gb);
+        }
+        vec3 pa = world_to_node(da, p);
+        vec3 pb = world_to_node(db, p);
+        float va = sample_node(da, base_a, pa) * da.step_pad.x;
+        float vb = sample_node(db, base_b, pb) * db.step_pad.x;
+        if (va >= 0.0 || vb >= 0.0) {
+            continue;
+        }
+        vec3 ga = gradient_node(da, base_a, pa);
+        vec3 gb = gradient_node(db, base_b, pb);
+        vec3 nrm = normalize(ga - gb + vec3(1e-9));
+        uint slot = atomicAdd(counts[pair], 1u);
+        if (slot >= pc.max_contacts) {
+            continue;
+        }
+        uint o = pair * pc.max_contacts + slot;
+        c[2u * o] = vec4(p, -va + (-vb));   /* глубина пары = сумма заглублений */
+        c[2u * o + 1u] = vec4(nrm, 0.0);
+        found++;
+        if (found >= pc.max_contacts) {
+            break;
+        }
+    }
+}
