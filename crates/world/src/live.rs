@@ -211,12 +211,15 @@ fn scene_plate() -> (Params, LiveBody, Vec<GpuBody>) {
         tets: plate.tets.clone(),
         origin: plate.origin,
         level_cap: plate.level_cap,
+        /* Запечённое поле плиты переносим в тело мира: иначе rebuild()
+         * строил TetBody без поля и меш считался BFS-ом по занятости —
+         * отсюда гребни и шип на угле. */
+        sdf: Some(plate.sdf().clone()),
         local: Vec::new(),
         mesh: -1,
         lines: -1,
         kind: Kind::Target,
         alive: true,
-        sdf: None,
     };
     body.rebuild();
     // Ставим плиту ровно на пол по ЛОКАЛЬНЫМ тетраэдрам (это и есть
