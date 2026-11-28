@@ -1819,17 +1819,26 @@ impl GpuSim {
             },
             Step {
                 pipe: if self.flat_pairs { P_TETPAIRSFLAT } else { P_TETPAIRS },
-                bufs: vec![
-                    self.bodies[0],
-                    self.tets,
-                    self.span,
-                    self.tetstart,
-                    self.cell_tets,
-                    self.pairs,
-                    self.pair_count,
-                    self.baabb,
-                    self.cellid,
-                ],
+                /* flat читает ещё и номер ячейки записи (9 буферов), старое
+                 * крыло VF_PAIRGEN=cell — без него (8). Раскладку числа
+                 * буферов держим рядом с выбором пайплайна: layout у них
+                 * разный, и лишний буфер — это ошибка диспатча. */
+                bufs: {
+                    let mut b = vec![
+                        self.bodies[0],
+                        self.tets,
+                        self.span,
+                        self.tetstart,
+                        self.cell_tets,
+                        self.pairs,
+                        self.pair_count,
+                        self.baabb,
+                    ];
+                    if self.flat_pairs {
+                        b.push(self.cellid);
+                    }
+                    b
+                },
                 push,
                 /* По записям: групп на весь потолок (записей не больше
                  * MAX_CELL_TETS), лишние invocation выходят первой проверкой.
