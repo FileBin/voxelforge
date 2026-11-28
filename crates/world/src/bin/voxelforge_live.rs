@@ -541,8 +541,14 @@ impl Sim {
                 let tick_in_flight = shared.lock().unwrap().in_tick;
                 let mut g = shared.lock().unwrap();
                 let step = if g.interval > 0.0 { g.interval } else { g.tick };
-                let overdue = tick_in_flight
-                    || std::env::var("VF_NO_INTERP").is_ok()
+                /* ВАЖНО: такт «в полёте» НЕ повод рисовать alpha = 1. При 20 Гц
+                 * такте и 60 fps каждый третий кадр попадал в это состояние, и
+                 * картинка шагала целым тактом (пуля на 26 м/с — 1.3 м за кадр).
+                 * Это и было «дрожание». alpha = 1 оставляем только для явного
+                 * флага и для настоящей перегрузки (интервал такта разошёлся с
+                 * номиналом), когда интерполяция заведомо врёт. */
+                let _ = tick_in_flight;
+                let overdue = std::env::var("VF_NO_INTERP").is_ok()
                     || step > g.tick * 1.25;
                 let alpha = if overdue || step <= 0.0 {
                     1.0
